@@ -67,14 +67,39 @@ using std::vector;
 
 using ceph::bufferlist;
 
+//这是一个匿名命名空间（anonymous namespace），这意味着这些定义只在当前编译单元（.cpp文件）中可见，不会与其他文件产生符号冲突。
 namespace {
 
+/**
+作用：初始化 OSD 主模块的跟踪点
+库文件：libosd_tp.so - 包含 OSD 核心操作的跟踪点定义
+跟踪域：osd_tracing - 标识这些跟踪属于 OSD 主功能域
+用途：跟踪 OSD 的主要操作，如请求处理、Peering 过程等
+*/
 TracepointProvider::Traits osd_tracepoint_traits("libosd_tp.so",
                                                  "osd_tracing");
+/**
+作用：初始化对象存储层的跟踪点
+库文件：libos_tp.so - 对象存储相关的跟踪点
+跟踪域：osd_objectstore_tracing - 对象存储操作域
+用途：跟踪对象存储接口的调用，如读、写、事务操作等
+*/
 TracepointProvider::Traits os_tracepoint_traits("libos_tp.so",
                                                 "osd_objectstore_tracing");
+/**
+作用：初始化 BlueStore 后端存储的跟踪点
+库文件：libbluestore_tp.so - BlueStore 特有的跟踪点
+跟踪域：bluestore_tracing - BlueStore 操作域
+用途：跟踪 BlueStore 的底层操作，如 RocksDB 调用、磁盘 I/O 等
+*/
 TracepointProvider::Traits bluestore_tracepoint_traits("libbluestore_tp.so",
 						       "bluestore_tracing");
+/**
+条件：仅在定义了 WITH_OSD_INSTRUMENT_FUNCTIONS 宏时编译
+库文件：libcyg_profile_tp.so - 函数级跟踪库
+跟踪域：osd_function_tracing - 函数调用跟踪域
+用途：实现细粒度的函数级性能分析（类似 gprof 的 instrumentation）
+*/
 #ifdef WITH_OSD_INSTRUMENT_FUNCTIONS
 TracepointProvider::Traits cyg_profile_traits("libcyg_profile_tp.so",
                                                  "osd_function_tracing");
@@ -122,6 +147,14 @@ static void usage()
   generic_server_usage();
 }
 
+/**
+argc: 命令行参数数量, 包括程序名本身
+argv: 命令行参数数组的指针
+例：./ceph-osd -i 0 --debug-osd 20
+则：
+argc = 5
+argv = ["./ceph-osd", "-i", "0", "--debug-osd", "20"]
+*/
 int main(int argc, const char **argv)
 {
   auto args = argv_to_vec(argc, argv);

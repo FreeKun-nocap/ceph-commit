@@ -16,11 +16,14 @@
 #ifndef CEPH_COMMON_CODE_ENVIRONMENT_H
 #define CEPH_COMMON_CODE_ENVIRONMENT_H
 
+/**
+Ceph 代码环境的一种类型
+*/
 enum code_environment_t {
-  CODE_ENVIRONMENT_UTILITY = 0,
-  CODE_ENVIRONMENT_DAEMON = 1,
-  CODE_ENVIRONMENT_LIBRARY = 2,
-  CODE_ENVIRONMENT_UTILITY_NODOUT = 3,
+  CODE_ENVIRONMENT_UTILITY = 0, // 工具环境（如命令行工具）
+  CODE_ENVIRONMENT_DAEMON = 1, // 守护进程环境（如 OSD、MON、MGR 等）
+  CODE_ENVIRONMENT_LIBRARY = 2, // 库环境（如 Ceph 客户端库）
+  CODE_ENVIRONMENT_UTILITY_NODOUT = 3, // 工具环境（如命令行工具），不输出到标准输出
 };
 
 #ifdef __cplusplus

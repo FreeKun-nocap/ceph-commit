@@ -131,9 +131,33 @@ void env_to_vec(std::vector<const char*>& args, const char *name)
   args.insert(args.end(), arguments.begin(), arguments.end());
 }
 
+/**
+作用：将传统的 C 风格命令行参数数组转换为 C++ 的 vector 容器，并移除程序名
+参数：
+  argc: 命令行参数数量, 包括程序名本身
+  argv: 命令行参数数组的指针
+返回值：
+  std::vector<const char*>：包含所有参数（不包括程序名）的 vector 容器
+ */
 std::vector<const char*> argv_to_vec(int argc, const char* const * argv)
 {
   assert(argc > 0);
+  /**
+  语法解析：
+    {} 是 C++11 引入的统一初始化（Uniform Initialization）语法
+    return {argv + 1, argv + argc};
+    等价于
+    // 显式构造
+    return std::vector<const char*>(argv + 1, argv + argc);
+
+    // 或者
+    std::vector<const char*> vec;
+    vec.assign(argv + 1, argv + argc);
+    return vec;
+
+  作用：
+    构造 vector：使用迭代器范围构造函数
+  */
   return {argv + 1, argv + argc};
 }
 
