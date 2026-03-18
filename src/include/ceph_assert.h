@@ -33,6 +33,11 @@ struct BackTrace;
  * Select a function-name variable based on compiler tests, and any compiler
  * specific overrides.
  */
+/**
+预处理器条件选择块，用于在不同的编译环境下选择合适的函数名变量
+HAVE_PRETTY_FUNC 和 HAVE_FUNC 宏是通过项目的构建系统在编译前自动检测生成的，通常由 Autoconf 脚本完成
+在断言失败时，能够显示当前正在执行的函数名称，以便于调试
+*/
 #if defined(HAVE_PRETTY_FUNC)
 # define __CEPH_ASSERT_FUNCTION __PRETTY_FUNCTION__
 #elif defined(HAVE_FUNC)
@@ -65,7 +70,9 @@ extern void __ceph_assert_warn(const char *assertion, const char *file, int line
 
 [[noreturn]] void __ceph_abortf(const char *file, int line, const char *func,
                                 const char* msg, ...);
-
+/**
+C++ 中的类型转换运算符，用于执行静态类型转换
+*/
 #define _CEPH_ASSERT_VOID_CAST static_cast<void>
 
 #define assert_warn(expr)							\
@@ -93,6 +100,18 @@ using namespace ceph;
 #define ceph_abort_msgf(...)                                             \
   ::ceph::__ceph_abortf( __FILE__, __LINE__, __CEPH_ASSERT_FUNCTION, __VA_ARGS__)
 
+/**
+__SANITIZE_ADDRESS__ 是一个预处理器宏，当使用AddressSanitizer（ASan）编译代码时自动定义
+AddressSanitizer是Google开发的一个快速内存错误检测工具，主要用于C/C++程序。它能检测多种内存
+ASan在编译时插入额外的检查代码，需要清晰的代码路径
+ASan版本避免使用静态变量缓存，因为这些静态变量可能会干扰ASan的内存检查，简化断言有助于获得更清晰的调用栈和错误报告
+ASan版本：牺牲性能换取更精确的内存检查
+普通版本：优化性能，减少代码体积
+*/
+/**
+若 expr 为 true，则不执行任何操作
+若 expr 为 false，则调用 __ceph_assert_fail 函数触发断言失败
+*/
 #ifdef __SANITIZE_ADDRESS__
 #define ceph_assert(expr)                           \
   do {                                              \
