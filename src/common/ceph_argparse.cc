@@ -117,18 +117,32 @@ void env_to_vec(std::vector<const char*>& args, const char *name)
     env.push_back(s.c_str());
   }
   g_str_vec_lock.unlock();
+  /**
+  例：
+    环境变量 CEPH_ARGS = "--debug 10 --verbose -- cluster1 data.txt"
+    env_options = ["--debug", "10", "--verbose"]
+    env_arguments = ["--cluster1", "data.txt"]
+    命令行参数 args = ceph status --cluster mycluster -- --extra-arg
+    options = ["status", "--cluster", "mycluster"]
+    arguments = ["--extra-arg"]
+  */
   auto [env_options, env_arguments] = split_dashdash(env);
 
   auto [options, arguments] = split_dashdash(args);
   args.clear();
   args.insert(args.end(), env_options.begin(), env_options.end());
+  // args 变为 ["--debug", "10", "--verbose"]
   args.insert(args.end(), options.begin(), options.end());
+  // args 变为 ["--debug", "10", "--verbose", "status", "--cluster", "mycluster"]
   if (arguments.empty() && env_arguments.empty()) {
     return;
   }
   args.push_back("--");
+  // args 变为 ["--debug", "10", "--verbose", "status", "--cluster", "mycluster", "--"]
   args.insert(args.end(), env_arguments.begin(), env_arguments.end());
+  // args 变为 ["--debug", "10", "--verbose", "status", "--cluster", "mycluster", "--", "cluster1", "data.txt"]
   args.insert(args.end(), arguments.begin(), arguments.end());
+  // args 变为 ["--debug", "10", "--verbose", "status", "--cluster", "mycluster", "--", "cluster1", "data.txt", "--extra-arg"]
 }
 
 /**

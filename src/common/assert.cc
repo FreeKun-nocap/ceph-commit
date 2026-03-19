@@ -61,11 +61,14 @@ namespace ceph {
     g_assert_file = file;
     g_assert_line = line;
     g_assert_func = func;
+
+    // 获取当前线程的名称，如：ceph-osd、ceph-mds等
     g_assert_thread = (unsigned long long)pthread_self();
     ceph_pthread_getname(g_assert_thread_name, sizeof(g_assert_thread_name));
 
-    ostringstream tss;
-    tss << ceph_clock_now();
+    ostringstream tss;  // 1. 创建字符串输出流
+    tss << ceph_clock_now();  // 2. 将当前时间写入流
+    // tss.str()  // 3. 获取格式化的时间字符串
 
     snprintf(g_assert_msg, sizeof(g_assert_msg),
 	     "%s: In function '%s' thread %llx time %s\n"
@@ -75,6 +78,14 @@ namespace ceph {
     dout_emergency(g_assert_msg);
 
     // TODO: get rid of this memory allocation.
+    /**
+     获取当前函数（backtrace）（backtrace）并格式化为字符串
+     @param 1 表示从当前函数开始获取 backtrace
+     例如：
+     0：__ceph_assert_fail()      <-- 当前函数
+     1：caller_function()          <-- 调用assert的函数
+     2：original_caller()          <-- 原始调用者
+     */
     ostringstream oss;
     oss << ClibBackTrace(1);
     dout_emergency(oss.str());
@@ -85,13 +96,23 @@ namespace ceph {
       *_dout << oss.str() << dendl;
 
       // dump recent only if the abort signal handler won't do it for us
+      /**
+      开发时可能禁用信号处理器, fatal_signal_handlers = false
+      assert失败时：
+        1. assert函数中dump recent  // 能看到日志
+        2. abort()                  // 程序终止
+        3. 可以直接在IDE中调试      // 不需要信号处理器
+      */
       if (!g_assert_context->_conf->fatal_signal_handlers) {
 	g_assert_context->_log->dump_recent();
       }
 
-      // bypass the abort?
+      // bypass the abort?\
+      // ceph.conf 中的配置示例，ceph_assert_supresssions = "OSD.cc:123, PG.cc:456, common/Throttle.cc:789"
+      // get_str_list() 按照逗号分隔，将字符串转换为字符串列表
       const auto supressions = get_str_list(
 	g_assert_context->_conf.get_val<std::string>("ceph_assert_supresssions"));
+      // none_of() 检查范围内是否所有元素都不满足某个条件
       should_abort = std::none_of(
 	std::begin(supressions), std::end(supressions),
 	[file, line](const auto& supression) {
