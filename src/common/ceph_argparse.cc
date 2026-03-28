@@ -83,7 +83,7 @@ split_dashdash(const std::vector<const char*>& args) {
   return {std::move(options), std::move(arguments)};
 }
 
-static std::mutex g_str_vec_lock;
+static std::mutex g_str_vec_lock;  // 静态的互斥锁（mutex）对象, 用于在多线程环境中保护共享资源的访问
 static std::vector<std::string> g_str_vec;
 
 void clear_g_str_vec()
@@ -93,6 +93,14 @@ void clear_g_str_vec()
   g_str_vec_lock.unlock();
 }
 
+/**
+获取环境变量的值并将其转换为 C++ 的 vector 容器
+参数：
+  args: 命令行参数 vector 容器, 用于存储转换后的参数
+  name: 环境变量名称, 默认值为 "CEPH_ARGS"
+返回：
+  无
+*/
 void env_to_vec(std::vector<const char*>& args, const char *name)
 {
   if (!name)
@@ -104,7 +112,7 @@ void env_to_vec(std::vector<const char*>& args, const char *name)
    */
   g_str_vec_lock.lock();
   if (g_str_vec.empty()) {
-    char *p = getenv(name);
+    char *p = getenv(name);  // 获取环境变量的值
     if (!p) {
       g_str_vec_lock.unlock();
       return;
@@ -277,12 +285,16 @@ CephInitParameters::CephInitParameters(uint32_t module_type_)
   name.set(module_type, "admin");
 }
 
+/**
+将字符串中的短横线替换为下划线
+*/
 static void dashes_to_underscores(const char *input, char *output)
 {
   char c = 0;
   char *o = output;
   const char *i = input;
   // first two characters are copied as-is
+  // 处理前两个字符，直接复制到输出字符串中，若其中一个字符为空字符，则直接返回
   *o = *i++;
   if (*o++ == '\0')
     return;
@@ -291,10 +303,10 @@ static void dashes_to_underscores(const char *input, char *output)
     return;
   for (; ((c = *i)); ++i) {
     if (c == '=') {
-      strcpy(o, i);
+      strcpy(o, i);  // 将剩余字符串（包括等号及之后）直接复制
       return;
     }
-    if (c == '-')
+    if (c == '-')  // 遇到短横线，将其替换为下划线
       *o++ = '_';
     else
       *o++ = c;
@@ -314,24 +326,31 @@ bool ceph_argparse_double_dash(std::vector<const char*> &args,
   return false;
 }
 
+/**
+检查当前参数是不是可变参数（或它们的下划线版本），如果是就删除它
+返回值：
+  bool：如果当前参数是可变参数（或它们的下划线版本），则返回 true，否则返回 false
+*/
 bool ceph_argparse_flag(std::vector<const char*> &args,
 	std::vector<const char*>::iterator &i, ...)
 {
+  // 第一个可变参数
   const char *first = *i;
   char tmp[strlen(first)+1];
   dashes_to_underscores(first, tmp);
   first = tmp;
-  va_list ap;
 
+  va_list ap;  // 可变参数
   va_start(ap, i);
   while (1) {
-    const char *a = va_arg(ap, char*);
+    const char *a = va_arg(ap, char*);  // 从可变参数列表中提取一个 char* 类型的参数
     if (a == NULL) {
       va_end(ap);
       return false;
     }
     char a2[strlen(a)+1];
     dashes_to_underscores(a, a2);
+    // first 此时为 i 的下划线版本，a2 为可变参数 a 的下划线版本
     if (strcmp(a2, first) == 0) {
       i = args.erase(i);
       va_end(ap);
