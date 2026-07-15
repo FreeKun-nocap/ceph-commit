@@ -218,29 +218,30 @@ public:
     std::lock_guard l{lock};
     return config.rm_val(values, key);
   }
-  // Expand all metavariables. Make any pending observer callbacks.
+  // 展开所有元变量（如 $cluster、$name 等），并调用所有待触发的配置观察者回调
   void apply_changes(std::ostream* oss) {
-    rev_obs_map_t rev_obs;
+    rev_obs_map_t rev_obs;     // 反向观察者映射：观察者 → 它关心的变更 key 集合
 
     {
-      std::lock_guard locker(lock);
-      // apply changes until the cluster name is assigned
+      std::lock_guard locker(lock);      // 加锁访问内部状态
+      // 只有集群名确定后才应用变更（否则元变量展开不完整）
       if (!values.cluster.empty()) {
-        // meta expands could have modified anything.  Copy it all out again.
+        // 收集所有变更项及其对应的观察者（元变量展开可能修改任意配置项）
         _gather_changes(values.changed, &rev_obs, oss);
       }
-    }
+    }  // 离开作用域自动释放锁
 
-    _call_observers(rev_obs);
+    _call_observers(rev_obs);  // 在锁外调用观察者回调（避免死锁）
   }
   int set_val(const std::string_view key, const std::string& s,
               std::stringstream* err_ss=nullptr) {
     std::lock_guard l{lock};
     return config.set_val(values, obs_mgr, key, s, err_ss);
   }
+  // 设置配置项的默认值（最低优先级，仅当没有其他来源提供值时生效）
   void set_val_default(const std::string_view key, const std::string& val) {
-    std::lock_guard l{lock};
-    config.set_val_default(values, obs_mgr, key, val);
+    std::lock_guard l{lock};                                  // 加互斥锁，保证线程安全
+    config.set_val_default(values, obs_mgr, key, val);           // 转发给底层 md_config_t
   }
   void set_val_or_die(const std::string_view key, const std::string& val) {
     std::lock_guard l{lock};

@@ -45,7 +45,7 @@ std::ostream &operator<<(std::ostream &oss, const enum code_environment_t e)
 }
 
 #if defined(HAVE_PTHREAD_GETNAME_NP) && !defined(_WIN32)
-
+// linux 的实现
 int get_process_name(char *buf, int len)
 {
   if (len <= 16) {

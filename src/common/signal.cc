@@ -52,23 +52,33 @@ std::string signal_mask_to_str()
   return oss.str();
 }
 
-/* Block the signals in 'siglist'. If siglist == NULL, block all signals. */
+/**
+ * block_signals —— 阻塞指定的信号列表（或阻塞全部信号）。
+ *
+ * @param siglist      要阻塞的信号数组，以 0 结尾（如 { SIGPIPE, 0 }）。
+ *                     传 NULL 表示阻塞所有信号。
+ * @param old_sigset   输出参数：保存阻塞前的信号掩码（用于后续恢复）。
+ *                     传 NULL 表示不保存旧状态。
+ *
+ * 底层调用 pthread_sigmask(SIG_BLOCK, ...)，是线程级别的信号屏蔽。
+ */
 void block_signals(const int *siglist, sigset_t *old_sigset)
 {
   sigset_t sigset;
   if (!siglist) {
-    sigfillset(&sigset);
+    sigfillset(&sigset);        // siglist 为空 → 阻塞全部信号
   }
   else {
     int i = 0;
-    sigemptyset(&sigset);
+    sigemptyset(&sigset);        // 清空信号集
     while (siglist[i]) {
-      sigaddset(&sigset, siglist[i]);
+      sigaddset(&sigset, siglist[i]);  // 逐个加入要阻塞的信号
       ++i;
     }
   }
+  // 设置线程信号掩码：SIG_BLOCK = 将指定信号加入阻塞集合
   int ret = pthread_sigmask(SIG_BLOCK, &sigset, old_sigset);
-  ceph_assert(ret == 0);
+  ceph_assert(ret == 0);        // 失败就断言（理论上不会失败）
 }
 
 void restore_sigset(const sigset_t *old_sigset)

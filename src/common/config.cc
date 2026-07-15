@@ -367,67 +367,113 @@ int md_config_t::set_mon_vals(CephContext *cct,
   return 0;
 }
 
+/**
+ * parse_config_files —— 解析 Ceph 配置文件（ceph.conf）。
+ *
+ * @param values          配置值存储（解析结果写入这里）
+ * @param tracker         配置变更追踪器
+ * @param conf_files_str  用户指定的配置文件路径列表（冒号分隔，为空则用默认搜索路径）
+ * @param warnings        警告信息输出流（解析过程中的警告写到这里）
+ * @param flags           标志位（CINIT_FLAG_NO_DEFAULT_CONFIG_FILE 等）
+ * @return                0 成功，-ENOENT 没找到文件，-EINVAL/其他 解析错误
+ *
+ * 执行流程：
+ *   1. 安全检查：线程已启动则不允许再读配置文件
+ *   2. 生成配置文件搜索路径列表（用户指定路径 + /etc/ceph/ + ~/.ceph/ 等）
+ *   3. 按顺序逐个尝试读取并解析，第一个成功的即为使用的配置文件
+ *   4. 全部失败返回 -ENOENT；解析过程中的语法错误返回对应错误码
+ */
 int md_config_t::parse_config_files(ConfigValues& values,
 				    const ConfigTracker& tracker,
 				    const char *conf_files_str,
 				    std::ostream *warnings,
 				    int flags)
 {
+  // 运行时保护：线程已启动后不允许重新解析配置文件
+  // （运行时改配置走 admin socket / monitor 下发等路径）
   if (safe_to_start_threads)
     return -ENOSYS;
 
+  // 如果还没有集群名且用户未指定配置文件，从环境变量或默认值推断
   if (values.cluster.empty() && !conf_files_str) {
     values.cluster = get_cluster_name(nullptr);
   }
-  // open new conf
+
+  // 逐个尝试配置文件搜索路径（默认路径：/etc/ceph/$cluster.conf 等）
   for (auto& fn : get_conffile_paths(values, conf_files_str, warnings, flags)) {
     bufferlist bl;
     std::string error;
-    if (bl.read_file(fn.c_str(), &error)) {
-      parse_error = error;
-      continue;
+    if (bl.read_file(fn.c_str(), &error)) {   // 读取文件内容到 buffer
+      parse_error = error;                      // 记录读取错误
+      continue;                                  // 读失败，试下一个路径
     }
     ostringstream oss;
     int ret = parse_buffer(values, tracker, bl.c_str(), bl.length(), &oss);
-    if (ret == 0) {
-      parse_error.clear();
-      conf_path = fn;
-      break;
+    if (ret == 0) {                              // 解析成功
+      parse_error.clear();                        // 清除之前的错误
+      conf_path = fn;                             // 记录实际生效的配置文件路径
+      break;                                      // 第一个成功的就用它
     }
-    parse_error = oss.str();
+    parse_error = oss.str();                     // 记录解析错误信息
     if (ret != -ENOENT) {
-      return ret;
+      return ret;                                 // 不是"文件不存在"的错误 → 直接返回
     }
   }
-  // it must have been all ENOENTs, that's the only way we got here
+  // 走到这里说明所有路径都试过了，且都是 ENOENT（文件不存在）
   if (conf_path.empty()) {
-    return -ENOENT;
+    return -ENOENT;                              // 一个配置文件都没找到
   }
+
+  // 如果还没有集群名，从配置文件路径推断（如 ceph.conf → 集群名 ceph）
   if (values.cluster.empty()) {
     values.cluster = get_cluster_name(conf_path.c_str());
   }
-  update_legacy_vals(values);
+  update_legacy_vals(values);                     // 同步到遗留的 C 结构体字段
   return 0;
 }
 
+/**
+ * parse_buffer —— 解析内存中的配置文件内容（INI 格式），把结果写入 values。
+ *
+ * @param values    配置值存储（解析结果写入这里，以 CONF_FILE 优先级）
+ * @param tracker   配置变更追踪器
+ * @param buf       配置文件内容的内存指针
+ * @param len       内容长度
+ * @param warnings  警告输出流（解析错误时写入）
+ * @return          0 成功，-EINVAL 解析失败
+ *
+ * 执行流程：
+ *   1. 用 ConfFile 解析 INI 格式的文本（[global]、[osd]、[osd.0] 等 section）
+ *   2. 确定本进程需要读取哪些 section（如 [global] + [osd] + [osd.$id]）
+ *   3. 遍历 schema 中所有已知配置项，从配置文件对应 section 取值
+ *   4. 以 CONF_FILE 优先级写入 values（解析失败的项记录警告，不中断）
+ */
 int
 md_config_t::parse_buffer(ConfigValues& values,
 			  const ConfigTracker& tracker,
 			  const char* buf, size_t len,
 			  std::ostream* warnings)
 {
+  // 第一步：用 ConfFile 解析 INI 格式文本（处理 section、key=value、注释等）
   if (!cf.parse_buffer(string_view{buf, len}, warnings)) {
-    return -EINVAL;
+    return -EINVAL;                           // 语法错误，直接返回
   }
+  // 第二步：确定本进程应读取的 section 列表
+  // 例如 OSD 进程会读：[global] → [osd] → [osd.0]（越后面优先级越高）
   const auto my_sections = get_my_sections(values);
+
+  // 第三步：遍历所有已知配置项，从配置文件中取值并写入
   for (const auto &i : schema) {
     const auto &opt = i.second;
     std::string val;
+    // 从配置文件的 section 中查找该配置项的值（找不到则跳过，保留默认值）
     if (_get_val_from_conf_file(my_sections, opt.name, val)) {
       continue;
     }
+    // 以 CONF_FILE 优先级写入 values
     std::string error_message;
     if (_set_val(values, tracker, val, opt, CONF_FILE, &error_message) < 0) {
+      // 写入失败（类型不匹配、校验失败等）→ 记录警告，继续处理其他项
       if (warnings != nullptr) {
         *warnings << "parse error setting " << std::quoted(opt.name)
                   << " to " << std::quoted(val);
@@ -438,37 +484,61 @@ md_config_t::parse_buffer(ConfigValues& values,
       }
     }
   }
+  // 检查并警告旧版本的 section 命名（如 [mds] → 应使用 [mds.$id]）
   cf.check_old_style_section_names({"mds", "mon", "osd"}, cerr);
   return 0;
 }
 
+/**
+ * get_conffile_paths —— 生成配置文件的搜索路径列表。
+ *
+ * @param values          当前配置值（用于变量展开，如 $cluster、$data_dir）
+ * @param conf_files_str  用户指定的配置文件路径（冒号/分号分隔，可为空）
+ * @param warnings        警告输出流（路径展开失败时写入警告）
+ * @param flags           初始化标志位
+ * @return                按优先级排序的配置文件路径列表
+ *
+ * 优先级从高到低：
+ *   1. 命令行 -c/--conf 指定的路径（conf_files_str）
+ *   2. 环境变量 CEPH_CONF 指定的路径
+ *   3. 编译时默认路径 CEPH_CONF_FILE_DEFAULT（如 /etc/ceph/$cluster.conf）
+ *   4. 如果 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE 则跳过默认路径
+ */
 std::list<std::string>
 md_config_t::get_conffile_paths(const ConfigValues& values,
 				const char *conf_files_str,
 				std::ostream *warnings,
 				int flags) const
 {
+  // 如果用户未指定配置文件路径
   if (!conf_files_str) {
+    // 先查环境变量 CEPH_CONF
     const char *c = getenv("CEPH_CONF");
     if (c) {
       conf_files_str = c;
     } else {
+      // 没有环境变量 → 用编译时默认路径
+      // 但如果设置了 NO_DEFAULT_CONFIG_FILE 标志，则一个都不找
       if (flags & CINIT_FLAG_NO_DEFAULT_CONFIG_FILE)
 	return {};
-      conf_files_str = CEPH_CONF_FILE_DEFAULT;
+      conf_files_str = CEPH_CONF_FILE_DEFAULT;  // 如 "/etc/ceph/$cluster.conf"
     }
   }
 
+  // 将路径字符串按分号或逗号分隔，拆成列表（支持多个候选路径）
   std::list<std::string> paths;
   get_str_list(conf_files_str, ";,", paths);
+
+  // 遍历路径列表，做变量展开和无效路径过滤
   for (auto i = paths.begin(); i != paths.end(); ) {
     string& path = *i;
+    // 如果路径里有 $data_dir 但还不知道 data_dir 是什么 → 这条路径没用，删掉
     if (path.find("$data_dir") != path.npos &&
 	data_dir_option.empty()) {
-      // useless $data_dir item, skip
+      // $data_dir 还没确定，跳过这条路径
       i = paths.erase(i);
     } else {
-      early_expand_meta(values, path, warnings);
+      early_expand_meta(values, path, warnings);  // 展开 $cluster、$name 等变量
       ++i;
     }
   }
@@ -494,20 +564,41 @@ std::string md_config_t::get_cluster_name(const char* conffile)
   }
 }
 
+/**
+ * parse_env —— 从环境变量中读取配置，以 CONF_ENV 优先级写入 values。
+ *
+ * @param entity_type  模块类型（OSD/MON/MDS 等，用于针对性处理内存等配置）
+ * @param values       配置值存储（写入这里）
+ * @param tracker      配置变更追踪器
+ * @param args_var     参数环境变量名（默认 "CEPH_ARGS"）
+ *
+ * 处理的环境变量：
+ *   - CEPH_KEYRING    → keyring 路径
+ *   - CEPH_LIB        → erasure_code_dir / plugin_dir / osd_class_dir
+ *   - TMPDIR          → tmp_dir
+ *   - POD_MEMORY_LIMIT → K8s Pod 内存上限（推算 osd_memory_target 默认值）
+ *   - POD_MEMORY_REQUEST → K8s Pod 内存申请（设置 osd_memory_target）
+ *   - CEPH_ARGS       → 额外命令行参数（再经 parse_argv 解析）
+ */
 void md_config_t::parse_env(unsigned entity_type,
 			    ConfigValues& values,
 			    const ConfigTracker& tracker,
 			    const char *args_var)
 {
+  // 运行时保护：线程启动后不允许再从环境变量加载配置
   if (safe_to_start_threads)
     return;
   if (!args_var) {
     args_var = "CEPH_ARGS";
   }
+
+  // CEPH_KEYRING → keyring 配置项
   if (auto s = getenv("CEPH_KEYRING"); s) {
     string err;
     _set_val(values, tracker, s, *find_option("keyring"), CONF_ENV, &err);
   }
+
+  // CEPH_LIB → 三个插件目录（纠删码、通用插件、OSD 类）
   if (auto dir = getenv("CEPH_LIB"); dir) {
     for (auto name : { "erasure_code_dir", "plugin_dir", "osd_class_dir" }) {
     std::string err;
@@ -517,53 +608,25 @@ void md_config_t::parse_env(unsigned entity_type,
     }
   }
 
+  // TMPDIR → tmp_dir（临时文件目录）
   if (auto s = getenv("TMPDIR"); s) {
     string err;
     _set_val(values, tracker, s, *find_option("tmp_dir"), CONF_ENV, &err);
   }
 
-  // Apply pod memory limits:
+  // ===== Kubernetes Pod 内存限制处理 =====
   //
-  // There are two types of resource requests: `limits` and `requests`.
+  // K8s 有两种资源规格：
+  //   - requests（申请值）：调度器用，决定 Pod 放哪台节点，保守值
+  //     对应 POD_MEMORY_REQUEST（Rook 设置）→ 作为内存目标值
+  //   - limits（上限值）：运行时限制，超了会 OOM kill，通常 > requests
+  //     对应 cgroup 内存限制 → 作为 osd_memory_target 的默认值（可被覆盖）
   //
-  // - Requests: Used by the K8s scheduler to determine on which nodes to
-  //   schedule the pods. This helps spread the pods to different nodes. This
-  //   value should be conservative in order to make sure all the pods are
-  //   schedulable. This corresponds to POD_MEMORY_REQUEST (set by the Rook
-  //   CRD) and is the target memory utilization we try to maintain for daemons
-  //   that respect it.
-  //
-  //   If POD_MEMORY_REQUEST is present, we use it as the target.
-  //
-  // - Limits: At runtime, the container runtime (and Linux) will use the
-  //   limits to see if the pod is using too many resources. In that case, the
-  //   pod will be killed/restarted automatically if the pod goes over the limit.
-  //   This should be higher than what is specified for requests (potentially
-  //   much higher). This corresponds to the cgroup memory limit that will
-  //   trigger the Linux OOM killer.
-  //
-  //   If POD_MEMORY_LIMIT is present, we use it as the /default/ value for
-  //   the target, which means it will only apply if the *_memory_target option
-  //   isn't set via some other path (e.g., POD_MEMORY_REQUEST, or the cluster
-  //   config, or whatever.)
-  //
-  // Here are the documented best practices:
-  //   https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/#motivation-for-cpu-requests-and-limits
-  //
-  // When the operator creates the CephCluster CR, it will need to generate the
-  // desired requests and limits. As long as we are conservative in our choice
-  // for requests and generous with the limits we should be in a good place to
-  // get started.
-  //
-  // The support in Rook is already there for applying the limits as seen in
-  // these links.
-  //
-  // Rook docs on the resource requests and limits:
-  //   https://rook.io/docs/rook/v1.0/ceph-cluster-crd.html#cluster-wide-resources-configuration-settings
-  // Example CR settings:
-  //   https://github.com/rook/rook/blob/6d2ef936698593036185aabcb00d1d74f9c7bfc1/cluster/examples/kubernetes/ceph/cluster.yaml#L90
+  // 优先级：POD_MEMORY_REQUEST > 配置文件/其他 > POD_MEMORY_LIMIT(默认值)
   //
   uint64_t pod_limit = 0, pod_request = 0;
+
+  // POD_MEMORY_LIMIT：按比例推算 osd_memory_target 默认值
   if (auto pod_lim = getenv("POD_MEMORY_LIMIT"); pod_lim) {
     string err;
     uint64_t v = atoll(pod_lim);
@@ -575,8 +638,7 @@ void md_config_t::parse_env(unsigned entity_type,
 	    values, "osd_memory_target_cgroup_limit_ratio");
 	  if (cgroup_ratio > 0.0) {
 	    pod_limit = v * cgroup_ratio;
-	    // set osd_memory_target *default* based on cgroup limit, so that
-	    // it can be overridden by any explicit settings elsewhere.
+	    // 设为默认值（最低优先级），这样显式配置可以覆盖
 	    set_val_default(values, tracker,
 			    "osd_memory_target", stringify(pod_limit));
 	  }
@@ -584,17 +646,15 @@ void md_config_t::parse_env(unsigned entity_type,
       }
     }
   }
+
+  // POD_MEMORY_REQUEST 赋值到 pod_request
   if (auto pod_req = getenv("POD_MEMORY_REQUEST"); pod_req) {
     if (uint64_t v = atoll(pod_req); v) {
       pod_request = v;
     }
   }
+  // 如果同时设置了 LIMIT 和 REQUEST，取较小值（k8s 可能把 LIMIT 和 REQUEST 设相等）
   if (pod_request && pod_limit) {
-    // If both LIMIT and REQUEST are set, ensure that we use the
-    // min of request and limit*ratio.  This is important
-    // because k8s set set LIMIT == REQUEST if only LIMIT is
-    // specified, and we want to apply the ratio in that case,
-    // even though REQUEST is present.
     pod_request = std::min<uint64_t>(pod_request, pod_limit);
   }
   if (pod_request) {
@@ -608,9 +668,10 @@ void md_config_t::parse_env(unsigned entity_type,
     }
   }
 
+  // CEPH_ARGS：把环境变量里的额外参数当作命令行参数再解析一次
   if (getenv(args_var)) {
     vector<const char *> env_args;
-    env_to_vec(env_args, args_var);
+    env_to_vec(env_args, args_var);       // 环境变量字符串 → 参数数组
     parse_argv(values, tracker, env_args, CONF_ENV);
   }
 }
@@ -660,44 +721,64 @@ void md_config_t::_show_config(const ConfigValues& values,
   }
 }
 
+/**
+ * parse_argv —— 解析命令行参数，以指定优先级写入配置。
+ *
+ * @param values  配置值存储（写入结果）
+ * @param tracker 配置变更追踪器
+ * @param args    命令行参数数组（会被修改，已识别的参数被移除）
+ * @param level   优先级级别（CONF_CMDLINE / CONF_ENV 等）
+ * @return        0 成功，负值错误码
+ *
+ * 处理三类参数：
+ *   1. 特殊展示型参数（--show_conf / --show-config / --show-config-value）
+ *   2. 有短选项的常用参数（-f / -d / -m / -k / -K / -M / -r 等）
+ *   3. 通用 --key=value 形式（走 parse_option 统一处理）
+ */
 int md_config_t::parse_argv(ConfigValues& values,
 			    const ConfigTracker& tracker,
 			    std::vector<const char*>& args, int level)
 {
+  // 运行时保护：线程启动后不允许再解析命令行参数
   if (safe_to_start_threads) {
     return -ENOSYS;
   }
 
-  // In this function, don't change any parts of the configuration directly.
-  // Instead, use set_val to set them. This will allow us to send the proper
-  // observer notifications later.
+  // 注意：此函数不直接修改 values 中的成员变量，而是通过 set_val 系列函数写入，
+  // 这样可以确保正确触发观察者通知和一致性更新。
+
   std::string val;
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
+    // 遇到 -- 则停止解析（后续参数留给业务层处理）
     if (strcmp(*i, "--") == 0) {
-      /* Normally we would use ceph_argparse_double_dash. However, in this
-       * function we *don't* want to remove the double dash, because later
-       * argument parses will still need to see it. */
+      // 这里不移除 --，因为后续的参数解析仍需要看到它
       break;
     }
+    // --show_conf：直接打印已加载的配置文件内容并退出
     else if (ceph_argparse_flag(args, i, "--show_conf", (char*)NULL)) {
       cerr << cf << std::endl;
       _exit(0);
     }
+    // --show-config：标记为展示配置，待后面 do_argv_commands 统一输出
     else if (ceph_argparse_flag(args, i, "--show_config", (char*)NULL)) {
       do_show_config = true;
     }
+    // --show-config-value <key>：展示单个配置项的值
     else if (ceph_argparse_witharg(args, i, &val, "--show_config_value", (char*)NULL)) {
       do_show_config_value = val;
     }
+    // --no-mon-config / --mon-config：控制是否从 Monitor 拉配置
     else if (ceph_argparse_flag(args, i, "--no-mon-config", (char*)NULL)) {
       values.no_mon_config = true;
     }
     else if (ceph_argparse_flag(args, i, "--mon-config", (char*)NULL)) {
       values.no_mon_config = false;
     }
+    // --foreground / -f：前台运行（不 daemonize）
     else if (ceph_argparse_flag(args, i, "--foreground", "-f", (char*)NULL)) {
       set_val_or_die(values, tracker, "daemonize", "false");
     }
+    // -d：调试模式（前台运行 + 输出日志到 stderr + 关闭 syslog）
     else if (ceph_argparse_flag(args, i, "-d", (char*)NULL)) {
       set_val_or_die(values, tracker, "fuse_debug", "true");
       set_val_or_die(values, tracker, "daemonize", "false");
@@ -706,9 +787,7 @@ int md_config_t::parse_argv(ConfigValues& values,
       set_val_or_die(values, tracker, "err_to_stderr", "true");
       set_val_or_die(values, tracker, "log_to_syslog", "false");
     }
-    // Some stuff that we wanted to give universal single-character options for
-    // Careful: you can burn through the alphabet pretty quickly by adding
-    // to this list.
+    // 以下是带短选项的常用参数（注意：短字母资源有限，谨慎添加）
     else if (ceph_argparse_witharg(args, i, &val, "--monmap", "-M", (char*)NULL)) {
       set_val_or_die(values, tracker, "monmap", val.c_str());
     }
@@ -718,14 +797,15 @@ int md_config_t::parse_argv(ConfigValues& values,
     else if (ceph_argparse_witharg(args, i, &val, "--bind", (char*)NULL)) {
       set_val_or_die(values, tracker, "public_addr", val.c_str());
     }
+    // --keyfile / -K：从文件或 stdin 读取密钥
     else if (ceph_argparse_witharg(args, i, &val, "--keyfile", "-K", (char*)NULL)) {
       bufferlist bl;
       string err;
       int r;
       if (val == "-") {
-	r = bl.read_fd(STDIN_FILENO, 1024);
+	r = bl.read_fd(STDIN_FILENO, 1024);        // 从标准输入读
       } else {
-	r = bl.read_file(val.c_str(), &err);
+	r = bl.read_file(val.c_str(), &err);      // 从文件读
       }
       if (r >= 0) {
 	string k(bl.c_str(), bl.length());
@@ -741,6 +821,7 @@ int md_config_t::parse_argv(ConfigValues& values,
     else if (ceph_argparse_witharg(args, i, &val, "--service_unique_id", (char*)NULL)) {
       set_val_or_die(values, tracker, "service_unique_id", val.c_str());
     }
+    // 其他参数：走通用 --key=value 解析逻辑
     else {
       int r = parse_option(values, tracker, args, i, NULL, level);
       if (r < 0) {
@@ -748,19 +829,28 @@ int md_config_t::parse_argv(ConfigValues& values,
       }
     }
   }
-  // meta expands could have modified anything.  Copy it all out again.
+  // 元变量展开可能修改了任何配置 → 重新同步到遗留 C 结构体字段
   update_legacy_vals(values);
   return 0;
 }
 
+/**
+ * do_argv_commands —— 执行展示型命令行参数（--show-config 等）。
+ *
+ * @param values  当前配置值
+ *
+ * 在 parse_argv 阶段只打标记不输出，确保配置全部加载完毕后
+ * 再展示最终生效值（包含配置文件、环境变量、命令行的合并结果）。
+ */
 void md_config_t::do_argv_commands(const ConfigValues& values) const
 {
-
+  // --show-config：打印全部配置项及当前值
   if (do_show_config) {
     _show_config(values, &cout, NULL);
     _exit(0);
   }
 
+  // --show-config-value <key>：打印单个配置项的值
   if (do_show_config_value.size()) {
     string val;
     int r = conf_stringify(_get_val(values, do_show_config_value, 0, &cerr),
@@ -1414,6 +1504,22 @@ int md_config_t::_get_val_from_conf_file(
   return -ENOENT;
 }
 
+/**
+ * _set_val —— 配置项赋值的核心实现（内部函数，外部通过 set_val / set_val_default 等调用）。
+ *
+ * @param values         配置值存储（ConfigValues），实际持有所有配置项的值
+ * @param observers      配置变更观察者（用于判断是否已被追踪）
+ * @param raw_val        字符串形式的原始值（如 "1024"、"/path/to/data"）
+ * @param opt            配置项的 Option 元数据（类型、校验规则等）
+ * @param level          优先级级别（CONF_DEFAULT / CONF_FILE / CONF_CMDLINE / CONF_MON 等）
+ * @param error_message  输出参数：失败时写入错误描述
+ * @return               0 成功，负值错误码
+ *
+ * 执行流程：
+ *   1. 将字符串 raw_val 解析为对应类型的值（int/bool/str/...）
+ *   2. 运行时安全检查：如果配置项标记为 startup-only，且线程已启动且无人追踪，拒绝修改
+ *   3. 写入 values 存储，并根据结果决定是否触发刷新
+ */
 int md_config_t::_set_val(
   ConfigValues& values,
   const ConfigTracker& observers,
@@ -1422,18 +1528,20 @@ int md_config_t::_set_val(
   int level,
   std::string *error_message)
 {
-  Option::value_t new_value;
-  ceph_assert(error_message);
-  int r = opt.parse_value(raw_val, &new_value, error_message);
+  Option::value_t new_value;                        // 解析后的值（variant 类型）
+  ceph_assert(error_message);                       // error_message 指针不能为空
+  int r = opt.parse_value(raw_val, &new_value, error_message);  // 字符串 → 类型化的值
   if (r < 0) {
-    return r;
+    return r;                                       // 解析失败，直接返回错误
   }
 
-  // unsafe runtime change?
+  // 运行时修改安全检查：
+  // 如果配置项只能在启动时修改（FLAG_RUNTIME 未设置），且当前线程已经启动，
+  // 且没有任何人追踪这个配置项的变更 → 拒绝修改
   if (!opt.can_update_at_runtime() &&
       safe_to_start_threads &&
       !observers.is_tracking(opt.name)) {
-    // accept value if it is not actually a change
+    // 例外：如果新旧值相同（等于没改），仍然允许通过
     if (new_value != _get_val_nometa(values, opt)) {
       *error_message = string("Configuration option '") + opt.name +
 	"' may not be modified at runtime";
@@ -1441,15 +1549,18 @@ int md_config_t::_set_val(
     }
   }
 
-  // Apply the value to its entry in the `values` map
+  // 将解析后的值写入 values map（按优先级 level 存储）
   auto result = values.set_value(opt.name, std::move(new_value), level);
   switch (result) {
   case ConfigValues::SET_NO_CHANGE:
+    // 值没有变化 → 什么都不做
     break;
   case ConfigValues::SET_NO_EFFECT:
+    // 值存进去了，但当前生效值没变（被更高优先级覆盖了） → 只清缓存
     values_bl.clear();
     break;
   case ConfigValues::SET_HAVE_EFFECT:
+    // 当前生效值发生了变化 → 清缓存 + 刷新依赖项（如扩展变量 $name 等）
     values_bl.clear();
     _refresh(values, opt);
     break;
@@ -1546,13 +1657,23 @@ class assign_visitor
 };
 } // anonymous namespace
 
+/**
+ * update_legacy_vals —— 将所有配置项的当前值同步到遗留 C 结构体成员变量。
+ *
+ * @param values  当前配置值存储
+ *
+ * 背景：Ceph 早期代码用 C 结构体（md_config_t）的成员变量存配置值，
+ *       后来重构为 ConfigValues（map 存储）+ schema 表。为了兼容旧代码
+ *       仍然直接访问结构体成员的写法，每次配置变更后都要把新值同步回去。
+ */
 void md_config_t::update_legacy_vals(ConfigValues& values)
 {
+  // 遍历所有需要同步的遗留字段映射
   for (const auto &i : legacy_values) {
-    const auto &name = i.first;
-    const auto &option = schema.at(name);
-    auto ptr = i.second;
-    update_legacy_val(values, option, ptr);
+    const auto &name = i.first;                    // 配置项名称
+    const auto &option = schema.at(name);           // 对应的 Option 元数据
+    auto ptr = i.second;                            // 遗留结构体成员的指针（偏移量）
+    update_legacy_val(values, option, ptr);          // 执行单条同步
   }
 }
 

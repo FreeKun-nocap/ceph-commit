@@ -29,37 +29,54 @@
 #define dout_subsys ceph_subsys_
 
 #ifndef WITH_CRIMSON
+/**
+ * common_preinit —— Ceph 公共预初始化函数，创建并配置 CephContext 的早期阶段。
+ *
+ * @param iparams  初始化参数（模块类型、实体名、是否跳过配置文件等）
+ * @param code_env 代码运行环境（守护进程/工具/库等）
+ * @param flags    初始化标志位（如 CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS）
+ * @return         已初步配置好的 CephContext 对象（调用者负责 release）
+ *
+ * 执行流程：
+ *   1. 设置全局代码环境标识 g_code_env
+ *   2. 创建 CephContext 对象（此时配置系统已初始化）
+ *   3. 设置实体名（如 osd.0）
+ *   4. 根据模块类型设置 keyring 默认路径（向后兼容）
+ *   5. 根据 flags 和 code_env 设置各类默认值（admin_socket、日志等）
+ *   6. 设置 no_config_file / host 等基础配置项
+ */
 CephContext *common_preinit(const CephInitParameters &iparams,
 			    enum code_environment_t code_env, int flags)
 {
-  // set code environment
+  // 设置全局代码环境标识（用注解标记为良性竞争，初始化只发生一次）
   ANNOTATE_BENIGN_RACE_SIZED(&g_code_env, sizeof(g_code_env), "g_code_env");
   g_code_env = code_env;
 
-  // Create a configuration object
+  // 创建 CephContext 对象：内部会初始化配置系统（md_config_t + schema）
   CephContext *cct = new CephContext(iparams.module_type, code_env, flags);
 
   auto& conf = cct->_conf;
-  // add config observers here
+  // 在此处注册配置观察者（目前为空，后续可扩展）
 
-  // Set up our entity name.
+  // 设置本进程的实体名称（如 osd.0, mon.a, client.admin）
   conf->name = iparams.name;
 
-  // different default keyring locations for osd and mds.  this is
-  // for backward compatibility.  moving forward, we want all keyrings
-  // in these locations.  the mon already forces $mon_data/keyring.
+  // OSD 和 MDS 使用不同的默认 keyring 路径（历史兼容原因）。
+  // 长远来看所有进程应统一位置；MON 已强制使用 $mon_data/keyring。
   if (conf->name.is_mds()) {
     conf.set_val_default("keyring", "$mds_data/keyring");
   } else if (conf->name.is_osd()) {
     conf.set_val_default("keyring", "$osd_data/keyring");
   }
 
+  // 非特权守护进程模式：admin_socket 路径带上 pid 和 cctid，
+  // 保证同名多个实例之间不冲突
   if ((flags & CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS)) {
-    // make this unique despite multiple instances by the same name.
     conf.set_val_default("admin_socket",
 			  "$run_dir/$cluster-$name.$pid.$cctid.asok");
   }
 
+  // 库模式或无输出工具模式：默认关闭 stderr 日志
   if (code_env == CODE_ENVIRONMENT_LIBRARY ||
       code_env == CODE_ENVIRONMENT_UTILITY_NODOUT) {
     conf.set_val_default("log_to_stderr", "false");
@@ -67,8 +84,10 @@ CephContext *common_preinit(const CephInitParameters &iparams,
     conf.set_val_default("log_flush_on_exit", "false");
   }
 
+  // 设置是否跳过配置文件（来自命令行 --no-config-file）
   conf.set_val("no_config_file", iparams.no_config_file ? "true" : "false");
 
+  // 如果 host 配置为空，用本机短主机名填充
   if (conf->host.empty()) {
     conf.set_val("host", ceph_get_short_hostname());
   }

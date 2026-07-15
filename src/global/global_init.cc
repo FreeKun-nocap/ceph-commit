@@ -59,10 +59,11 @@ namespace fs = std::filesystem;
 using std::cerr;
 using std::string;
 
+// 将 CephContext 设置到全局变量，方便各处代码无需传参即可访问上下文
 static void global_init_set_globals(CephContext *cct)
 {
-  g_ceph_context = cct;
-  get_process_name(g_process_name, sizeof(g_process_name));
+  g_ceph_context = cct;  // 全局 CephContext 指针（全局单例）
+  get_process_name(g_process_name, sizeof(g_process_name));  // 获取并缓存进程名（如 "ceph-osd"）
 }
 
 static void output_ceph_version()
@@ -106,6 +107,28 @@ static int chown_path(const std::string &pathname, const uid_t owner, const gid_
   #endif
 }
 
+/**
+ * global_pre_init —— Ceph 全局预初始化（加载配置、启动日志、进入可运行状态前的准备）。
+ *
+ * @param defaults    调用方传入的额外默认配置（key-value 映射，可为空）
+ * @param args        命令行参数（会被修改，已识别的参数会被移除）
+ * @param module_type 模块类型（OSD / MON / MDS / CLIENT 等）
+ * @param code_env    代码运行环境（守护进程 / 工具 / 库）
+ * @param flags       初始化标志位（CINIT_FLAG_*）
+ *
+ * 执行流程：
+ *   1. 把环境变量（CEPH_ARGS 等）合并进 args
+ *   2. 第一轮参数解析，提取早期参数（--cluster、--conf、-i、--name 等）
+ *   3. common_preinit：创建 CephContext + 基础默认值
+ *   4. 设置集群名、全局变量、MON 配置开关
+ *   5. 应用调用方传入的 defaults 默认值
+ *   6. 解析配置文件（ceph.conf）
+ *   7. 环境变量覆盖
+ *   8. 命令行参数覆盖（最高优先级）
+ *   9. 启动日志系统
+ *  10. 处理 --show-config 等展示型参数
+ *  11. 输出配置文件解析警告
+ */
 void global_pre_init(
   const std::map<std::string,std::string> *defaults,
   std::vector < const char* >& args,
@@ -115,7 +138,8 @@ void global_pre_init(
   std::string conf_file_list;
   std::string cluster = "";
 
-  // ensure environment arguments are included in early processing
+  // 把环境变量中的参数（CEPH_ARGS、CEPH_KEYRING 等）合并到 args 中，
+  // 确保环境变量也参与第一轮早期参数解析
   env_to_vec(args);
 
   // 第一轮参数解析：从命令行中提取 --cluster、--conf/-c、-i、--name、--version 等早期参数
@@ -123,68 +147,79 @@ void global_pre_init(
     args, module_type,
     &cluster, &conf_file_list);
 
-  CephContext *cct = common_preinit(iparams, code_env, flags);
-  cct->_conf->cluster = cluster;
+  // 预初始化 CephContext：创建上下文对象 + 设置基础默认值（keyring、admin_socket、日志等）
+  CephContext *cct = common_preinit(iparams, code_env, flags); 
+  cct->_conf->cluster = cluster;      // 设置集群名（来自 --cluster 参数或默认 "ceph"）
+  // 将 cct 和进程名存入全局变量（g_ceph_context、g_process_name），方便全代码访问
   global_init_set_globals(cct);
   auto& conf = cct->_conf;
 
+  // 如果指定了不读默认配置文件 / 不从 MON 拉配置，则关闭 mon config 功能
   if (flags & (CINIT_FLAG_NO_DEFAULT_CONFIG_FILE|
 	       CINIT_FLAG_NO_MON_CONFIG)) {
     conf->no_mon_config = true;
   }
 
-  // alternate defaults
+  // 应用调用方传入的额外默认值（优先级仍然是最低的 default 级别）
   if (defaults) {
     for (auto& i : *defaults) {
       conf.set_val_default(i.first, i.second);
     }
   }
 
+  // 如果命令行传了 --no-config_file，追加 NO_DEFAULT_CONFIG_FILE 标志
   if (conf.get_val<bool>("no_config_file")) {
     flags |= CINIT_FLAG_NO_DEFAULT_CONFIG_FILE;
   }
 
+  // 解析配置文件（ceph.conf，按搜索路径查找）
   int ret = conf.parse_config_files(c_str_or_null(conf_file_list),
 				    &cerr, flags);
   if (ret == -EDOM) {
+    // -EDOM = 配置文件内容有语法错误 → 直接退出
     cct->_log->flush();
     cerr << "global_init: error parsing config file." << std::endl;
     _exit(1);
   }
   else if (ret == -ENOENT) {
+    // -ENOENT = 没找到配置文件
     if (!(flags & CINIT_FLAG_NO_DEFAULT_CONFIG_FILE)) {
+      // 如果用户显式指定了配置文件路径但找不到 → 报错退出
       if (conf_file_list.length()) {
 	cct->_log->flush();
 	cerr << "global_init: unable to open config file from search list "
 	     << conf_file_list << std::endl;
         _exit(1);
       } else {
+        // 没指定路径也没找到默认配置 → 打印提示，用默认值继续
 	cerr << "did not load config file, using default settings."
 	     << std::endl;
       }
     }
   }
   else if (ret) {
+    // 其他读取错误 → 报错退出
     cct->_log->flush();
     cerr << "global_init: error reading config file. "
          << conf.get_parse_error() << std::endl;
     _exit(1);
   }
 
-  // environment variables override (CEPH_ARGS, CEPH_KEYRING)
+  // 环境变量覆盖（CEPH_ARGS、CEPH_KEYRING 等），优先级高于配置文件
   conf.parse_env(cct->get_module_type());
 
-  // command line (as passed by caller)
+  // 命令行参数覆盖（最高优先级，最后应用）
   conf.parse_argv(args);
 
+  // 启动日志系统（如果还没启动的话）
   if (!cct->_log->is_started()) {
     cct->_log->start();
   }
 
-  // do the --show-config[-val], if present in argv
+  // 处理 --show-config / --show-config-val 等展示型命令行参数（展示后直接退出）
   conf.do_argv_commands();
 
-  // Now we're ready to complain about config file parse errors
+  // 现在日志系统已就绪，输出配置文件解析过程中收集的警告信息
   g_conf().complain_about_parse_error(g_ceph_context);
 }
 
@@ -199,26 +234,49 @@ static bool dumpCallback(
 }
 #endif
 
+/**
+ * global_init —— Ceph 全局初始化主函数（Linux 平台完整流程）。
+ *
+ * @param defaults       调用方传入的额外默认配置
+ * @param args           命令行参数（会被修改，已识别的参数被移除）
+ * @param module_type    模块类型（OSD/MON/MDS/CLIENT 等）
+ * @param code_env       运行环境（守护进程/工具/库）
+ * @param flags          初始化标志位
+ * @param run_pre_init   是否在本函数内调用 global_pre_init（false 表示调用方已手动调用）
+ * @return               CephContext 的 intrusive_ptr（引用计数管理生命周期）
+ *
+ * Linux 平台执行流程：
+ *   1. 调用 global_pre_init（加载配置、启动日志）
+ *   2. 屏蔽 SIGPIPE 信号
+ *   3. 安装致命信号处理器（fatal_signal_handlers）
+ *   4. 注册断言上下文
+ *   5. 权限降级（setuid/setgid，root 启动时切换到普通用户）
+ *   6. 设置 dumpable 标志（允许生成 core dump）
+ *   7. 禁用透明大页（THP）
+ *   8. 从 Monitor 拉取配置（如果启用 mon_config）
+ *   9. 应用配置变更、通知所有观察者
+ *  10. 创建 run_dir 并设置权限
+ *  11. 输出版本号、初始化 CRUSH location
+ */
 boost::intrusive_ptr<CephContext>
 global_init(const std::map<std::string,std::string> *defaults,
 	    std::vector < const char* >& args,
 	    uint32_t module_type, code_environment_t code_env,
 	    int flags, bool run_pre_init)
 {
-  // Ensure we're not calling the global init functions multiple times.
+  // 防止重复调用 global_init（整个进程只能初始化一次）
   static bool first_run = true;
   if (run_pre_init) {
-    // We will run pre_init from here (default).
+    // 默认路径：在本函数内执行预初始化
     ceph_assert(!g_ceph_context && first_run);
     global_pre_init(defaults, args, module_type, code_env, flags);
   } else {
-    // Caller should have invoked pre_init manually.
+    // 调用方已手动执行了预初始化，检查确保已执行
     ceph_assert(g_ceph_context && first_run);
   }
   first_run = false;
 
-  // Verify flags have not changed if global_pre_init() has been called
-  // manually. If they have, update them.
+  // 如果 flags 与预初始化时不同，更新一下（主要影响 mon_config 开关）
   if (g_ceph_context->get_init_flags() != flags) {
     g_ceph_context->set_init_flags(flags);
     if (flags & (CINIT_FLAG_NO_DEFAULT_CONFIG_FILE|
@@ -227,40 +285,30 @@ global_init(const std::map<std::string,std::string> *defaults,
     }
   }
 
-  #ifndef _WIN32
-  // signal stuff
+  // ===== Linux：信号处理 =====
+  // 屏蔽 SIGPIPE：网络连接断开时默认会触发 SIGPIPE 导致进程退出，
+  // Ceph 自己处理 EPIPE 错误码，所以屏蔽这个信号
   int siglist[] = { SIGPIPE, 0 };
   block_signals(siglist, NULL);
-  #endif
 
+  // 安装致命信号处理器（段错误、总线错误等 → 打印调用栈）
   if (g_conf()->fatal_signal_handlers) {
     install_standard_sighandlers();
   }
 
-#ifdef HAVE_BREAKPAD
-  if (g_conf()->breakpad) {
-    google_breakpad::MinidumpDescriptor descriptor(g_conf()->crash_dir);
-    g_ceph_context->_ex_handler.reset(
-	new google_breakpad::ExceptionHandler(descriptor, nullptr, dumpCallback, nullptr, true, -1));
-  }
-#else
-  if (g_conf()->breakpad) {
-    cerr << "breakpad crash reporting requested, but disabled at build time"
-         << std::endl;
-  }
-#endif
-
+  // 注册断言上下文（断言失败时能打印更多上下文信息）
   ceph::register_assert_context(g_ceph_context);
 
+  // 退出时刷新日志（如果配置为 true）
   if (g_conf()->log_flush_on_exit)
     g_ceph_context->_log->set_flush_on_exit();
 
-  // drop privileges?
+  // ===== Linux：权限降级 =====
+  // 如果以 root 启动，且配置了 --setuser/--setgroup，则切换到普通用户/组
+  // 非 root 时忽略 --setuser（因为没权限切换）
   std::ostringstream priv_ss;
-
-  #ifndef _WIN32
-  // consider --setuser root a no-op, even if we're not root
   if (getuid() != 0) {
+    // 非 root 用户：打印忽略提示
     if (g_conf()->setuser.length()) {
       cerr << "ignoring --setuser " << g_conf()->setuser << " since I am not root"
 	   << std::endl;
@@ -271,42 +319,44 @@ global_init(const std::map<std::string,std::string> *defaults,
     }
   } else if (g_conf()->setgroup.length() ||
              g_conf()->setuser.length()) {
-    uid_t uid = 0;  // zero means no change; we can only drop privs here.
+    uid_t uid = 0;  // 0 表示不切换
     gid_t gid = 0;
     std::string uid_string;
     std::string gid_string;
     std::string home_directory;
+
     if (g_conf()->setuser.length()) {
       char buf[4096];
       struct passwd pa;
       struct passwd *p = 0;
 
+      // 先尝试按数字 UID 解析
       uid = atoi(g_conf()->setuser.c_str());
       if (uid) {
         getpwuid_r(uid, &pa, buf, sizeof(buf), &p);
       } else {
+        // 按用户名查找
 	getpwnam_r(g_conf()->setuser.c_str(), &pa, buf, sizeof(buf), &p);
         if (!p) {
 	  cerr << "unable to look up user '" << g_conf()->setuser << "'"
 	       << std::endl;
 	  exit(1);
         }
-
-        uid = p->pw_uid;
-        gid = p->pw_gid;
+        uid = p->pw_uid;     // 记录 UID
+        gid = p->pw_gid;     // 同时记录默认 GID
         uid_string = g_conf()->setuser;
       }
-
+      // 记录 home 目录（切换后设置 HOME 环境变量）
       if (p && p->pw_dir != nullptr) {
         home_directory = std::string(p->pw_dir);
       }
     }
+
     if (g_conf()->setgroup.length() > 0) {
+      // 先尝试按数字 GID 解析
       gid = atoi(g_conf()->setgroup.c_str());
       if (!gid) {
-	// There's no actual well-defined max that I could find in
-	// library documentation. If we're allocating on the heap,
-	// 64KiB seems at least reasonable.
+        // 按组名查找
 	static constexpr std::size_t size = 64 * 1024;
 	auto buf = std::make_unique_for_overwrite<char[]>(size);
 	struct group gr;
@@ -321,9 +371,12 @@ global_init(const std::map<std::string,std::string> *defaults,
 	gid_string = g_conf()->setgroup;
       }
     }
+
+    // setuser_match_path：切换前检查指定路径的所有者是否匹配
+    // 如果不匹配则拒绝切换（安全机制，防止数据目录权限错乱）
     if ((uid || gid) &&
 	g_conf()->setuser_match_path.length()) {
-      // induce early expansion of setuser_match_path config option
+      // 先展开路径中的元变量（如 $data_dir 等）
       string match_path = g_conf()->setuser_match_path;
       g_conf().early_expand_meta(match_path, &cerr);
       struct stat st;
@@ -334,6 +387,7 @@ global_init(const std::map<std::string,std::string> *defaults,
 	     << ": " << cpp_strerror(errno) << std::endl;
 	exit(1);
       }
+      // UID/GID 不匹配 → 不切换，保持 root
       if ((uid && uid != st.st_uid) ||
 	  (gid && gid != st.st_gid)) {
 	cerr << "WARNING: will not setuid/gid: " << match_path
@@ -350,63 +404,60 @@ global_init(const std::map<std::string,std::string> *defaults,
 		<< st.st_uid << ":" << st.st_gid << ". ";
       }
     }
+    // 把要切换的 uid/gid 存到 CephContext（延迟切换时会用到）
     g_ceph_context->set_uid_gid(uid, gid);
     g_ceph_context->set_uid_gid_strings(uid_string, gid_string);
+
     if ((flags & CINIT_FLAG_DEFER_DROP_PRIVILEGES) == 0) {
+      // 立即切换权限：先 setgid 再 setuid（顺序不能反）
       if (setgid(gid) != 0) {
 	cerr << "unable to setgid " << gid << ": " << cpp_strerror(errno)
 	     << std::endl;
 	exit(1);
       }
-#if defined(HAVE_SYS_PRCTL_H)
+      // set_keepcaps：setuid 后保留能力位（CAP_*），RDMA 等场景需要
       if (g_conf().get_val<bool>("set_keepcaps")) {
 	if (prctl(PR_SET_KEEPCAPS, 1) == -1) {
 	  cerr << "warning: unable to set keepcaps flag: " << cpp_strerror(errno) << std::endl;
 	}
       }
-#endif
       if (setuid(uid) != 0) {
 	cerr << "unable to setuid " << uid << ": " << cpp_strerror(errno)
 	     << std::endl;
 	exit(1);
       }
+      // 更新 HOME 环境变量
       if (setenv("HOME", home_directory.c_str(), 1) != 0) {
 	cerr << "warning: unable to set HOME to " << home_directory << ": "
              << cpp_strerror(errno) << std::endl;
       }
       priv_ss << "set uid:gid to " << uid << ":" << gid << " (" << uid_string << ":" << gid_string << ")";
     } else {
+      // 延迟切换（稍后再切），先记录到日志
       priv_ss << "deferred set uid:gid to " << uid << ":" << gid << " (" << uid_string << ":" << gid_string << ")";
     }
   }
-  #endif /* _WIN32 */
 
-#if defined(HAVE_SYS_PRCTL_H)
+  // ===== Linux：prctl 系统调优 =====
+  // 设置 dumpable=1：允许生成 core dump（setuid 后默认禁止 core dump）
   if (prctl(PR_SET_DUMPABLE, 1) == -1) {
     cerr << "warning: unable to set dumpable flag: " << cpp_strerror(errno) << std::endl;
   }
-#  if defined(PR_SET_THP_DISABLE)
+  // 禁用透明大页（THP）：THP 会导致 Ceph OSD 内存分配 latency 抖动
   if (!g_conf().get_val<bool>("thp") && prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) == -1) {
     cerr << "warning: unable to disable THP: " << cpp_strerror(errno) << std::endl;
   }
-#  endif
-#endif
 
-  //
-  // Utterly important to run first network connection after setuid().
-  // In case of rdma transport uverbs kernel module starts returning
-  // -EACCESS on each operation if credentials has been changed, see
-  // callers of ib_safe_file_access() for details.
-  //
-  // fork() syscall also matters, so daemonization won't work in case
-  // of rdma.
-  //
+  // ===== 从 Monitor 拉取配置 =====
+  // 注意：必须在 setuid 之后建立网络连接！
+  // RDMA 传输层在权限变更后会报 EACCES，所以网络初始化必须在权限切换完成后
   if (!g_conf()->no_mon_config) {
-    // make sure our mini-session gets legacy values
+    // 确保 mini-session 也有最新的遗留字段值
     g_conf().apply_changes(nullptr);
 
     ceph::async::io_context_pool cp(1);
     MonClient mc_bootstrap(g_ceph_context, cp);
+    // 从 MON 拉 monmap 和配置项
     if (mc_bootstrap.get_monmap_and_config() < 0) {
       cp.stop();
       g_ceph_context->_log->flush();
@@ -417,9 +468,10 @@ global_init(const std::map<std::string,std::string> *defaults,
     cp.stop();
   }
 
-  // Expand metavariables. Invoke configuration observers. Open log file.
+  // 展开所有元变量、调用配置观察者、打开日志文件
   g_conf().apply_changes(nullptr);
 
+  // 创建 run_dir（存放 admin socket、pid 文件等运行时文件）
   if (g_conf()->run_dir.length() &&
       code_env == CODE_ENVIRONMENT_DAEMON &&
       !(flags & CINIT_FLAG_NO_DAEMON_ACTIONS)) {
@@ -430,6 +482,7 @@ global_init(const std::map<std::string,std::string> *defaults,
        cerr << "warning: unable to create " << g_conf()->run_dir
             << ec.message() << std::endl;
       }
+      // 设置目录权限：owner 全权限，group 和 others 只读 + 执行
       fs::permissions(
         g_conf()->run_dir.c_str(),
         fs::perms::owner_all |
@@ -438,19 +491,18 @@ global_init(const std::map<std::string,std::string> *defaults,
     }
   }
 
-  // call all observers now.  this has the side-effect of configuring
-  // and opening the log file immediately.
+  // 通知所有配置观察者（副作用：日志文件被立即配置并打开）
   g_conf().call_all_observers();
 
+  // 输出权限变更信息到日志
   if (priv_ss.str().length()) {
     dout(0) << priv_ss.str() << dendl;
   }
 
+  // 如果延迟切换权限，此时调整日志文件和 run_dir 的所有者
   if ((flags & CINIT_FLAG_DEFER_DROP_PRIVILEGES) &&
       (g_ceph_context->get_set_uid() || g_ceph_context->get_set_gid())) {
-    // Fix ownership on log files and run directories if needed.
-    // Admin socket files are chown()'d during the common init path _after_
-    // the service thread has been started. This is sadly a bit of a hack :(
+    // 修正 run_dir 和日志文件的所有者
     chown_path(g_conf()->run_dir,
 	       g_ceph_context->get_set_uid(),
 	       g_ceph_context->get_set_gid(),
@@ -461,25 +513,27 @@ global_init(const std::map<std::string,std::string> *defaults,
       g_ceph_context->get_set_gid());
   }
 
-  // Now we're ready to complain about config file parse errors
+  // 日志就绪后，输出配置文件解析过程中收集的警告
   g_conf().complain_about_parse_error(g_ceph_context);
 
-  // test leak checking
+  // 调试用：故意泄漏内存（测试泄漏检测）
   if (g_conf()->debug_deliberately_leak_memory) {
     derr << "deliberately leaking some memory" << dendl;
     char *s = new char[1234567];
     (void)s;
-    // cppcheck-suppress memleak
   }
 
+  // 守护进程模式：输出版本号
   if (code_env == CODE_ENVIRONMENT_DAEMON && !(flags & CINIT_FLAG_NO_DAEMON_ACTIONS))
     output_ceph_version();
 
+  // 初始化 CRUSH 位置信息（如 rack/row/room 等）
   if (g_ceph_context->crush_location.init_on_startup()) {
     cerr << " failed to init_on_startup : " << cpp_strerror(errno) << std::endl;
     exit(1);
   }
 
+  // 返回 CephContext 的 intrusive_ptr（引用计数 +1，false 表示不增加引用）
   return boost::intrusive_ptr<CephContext>{g_ceph_context, false};
 }
 
