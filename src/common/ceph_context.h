@@ -116,6 +116,17 @@ namespace ceph::common {
  * CephContext contains the configuration, the dout object, and anything else
  * that you might want to pass to libcommon with every function call.
  */
+/**
+ * CephContext —— Ceph 进程的核心上下文对象（通常缩写为 cct）
+ *
+ * 每个 Ceph 进程启动时创建一个 CephContext 实例，它承载全部基础设施：
+ *   - _conf      : 全局配置（ConfigProxy）
+ *   - _log       : 日志系统（Log）
+ *   - _module_type: 当前模块类型（OSD / MON / MDS / CLIENT 等）
+ *   - 加密、性能计数器、Admin Socket、插件注册表、心跳、崩溃处理等
+ *
+ * 生命周期：引用计数管理（get() / put()），当引用计数归零时自动析构。
+ */
 class CephContext {
 public:
   CephContext(uint32_t module_type_,
@@ -124,30 +135,31 @@ public:
   struct create_options {
     enum code_environment_t code_env=CODE_ENVIRONMENT_UTILITY;
     int init_flags = 0;
+    // 自定义日志创建函数（若不指定则使用默认的 Log 实现）
     std::function<ceph::logging::Log* (const ceph::logging::SubsystemMap *)> create_log;
   };
   CephContext(uint32_t module_type_,
 	      const create_options& options);
+  // 禁止拷贝 / 移动 —— CephContext 是全局唯一实例，不应被复制
   CephContext(const CephContext&) = delete;
   CephContext& operator =(const CephContext&) = delete;
   CephContext(CephContext&&) = delete;
   CephContext& operator =(CephContext&&) = delete;
 
-  bool _finished = false;
+  bool _finished = false;       // 标记 CephContext 是否已完成析构（供断言使用）
   ~CephContext();
 
-  // ref count!
 private:
-  std::atomic<unsigned> nref;
+  std::atomic<unsigned> nref;   // 引用计数（原子操作，线程安全）
 public:
-  CephContext *get() {
+  CephContext *get() {          // 增加引用计数，返回 this
     ++nref;
     return this;
   }
-  void put();
+  void put();                   // 减少引用计数，归零时调用 delete this
 
-  ConfigProxy _conf;
-  ceph::logging::Log *_log;
+  ConfigProxy _conf;            // 全局配置代理（读写运行时配置项）
+  ceph::logging::Log *_log;     // 日志后端（输出到文件 / syslog / stderr 等）
 #ifdef HAVE_BREAKPAD
   std::unique_ptr<google_breakpad::ExceptionHandler> _ex_handler;
   static_assert(sizeof(std::unique_ptr<google_breakpad::ExceptionHandler>) == sizeof(std::unique_ptr<char>));
@@ -156,22 +168,22 @@ public:
   std::unique_ptr<char> _ex_handler;
 #endif
 
-  /* init ceph::crypto */
+  /* 初始化加密子系统（内部引用计数，可多次调用） */
   void init_crypto();
 
-  /// shutdown crypto (should match init_crypto calls)
+  /// 关闭加密子系统（与 init_crypto 配对调用）
   void shutdown_crypto();
 
-  /* Start the Ceph Context's service thread */
+  /* 启动 CephContext 的后台服务线程（处理 SIGHUP 日志重开等） */
   void start_service_thread();
 
-  /* Reopen the log files */
+  /* 重新打开日志文件（SIGHUP 信号触发，用于日志轮转） */
   void reopen_logs();
 
-  /* Get the module type (client, mon, osd, mds, etc.) */
+  /* 获取当前模块类型（返回 CEPH_ENTITY_TYPE_OSD / MON / MDS / CLIENT 等） */
   uint32_t get_module_type() const;
 
-  // this is here only for testing purposes!
+  // 仅供测试使用！修改模块类型
   void _set_module_type(uint32_t t) {
     _module_type = t;
   }
@@ -179,7 +191,7 @@ public:
   void set_init_flags(int flags);
   int get_init_flags() const;
 
-  /* Get the PerfCountersCollection of this CephContext */
+  /* 获取性能计数器集合（用于采集运行时指标） */
   PerfCountersCollection *get_perfcounters_collection();
 
   ceph::HeartbeatMap *get_heartbeat_map() {
@@ -187,17 +199,13 @@ public:
   }
 
   /**
-   * Get the admin socket associated with this CephContext.
-   *
-   * Currently there is always an admin socket object,
-   * so this will never return NULL.
-   *
-   * @return the admin socket
+   * 获取 Admin Socket（管理接口）。
+   * 每个 CephContext 都有一个 Admin Socket 实例，不会返回 NULL。
    */
   AdminSocket *get_admin_socket();
 
   /**
-   * process an admin socket command
+   * 处理来自 admin socket 的命令（daemon/admin_socket 机制）
    */
   int do_command(std::string_view command, const cmdmap_t& cmdmap,
 		 Formatter *f,
@@ -210,6 +218,12 @@ public:
 
   static constexpr std::size_t largest_singleton = 8 * 72;
 
+  /**
+   * 获取或创建单例对象（按名称 + 类型索引）。
+   * 供各子系统存储全局唯一实例，避免使用裸全局变量。
+   * @param name         单例名称
+   * @param drop_on_fork fork 时是否销毁重建（处理 fork 后的线程安全问题）
+   */
   template<typename T, typename... Args>
   T& lookup_or_create_singleton_object(std::string_view name,
 				       bool drop_on_fork,
@@ -235,21 +249,22 @@ public:
   }
 
   /**
-   * get a crypto handler
+   * 获取加密处理器（按类型索引，如 AES）
    */
   CryptoHandler *get_crypto_handler(int type);
 
-  CryptoRandom* random() const { return _crypto_random.get(); }
+  CryptoRandom* random() const { return _crypto_random.get(); }  // 安全随机数生成器
 
-  /// check if experimental feature is enable, and emit appropriate warnings
+  /// 检查实验性功能是否已启用，若未启用在日志中发出警告
   bool check_experimental_feature_enabled(const std::string& feature);
   bool check_experimental_feature_enabled(const std::string& feature,
 					  std::ostream *message);
 
-  ceph::PluginRegistry *get_plugin_registry() {
+  ceph::PluginRegistry *get_plugin_registry() {  // 插件注册表（动态加载 .so）
     return _plugin_registry;
   }
 
+  // 设置/获取进程的 uid/gid（用于权限降级）
   void set_uid_gid(uid_t u, gid_t g) {
     _set_uid = u;
     _set_gid = g;
@@ -275,18 +290,19 @@ public:
   class ForkWatcher {
    public:
     virtual ~ForkWatcher() {}
-    virtual void handle_pre_fork() = 0;
-    virtual void handle_post_fork() = 0;
+    virtual void handle_pre_fork() = 0;   // fork() 之前回调
+    virtual void handle_post_fork() = 0;  // fork() 之后回调（在子进程中）
   };
 
+  // 注册 fork 观察者（多线程 fork 时用于释放/重建锁等资源）
   void register_fork_watcher(ForkWatcher *w) {
     std::lock_guard lg(_fork_watchers_lock);
     _fork_watchers.push_back(w);
   }
 
   void drop_temp_messenger_obj();
-  void notify_pre_fork();
-  void notify_post_fork();
+  void notify_pre_fork();   // 通知所有 ForkWatcher：即将 fork
+  void notify_post_fork();  // 通知所有 ForkWatcher：fork 完成（子进程）
 
   /**
    * update CephContext with a copy of the passed in MonMap mon addrs
@@ -313,20 +329,19 @@ public:
 
 private:
 
-
-  /* Stop and join the Ceph Context's service thread */
+  /* 停止并 join 后台服务线程 */
   void join_service_thread();
 
-  uint32_t _module_type;
+  uint32_t _module_type;    // 模块类型（OSD / MON / MDS / CLIENT 等）
 
-  int _init_flags;
+  int _init_flags;          // 初始化标志位
 
-  uid_t _set_uid; ///< uid to drop privs to
-  gid_t _set_gid; ///< gid to drop privs to
+  uid_t _set_uid;           // 权限降级目标 uid
+  gid_t _set_gid;           // 权限降级目标 gid
   std::string _set_uid_string;
   std::string _set_gid_string;
 
-  int _crypto_inited;
+  int _crypto_inited;       // 加密初始化引用计数
 
 #ifdef __cpp_lib_atomic_shared_ptr
   std::atomic<std::shared_ptr<std::vector<entity_addrvec_t>>> _mon_addrs;
@@ -334,32 +349,33 @@ private:
   std::shared_ptr<std::vector<entity_addrvec_t>> _mon_addrs;
 #endif
 
-  /* libcommon service thread.
-   * SIGHUP wakes this thread, which then reopens logfiles */
+  /* 后台服务线程。
+   * SIGHUP 信号会唤醒此线程，然后重新打开日志文件 */
   friend class CephContextServiceThread;
   CephContextServiceThread *_service_thread;
 
   using md_config_obs_t = ceph::md_config_obs_impl<ConfigProxy>;
 
-  md_config_obs_t *_log_obs;
+  md_config_obs_t *_log_obs;  // 日志相关的配置变更观察者
 
-  /* The admin socket associated with this context */
+  /* 此 CephContext 关联的 Admin Socket（管理接口） */
   AdminSocket *_admin_socket;
 
-  /* lock which protects service thread creation, destruction, etc. */
+  /* 保护服务线程创建/销毁的锁 */
   ceph::spinlock _service_thread_lock;
 
-  /* The collection of profiling loggers associated with this context */
+  /* 性能计数器集合（采集运行时性能指标） */
   PerfCountersCollection *_perf_counters_collection;
 
   md_config_obs_t *_perf_counters_conf_obs;
 
   CephContextHook *_admin_hook;
 
-  ceph::HeartbeatMap *_heartbeat_map;
+  ceph::HeartbeatMap *_heartbeat_map;  // 心跳映射表（检测工作线程卡死）
 
-  ceph::spinlock associated_objs_lock;
+  ceph::spinlock associated_objs_lock; // 保护单例对象 map 的锁
 
+  // 单例对象 map：按 (名称, 类型) 索引，存储 immobile_any 对象
   struct associated_objs_cmp {
     using is_transparent = std::true_type;
     template<typename T, typename U>
@@ -375,22 +391,23 @@ private:
 	   associated_objs_cmp> associated_objs;
   std::set<std::string> associated_objs_drop_on_fork;
 
+  // fork 观察者列表锁
   ceph::spinlock _fork_watchers_lock;
   std::vector<ForkWatcher*> _fork_watchers;
 
-  // crypto
-  CryptoHandler *_crypto_none;
-  CryptoHandler *_crypto_aes;
-  std::unique_ptr<CryptoRandom> _crypto_random;
+  // ===== 加密子系统 =====
+  CryptoHandler *_crypto_none;  // 无加密处理器
+  CryptoHandler *_crypto_aes;   // AES 加密处理器
+  std::unique_ptr<CryptoRandom> _crypto_random;  // 安全随机数生成器
 
-  // experimental
+  // ===== 实验性功能 =====
   CephContextObs *_cct_obs;
   ceph::spinlock _feature_lock;
-  std::set<std::string> _experimental_features;
+  std::set<std::string> _experimental_features;  // 已启用的实验性功能集合
 
-  ceph::PluginRegistry* _plugin_registry;
+  ceph::PluginRegistry* _plugin_registry;  // 插件注册表（动态加载共享库）
 #ifdef CEPH_DEBUG_MUTEX
-  md_config_obs_t *_lockdep_obs;
+  md_config_obs_t *_lockdep_obs;           // 锁依赖检测观察者
 #endif
 
   std::unique_ptr<AdminSocketHook> _msgr_hook;

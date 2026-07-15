@@ -157,11 +157,13 @@ argv = ["./ceph-osd", "-i", "0", "--debug-osd", "20"]
 */
 int main(int argc, const char **argv)
 {
-  auto args = argv_to_vec(argc, argv);
+  auto args = argv_to_vec(argc, argv);  // 将命令行参数转换为vector，便于后续处理，例如：["-i", "0", "--debug-osd", "20"]
   if (args.empty()) {
     cerr << argv[0] << ": -h or --help for usage" << std::endl;
     exit(1);
   }
+
+  // 如果参数中包含 -h 或 --help，打印帮助信息并退出程序
   if (ceph_argparse_need_usage(args)) {
     usage();
     exit(0);

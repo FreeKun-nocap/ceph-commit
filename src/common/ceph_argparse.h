@@ -40,9 +40,9 @@ class CephInitParameters
 public:
   explicit CephInitParameters(uint32_t module_type_);
 
-  uint32_t module_type;
-  EntityName name;
-  bool no_config_file = false;
+  uint32_t module_type;  // 模块类型，例如 CEPH_ENTITY_TYPE_OSD
+  EntityName name;  // 实体名称，例如 osd.0
+  bool no_config_file = false;  // 是否不使用配置文件
 
   void encode(ceph::buffer::list& bl) const {
     ENCODE_START(1, 1, bl);

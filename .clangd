@@ -1,0 +1,8 @@
+Diagnostics:
+  Suppress: '*'
+  ClangTidy:
+    Remove: '*'
+CompileFlags:
+  Add: [-std=c++20, -ferror-limit=0, -I/root/ceph-commit/ceph/src, -I/root/ceph-commit/ceph/src/include]
+Index:
+  Background: Build

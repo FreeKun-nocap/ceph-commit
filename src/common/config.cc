@@ -130,34 +130,49 @@ static int conf_stringify(const Option::value_t& v, string *out)
   return 0;
 }
 
+/**
+ * md_config_t 构造函数 —— 初始化 Ceph 配置系统的核心对象。
+ *
+ * @param values   配置值存储（ConfigValues），实际持有所有配置项的当前值
+ * @param tracker  配置变更追踪器（用于通知观察者配置变更）
+ * @param is_daemon 是否为守护进程模式（影响日志输出目标等行为）
+ *
+ * 构造时执行：
+ *   1. 将编译时注册的全部 Option 加载到 schema map 中，实现 O(1) 查找
+ *   2. 为每个调试子系统自动生成 debug_<name> 选项
+ */
 md_config_t::md_config_t(ConfigValues& values,
 			 const ConfigTracker& tracker,
 			 bool is_daemon)
   : is_daemon(is_daemon)
 {
-  // Load the compile-time list of Option into
-  // a map so that we can resolve keys quickly.
+  // 遍历编译时注册的全部 Option（来自各模块 YAML 定义生成的 ceph_options[] 数组）
   for (const auto &i : ceph_options) {
     if (schema.count(i.name)) {
-      // We may be instantiated pre-logging so send 
+      // 检测重复注册的配置项（可能是代码 bug），直接终止进程
       std::cerr << "Duplicate config key in schema: '" << i.name << "'"
                 << std::endl;
       ceph_abort();
     }
+    // 插入 schema map，key 为配置项名，value 为 Option 元数据引用
     schema.emplace(i.name, i);
   }
 
-  // Define the debug_* options as well.
+  // ===== 动态生成 debug_* 选项 =====
+  // 为每个调试子系统（如 osd, mon, mds, bluestore 等）自动注册对应的
+  // debug_<subsys> 配置项，格式为 "N" 或 "N/M"
   subsys_options.reserve(values.subsys.get_num());
   for (unsigned i = 0; i < values.subsys.get_num(); ++i) {
     subsys_options.emplace_back(
       fmt::format("debug_{}", values.subsys.get_name(i)), Option::TYPE_STR, Option::LEVEL_ADVANCED);
     Option& opt = subsys_options.back();
+    // 默认值：日志级别/收集级别，如 "4/5"
     opt.set_default(fmt::format("{}/{}", values.subsys.get_log_level(i), values.subsys.get_gather_level(i)));
     opt.set_description(fmt::format("Debug level for {}", values.subsys.get_name(i)).c_str());
-    opt.set_flag(Option::FLAG_RUNTIME);
+    opt.set_flag(Option::FLAG_RUNTIME);     // 标记为运行时可变（无需重启）
     opt.set_long_description("The value takes the form 'N' or 'N/M' where N and M are values between 0 and 99.  N is the debug level to log (all values below this are included), and M is the level to gather and buffer in memory.  In the event of a crash, the most recent items <= M are dumped to the log file.");
     opt.set_subsys(i);
+    // 值校验器：检查 N/M 格式是否合法（两个 0-99 的整数）
     opt.set_validator([](std::string *value, std::string *error_message) {
 	int m, n;
 	int r = sscanf(value->c_str(), "%d/%d", &m, &n);
@@ -172,7 +187,7 @@ md_config_t::md_config_t(ConfigValues& values,
 	      return -ERANGE;
 	    }
 	  } else {
-	    // normalize to M/N
+	    // 如果只写了 N（无 /M），归一化为 N/N
 	    n = m;
 	    *value = fmt::format("{}/{}", m, n);
 	  }
@@ -183,46 +198,44 @@ md_config_t::md_config_t(ConfigValues& values,
 	return 0;
       });
   }
+  // 将动态生成的 debug_* 选项也注册进 schema
   for (auto& opt : subsys_options) {
     schema.emplace(opt.name, opt);
   }
 
+  // 校验 schema 完整性（检查 see-also 引用等）
   validate_schema();
 
-  // Validate default values from the schema
+  // ===== 校验所有配置项的默认值 =====
+  // 对每个 STR 类型配置项，用其 pre_validate() 函数检查默认值是否合法。
+  // 如果校验器对字符串做了规范化（如 trim、大小写转换），则用规范化后的值覆盖默认值。
   for (const auto &i : schema) {
     const Option &opt = i.second;
     if (opt.type == Option::TYPE_STR) {
       bool has_daemon_default = (opt.daemon_value != Option::value_t{});
       Option::value_t default_val;
       if (is_daemon && has_daemon_default) {
-	default_val = opt.daemon_value;
+        default_val = opt.daemon_value;     // 守护进程使用 daemon_value
       } else {
-	default_val = opt.value;
+        default_val = opt.value;            // 否则使用通用默认值
       }
-      // We call pre_validate as a sanity check, but also to get any
-      // side effect (value modification) from the validator.
       auto* def_str = std::get_if<std::string>(&default_val);
       std::string val = *def_str;
       std::string err;
       if (opt.pre_validate(&val, &err) != 0) {
+        // 编译内置的默认值居然通不过自己的校验 → 严重 bug，终止进程
         std::cerr << "Default value " << opt.name << "=" << *def_str << " is "
                      "invalid: " << err << std::endl;
-
-        // This is the compiled-in default that is failing its own option's
-        // validation, so this is super-invalid and should never make it
-        // past a pull request: crash out.
         ceph_abort();
       }
       if (val != *def_str) {
-	// if the validator normalizes the string into a different form than
-	// what was compiled in, use that.
-	set_val_default(values, tracker, opt.name, val);
+        // 校验器对默认值做了规范化（如归一化字符串形式），用规范化后的值替换
+        set_val_default(values, tracker, opt.name, val);
       }
     }
   }
 
-  // Copy out values (defaults) into any legacy (C struct member) fields
+  // 将默认值同步到遗留 C 结构体字段（向后兼容旧代码使用的全局变量）
   update_legacy_vals(values);
 }
 
@@ -256,13 +269,22 @@ void md_config_t::validate_schema()
   }
 }
 
+/**
+ * 根据配置项名称查找对应的 Option 定义元数据。
+ *
+ * 在 schema map 中查找配置项，该 map 在程序启动时由所有模块注册的
+ * Option 定义填充。如果配置项未注册，返回 nullptr。
+ *
+ * @param name 配置项名称（如 "osd_data", "log_file" 等）
+ * @return 找到的 Option 指针，不存在则返回 nullptr
+ */
 const Option *md_config_t::find_option(const std::string_view name) const
 {
-  auto p = schema.find(name);
+  auto p = schema.find(name);           // 在全局 schema 表中查找
   if (p != schema.end()) {
-    return &p->second;
+    return &p->second;                  // 返回 Option 的指针
   }
-  return nullptr;
+  return nullptr;                       // 未注册的配置项返回空指针
 }
 
 void md_config_t::set_val_default(ConfigValues& values,

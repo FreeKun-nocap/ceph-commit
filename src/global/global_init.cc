@@ -118,6 +118,7 @@ void global_pre_init(
   // ensure environment arguments are included in early processing
   env_to_vec(args);
 
+  // 第一轮参数解析：从命令行中提取 --cluster、--conf/-c、-i、--name、--version 等早期参数
   CephInitParameters iparams = ceph_argparse_early_args(
     args, module_type,
     &cluster, &conf_file_list);

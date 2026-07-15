@@ -154,6 +154,7 @@ void env_to_vec(std::vector<const char*>& args, const char *name)
 }
 
 /**
+vector 是动态数组
 作用：将传统的 C 风格命令行参数数组转换为 C++ 的 vector 容器，并移除程序名
 参数：
   argc: 命令行参数数量, 包括程序名本身
@@ -548,6 +549,20 @@ bool ceph_argparse_witharg(std::vector<const char*> &args,
   return r != 0;
 }
 
+/**
+ * 早期参数解析 —— 在所有模块通用的初始化参数中，提取出 Ceph 进程启动
+ * 所需的最基本信息（版本、配置文件、集群名、实体 ID/名称等）。
+ *
+ * 与完整的参数解析不同，此函数：
+ *   - 遇到 "--" 时立即停止（不消费它），后续解析器还需要看到这个分隔符
+ *   - 不认识的参数直接跳过（ignore），留给后续模块处理
+ *
+ * @param args           命令行参数向量（会被消费，已识别的参数会从中移除）
+ * @param module_type    调用者的模块类型（CEPH_ENTITY_TYPE_OSD / MON / MDS / CLIENT 等）
+ * @param cluster        输出：集群名称（如 "ceph"），通过 --cluster 指定
+ * @param conf_file_list 输出：配置文件路径，通过 --conf/-c 指定
+ * @return CephInitParameters 初始化参数对象
+ */
 CephInitParameters ceph_argparse_early_args
 	  (std::vector<const char*>& args, uint32_t module_type,
 	   std::string *cluster, std::string *conf_file_list)
@@ -555,37 +570,49 @@ CephInitParameters ceph_argparse_early_args
   CephInitParameters iparams(module_type);
   std::string val;
 
+  // 保存原始参数副本，供 --show_args 使用
   auto orig_args = args;
 
+  // 遍历参数列表，逐个匹配已知的早期参数
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
     if (strcmp(*i, "--") == 0) {
-      /* Normally we would use ceph_argparse_double_dash. However, in this
-       * function we *don't* want to remove the double dash, because later
-       * argument parses will still need to see it. */
+      // 遇到双横线分隔符：停止解析但不删除它，
+      // 后续（如各模块自己的参数解析）还需要识别 "--" 来区分位置参数
       break;
     }
     else if (ceph_argparse_flag(args, i, "--version", "-v", (char*)NULL)) {
+      // --version / -v：打印版本号并退出
       std::cout << pretty_version_to_str() << std::endl;
       _exit(0);
     }
     else if (ceph_argparse_witharg(args, i, &val, "--conf", "-c", (char*)NULL)) {
+      // --conf / -c：指定配置文件路径
       *conf_file_list = val;
     }
     else if (ceph_argparse_flag(args, i, "--no-config-file", (char*)NULL)) {
+      // --no-config-file：跳过读取任何配置文件
       iparams.no_config_file = true;
     }
     else if (ceph_argparse_witharg(args, i, &val, "--cluster", (char*)NULL)) {
+      // --cluster：指定集群名称（默认 "ceph"）
       *cluster = val;
     }
     else if ((module_type != CEPH_ENTITY_TYPE_CLIENT) &&
 	     (ceph_argparse_witharg(args, i, &val, "-i", (char*)NULL))) {
+      // -i <ID>：设置服务端守护进程的数字 ID（仅非 CLIENT 类型可用）
+      // 例如 ceph-osd -i 0  →  name = "osd.0"
       iparams.name.set_id(val);
     }
     else if (ceph_argparse_witharg(args, i, &val, "--id", "--user", (char*)NULL)) {
+      // --id / --user：以字符串形式设置实体 ID
+      // 例如 ceph --id admin  →  name = "client.admin"
       iparams.name.set_id(val);
     }
     else if (ceph_argparse_witharg(args, i, &val, "--name", "-n", (char*)NULL)) {
+      // --name / -n：以 TYPE.ID 格式设置完整实体名
+      // 例如 ceph --name osd.0  →  name = "osd.0"
       if (!iparams.name.from_str(val)) {
+        // 格式不合法（不是 TYPE.ID 形式），报错退出
 	std::cerr << "error parsing '" << val << "': expected string of the form TYPE.ID, "
 		  << "valid types are: " << EntityName::get_valid_types_as_str()
 		  << std::endl;
@@ -593,6 +620,7 @@ CephInitParameters ceph_argparse_early_args
       }
     }
     else if (ceph_argparse_flag(args, i, "--show_args", (char*)NULL)) {
+      // --show_args：调试用，打印所有原始参数
       std::cout << "args: ";
       for (std::vector<const char *>::iterator ci = orig_args.begin(); ci != orig_args.end(); ++ci) {
 	if (ci != orig_args.begin())
@@ -602,7 +630,7 @@ CephInitParameters ceph_argparse_early_args
       std::cout << std::endl;
     }
     else {
-      // ignore
+      // 不认识的参数：保留在 args 中（跳过），留给后续模块处理
       ++i;
     }
   }
