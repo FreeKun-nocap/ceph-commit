@@ -542,30 +542,38 @@ void global_print_banner(void)
   output_ceph_version();
 }
 
+// fork 之前的准备工作
+// 返回值：
+//   -1 — 不需要 fork（非守护进程 / daemonize=false），调用者跳过 prefork 流程
+//    0 — 需要 fork，调用者应执行 fork() 进入守护进程模式
 int global_init_prefork(CephContext *cct)
 {
+  // 非守护进程（工具/库模式）：不需要 fork
   if (g_code_env != CODE_ENVIRONMENT_DAEMON)
     return -1;
 
   const auto& conf = cct->_conf;
+  // 配置了 daemonize=false（-f 前台运行）：不 fork，只写 pid 文件
   if (!conf->daemonize) {
 
-    if (pidfile_write(conf->pid_file) < 0)
+    if (pidfile_write(conf->pid_file) < 0)            // 写 PID 文件
       exit(1);
 
+    // 延迟降权模式下修正 pid 文件的所有者
     if ((cct->get_init_flags() & CINIT_FLAG_DEFER_DROP_PRIVILEGES) &&
 	(cct->get_set_uid() || cct->get_set_gid())) {
       chown_path(conf->pid_file, cct->get_set_uid(), cct->get_set_gid(),
 		 cct->get_set_uid_string(), cct->get_set_gid_string());
     }
-    cct->drop_temp_messenger_obj();
+    // global_init 过程中，为了从 Monitor 拉取配置，Ceph 临时创建了一个 Messenger。这个 Messenger 依赖 NetworkStack 单例。
+    cct->drop_temp_messenger_obj();                    // 释放临时 Messenger（fork 后才需要）
     return -1;
   }
 
-  cct->notify_pre_fork();
-  // stop log thread
-  cct->_log->flush();
-  cct->_log->stop();
+  // daemonize=true：准备 fork
+  cct->notify_pre_fork();                              // 通知所有子系统即将 fork
+  cct->_log->flush();                                  // 刷写日志
+  cct->_log->stop();                                   // 停止日志线程（fork 时不能有后台线程）
   return 0;
 }
 

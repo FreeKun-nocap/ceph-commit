@@ -97,28 +97,36 @@ int CrushLocation::update_from_hook()
   return _parse(out);
 }
 
+// 进程启动时初始化 CRUSH 位置信息
+// CRUSH 位置决定 OSD 在 CRUSH map 层次结构中的物理位置（如 host/rack/row）
+// 三种初始化策略（按优先级）：
+//   1. crush_location 配置项 → 直接解析 "host=foo,rack=bar" 格式
+//   2. crush_location_hook 脚本 → 运行外部脚本获取位置信息
+//   3. 默认值 → host=本机短主机名, root=default
 int CrushLocation::init_on_startup()
 {
+  // 策略 1：配置文件中显式指定了 crush_location
   if (cct->_conf->crush_location.length()) {
     return update_from_conf();
   }
+  // 策略 2：配置了外部脚本钩子来动态获取位置
   if (cct->_conf->crush_location_hook.length()) {
     return update_from_hook();
   }
 
-  // start with a sane default
+  // 策略 3：兜底默认值 —— 用本机短主机名作为 host
   char hostname[HOST_NAME_MAX + 1];
-  int r = gethostname(hostname, sizeof(hostname));
+  int r = gethostname(hostname, sizeof(hostname));  // 获取 FQDN 完整主机名
   if (r < 0)
-    strcpy(hostname, "unknown_host");
-  // use short hostname
+    strcpy(hostname, "unknown_host");               // 获取失败用占位名
+  // 截取短主机名（去掉域名后缀）：node01.cluster.local → node01
   for (unsigned i=0; hostname[i]; ++i) {
     if (hostname[i] == '.') {
       hostname[i] = '\0';
       break;
     }
   }
-  std::lock_guard l(lock);
+  std::lock_guard l(lock);  // 加锁，loc 是多线程可读的
   loc.clear();
   loc.insert(std::make_pair<std::string,std::string>("host", hostname));
   loc.insert(std::make_pair<std::string,std::string>("root", "default"));

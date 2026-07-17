@@ -219,31 +219,33 @@ void pidfile_remove()
   pfh = nullptr;
 }
 
+// 写入 PID 文件，记录当前进程的 PID
+// 流程：创建 pfh → 注册 atexit 清理钩子 → open 文件 → write PID
 int pidfile_write(std::string_view pid_file)
 {
-  if (pid_file.empty()) {
+  if (pid_file.empty()) {                              // 没有指定 pid-file，跳过
     dout(0) << __func__ << ": ignore empty --pid-file" << dendl;
     return 0;
   }
 
-  ceph_assert(pfh == nullptr);
+  ceph_assert(pfh == nullptr);                         // 确保不会重复写入
 
-  pfh = new pidfh();
-  if (atexit(pidfile_remove)) {
+  pfh = new pidfh();                                   // 创建 PID 文件句柄
+  if (atexit(pidfile_remove)) {                        // 注册退出时的清理函数（进程退出自动删除 PID 文件）
     derr << __func__ << ": failed to set pidfile_remove function "
 	 << "to run at exit." << dendl;
     return -EINVAL;
   }
 
-  int r = pfh->open(pid_file);
+  int r = pfh->open(pid_file);                         // 打开/创建 PID 文件（加文件锁防多实例）
   if (r != 0) {
-    pidfile_remove();
+    pidfile_remove();                                  // 失败则清理
     return r;
   }
 
-  r = pfh->write();
+  r = pfh->write();                                    // 写入当前进程 PID
   if (r != 0) {
-    pidfile_remove();
+    pidfile_remove();                                  // 失败则清理
     return r;
   }
 

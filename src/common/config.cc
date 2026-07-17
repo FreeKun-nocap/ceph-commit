@@ -1415,6 +1415,7 @@ int md_config_t::_get_val_cstr(
     return -EINVAL;
 
   string val;
+  // 拒绝修改非 RUNTIME 配置 ← 防止运行时改基础配置
   if (conf_stringify(_get_val(values, key), &val) == 0) {
     int l = val.length() + 1;
     if (len == -1) {

@@ -907,32 +907,37 @@ void CephContext::shutdown_crypto()
   }
 }
 
+// 启动 CephContext 的后台服务线程，必须在 fork 之后调用
+// 这一步骤标志初始化阶段结束，进入运行阶段
 void CephContext::start_service_thread()
 {
+  // 创建后台服务线程（只创建一次）
   {
-    std::lock_guard lg(_service_thread_lock);
+    std::lock_guard lg(_service_thread_lock);          // 加锁防多线程重复创建
     if (_service_thread) {
-      return;
+      return;                                          // 已创建，直接返回
     }
     _service_thread = new CephContextServiceThread(this);
-    _service_thread->create("service");
+    _service_thread->create("service");                // 启动线程，线程名为 "service"
   }
 
+  // 启用性能计数器（除非显式禁用）
   if (!(get_init_flags() & CINIT_FLAG_NO_CCT_PERF_COUNTERS))
-    _enable_perf_counter();
+    _enable_perf_counter();                            // 注册 CephContext 级别的 perf 指标
 
-  // make logs flush on_exit()
+  // 设置进程退出时自动刷写日志
   if (_conf->log_flush_on_exit)
     _log->set_flush_on_exit();
 
-  // Trigger callbacks on any config observers that were waiting for
-  // it to become safe to start threads.
-  _conf.set_safe_to_start_threads();
-  _conf.call_all_observers();
+  // 关键步骤：标记"可以安全启动线程了"
+  // 之前各模块的 add_observer() 只是注册，handle_conf_change 被延迟
+  // 现在统一触发所有挂起的配置观察者回调
+  _conf.set_safe_to_start_threads();                   // 解除 "线程未启动" 保护
+  _conf.call_all_observers();                          // 批量通知所有等待中的观察者
 
-  // start admin socket
+  // 启动 Admin Socket（运维管理接口）
   if (_conf->admin_socket.length())
-    _admin_socket->init(_conf->admin_socket);
+    _admin_socket->init(_conf->admin_socket);           // 创建 Unix Domain Socket，开始监听命令
 }
 
 void CephContext::reopen_logs()

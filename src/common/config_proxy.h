@@ -31,14 +31,16 @@ class ConfigProxy {
 
   using rev_obs_map_t = ObsMgr::rev_obs_map;
 
+  // 逐个回调各观察者的 handle_conf_change，通知配置变更
+  // 在锁外调用，防止观察者的回调中再次加锁导致死锁
   void _call_observers(rev_obs_map_t& rev_obs) {
-    for (auto& [obs, keys] : rev_obs) {
-      (*obs)->handle_conf_change(*this, keys);
+    for (auto& [obs, keys] : rev_obs) {             // 遍历 {观察者 → 变更key集合}
+      (*obs)->handle_conf_change(*this, keys);       // 回调：通知该观察者 "这些 key 变了"，这是一个 虚函数 ，每个观察者有自己的实现。
     }
-    rev_obs.clear(); // drop shared_ptrs
+    rev_obs.clear();                                 // 清空映射，释放 shared_ptr 引用
     {
-      std::lock_guard l{lock};
-      cond.notify_all();
+      std::lock_guard l{lock};                       // 加锁：安全唤醒等待 remove_observer 的线程
+      cond.notify_all();                             // 唤醒所有等待者
     }
   }
   void _gather_changes(std::set<std::string> &changes,
@@ -57,12 +59,17 @@ class ConfigProxy {
     changes.clear();
   }
 
+  // 将观察者关心的一次变更记录下来，构建反向映射 {观察者 → {变更key集合}}
+  // 参数：
+  //   obs     — 配置观察者
+  //   key     — 发生变更的配置项名称
+  //   rev_obs — 输出：反向映射表（多次调用累积同一观察者的多个 key）
   void _map_observer_changes(ObsMgr::config_obs_ptr obs, const std::string& key,
                             rev_obs_map_t *rev_obs) {
-    ceph_assert(ceph_mutex_is_locked_by_me(lock));
+    ceph_assert(ceph_mutex_is_locked_by_me(lock));       // 调用者必须已持有 lock
 
-    auto [it, new_entry] = rev_obs->emplace(obs, std::set<std::string>{});
-    it->second.emplace(key);
+    auto [it, new_entry] = rev_obs->emplace(obs, std::set<std::string>{}); // 插入或查找该 observer
+    it->second.emplace(key);                             // 把变更 key 加入该 observer 的集合
   }
 
 public:
@@ -182,17 +189,21 @@ public:
       cond.wait(l);
     }
   }
+  // 通知所有观察者：遍历每个观察者关心的所有 key，逐个回调
+  // 分两步是为了最小化持锁时间：
+  //   1. 持锁收集变更映射（observer → {changed_keys}）
+  //   2. 放锁后逐 observer 回调（防止回调中再次加锁导致死锁）
   void call_all_observers() {
-    rev_obs_map_t rev_obs;
+    rev_obs_map_t rev_obs;                            // 反向映射：观察者 → 它关心的变更 key 集合
     {
-      std::lock_guard locker(lock);
+      std::lock_guard locker(lock);                   // 持锁：安全遍历 observer 注册表
       obs_mgr.for_each_observer(
         [this, &rev_obs](auto obs, const std::string& key) {
-          _map_observer_changes(obs, key, &rev_obs);
+          _map_observer_changes(obs, key, &rev_obs);  // 收集该 observer 关心的变更 key
         });
-    }
+    }                                                 // 放锁：收集完成
 
-    _call_observers(rev_obs);
+    _call_observers(rev_obs);                         // 无锁回调：逐个通知各观察者
   }
   void set_safe_to_start_threads() {
     std::lock_guard l(lock);

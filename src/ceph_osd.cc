@@ -148,13 +148,21 @@ static void usage()
 }
 
 /**
-argc: 命令行参数数量, 包括程序名本身
-argv: 命令行参数数组的指针
-例：./ceph-osd -i 0 --debug-osd 20
-则：
-argc = 5
-argv = ["./ceph-osd", "-i", "0", "--debug-osd", "20"]
-*/
+ * argc: 命令行参数数量, 包括程序名本身
+ * argv: 命令行参数数组的指针
+ * 例：./ceph-osd -i 0 --debug-osd 20
+ * 则：
+ * argc = 5
+ * argv = ["./ceph-osd", "-i", "0", "--debug-osd", "20"]
+ *
+ * 启动流程：
+ *   1. 解析命令行参数（-i <ID> 指定 OSD ID）
+ *   2. global_init() 初始化配置系统、日志、CRUSH 位置等基础设施
+ *   3. Preforker 机制：先 fork 子进程初始化 OSD，成功后才让父进程退出
+ *      （这样 systemd 等到初始化完成才认为服务已启动）
+ *   4. 处理一次性模式（mkfs/flush-journal/convert-filestore 等）
+ *   5. 进入 OSD 主循环：初始化 ObjectStore → 启动心跳、scrub 等线程 → 循环处理 IO
+ */
 int main(int argc, const char **argv)
 {
   auto args = argv_to_vec(argc, argv);  // 将命令行参数转换为vector，便于后续处理，例如：["-i", "0", "--debug-osd", "20"]
@@ -169,15 +177,19 @@ int main(int argc, const char **argv)
     exit(0);
   }
 
+  // 全局初始化：创建 CephContext + 解析配置 + 启动日志
   auto cct = global_init(
     nullptr,
     args, CEPH_ENTITY_TYPE_OSD,
     CODE_ENVIRONMENT_DAEMON, 0);
+  // 堆内存剖析器初始化（开发调试用，生产环境通常禁用）
   ceph_heap_profiler_init();
 
+  // Preforker：父进程先 fork 子进程初始化 OSD
+  // 初始化成功后子进程继续运行，父进程退出返回 0 给 systemd
   Preforker forker;
 
-  // osd specific args
+  // ==================== OSD 专用命令行参数解析 ====================
   bool mkfs = false;
   bool mkjournal = false;
   bool check_wants_journal = false;
@@ -197,75 +209,83 @@ int main(int argc, const char **argv)
   std::string osdspec_affinity;
 
   std::string val;
+  // 第二轮参数解析：只解析 OSD 专有的命令行参数
+  // 注：--cluster/-i/--conf 等通用参数已在 global_init 中处理完毕
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
-    if (ceph_argparse_double_dash(args, i)) {
+    if (ceph_argparse_double_dash(args, i)) {          // 遇到 "--" 停止解析
       break;
     } else if (ceph_argparse_flag(args, i, "--mkfs", (char*)NULL)) {
-      mkfs = true;
+      mkfs = true;                                     // 格式化 OSD 磁盘（创建元数据）
     } else if (ceph_argparse_witharg(args, i, &val, "--osdspec-affinity", (char*)NULL)) {
-     osdspec_affinity = val;
+     osdspec_affinity = val;                           // OSD spec 亲和性（用于自动化部署）
     } else if (ceph_argparse_flag(args, i, "--mkjournal", (char*)NULL)) {
-      mkjournal = true;
+      mkjournal = true;                                // 单独创建 journal 分区
     } else if (ceph_argparse_flag(args, i, "--check-allows-journal", (char*)NULL)) {
-      check_allows_journal = true;
+      check_allows_journal = true;                     // 检查设备是否支持 journal
     } else if (ceph_argparse_flag(args, i, "--check-wants-journal", (char*)NULL)) {
-      check_wants_journal = true;
+      check_wants_journal = true;                      // 检查设备是否想要 journal
     } else if (ceph_argparse_flag(args, i, "--check-needs-journal", (char*)NULL)) {
-      check_needs_journal = true;
+      check_needs_journal = true;                      // 检查设备是否必须 journal
     } else if (ceph_argparse_flag(args, i, "--mkkey", (char*)NULL)) {
-      mkkey = true;
+      mkkey = true;                                    // 生成 OSD 认证密钥
     } else if (ceph_argparse_flag(args, i, "--flush-journal", (char*)NULL)) {
-      flushjournal = true;
+      flushjournal = true;                             // 刷写 journal（回放后清空）
     } else if (ceph_argparse_flag(args, i, "--convert-filestore", (char*)NULL)) {
-      convertfilestore = true;
+      convertfilestore = true;                         // 从 FileStore 迁移到 BlueStore
     } else if (ceph_argparse_witharg(args, i, &val, "--dump-pg-log", (char*)NULL)) {
-      dump_pg_log = val;
+      dump_pg_log = val;                               // 导出指定 PG 的日志（调试用）
     } else if (ceph_argparse_flag(args, i, "--dump-journal", (char*)NULL)) {
-      dump_journal = true;
+      dump_journal = true;                             // 导出 journal 内容（调试用）
     } else if (ceph_argparse_flag(args, i, "--get-cluster-fsid", (char*)NULL)) {
-      get_cluster_fsid = true;
+      get_cluster_fsid = true;                         // 打印集群 FSID
     } else if (ceph_argparse_flag(args, i, "--get-osd-fsid", "--get-osd-uuid", (char*)NULL)) {
-      get_osd_fsid = true;
+      get_osd_fsid = true;                             // 打印 OSD FSID/UUID
     } else if (ceph_argparse_flag(args, i, "--get-journal-fsid", "--get-journal-uuid", (char*)NULL)) {
-      get_journal_fsid = true;
+      get_journal_fsid = true;                         // 打印 journal UUID
     } else if (ceph_argparse_witharg(args, i, &device_path,
 				     "--get-device-fsid", (char*)NULL)) {
-      get_device_fsid = true;
+      get_device_fsid = true;                          // 打印指定块设备的 FSID
     } else if (ceph_argparse_flag(args, i, "--run-benchmark", (char*)NULL)) {
-      run_benchmark = true;
+      run_benchmark = true;                            // 运行 SimpleBench（测试磁盘性能）
     } else {
-      ++i;
+      ++i;                                             // 不认识的参数跳过，下面统一检查报错
     }
   }
-  if (!args.empty()) {
+  if (!args.empty()) {                                 // 还有未识别的参数
     cerr << "unrecognized arg " << args[0] << std::endl;
     exit(1);
   }
 
+  // ==================== Preforker：父进程 fork 子进程 ====================
+  // global_init_prefork 判断是否应该进入 prefork 模式
+  // prefork 之后，is_parent() 为 true 则父进程等待子进程初始化成功再退出
+  // is_parent() 为 false 则子进程继续执行后续初始化
   if (global_init_prefork(g_ceph_context) >= 0) {
     std::string err;
-    int r = forker.prefork(err);
+    int r = forker.prefork(err);                         // fork 子进程
     if (r < 0) {
       cerr << err << std::endl;
       return r;
     }
-    if (forker.is_parent()) {
+    if (forker.is_parent()) {                            // 父进程：等待子进程初始化结果
       g_ceph_context->_log->start();
-      if (forker.parent_wait(err) != 0) {
+      if (forker.parent_wait(err) != 0) {                // 子进程初始化失败
         return -ENXIO;
       }
-      return 0;
+      return 0;                                          // 子进程成功，父进程 exit(0)
     }
-    setsid();
+    setsid();                                            // 子进程：脱离终端，成为守护进程
     global_init_postfork_start(g_ceph_context);
   }
-  common_init_finish(g_ceph_context);
-  global_init_chdir(g_ceph_context);
+  common_init_finish(g_ceph_context);  // common_init_finish 是 初始化收尾函数 ——把 global_init 中跳过的最后几步补上。
+  global_init_chdir(g_ceph_context);                     // 切换到 osd_data 目录
 
+  // ==================== 一次性模式：获取 journal UUID ====================
   if (get_journal_fsid) {
     device_path = g_conf().get_val<std::string>("osd_journal");
     get_device_fsid = true;
   }
+  // ==================== 一次性模式：获取块设备 UUID ====================
   if (get_device_fsid) {
     uuid_d uuid;
     int r = ObjectStore::probe_block_device_fsid(g_ceph_context, device_path,
@@ -279,6 +299,7 @@ int main(int argc, const char **argv)
     forker.exit(0);
   }
 
+  // ==================== 一次性模式：导出 PG 日志 ====================
   if (!dump_pg_log.empty()) {
     common_init_finish(g_ceph_context);
     bufferlist bl;
@@ -304,10 +325,11 @@ int main(int argc, const char **argv)
     forker.exit(0);
   }
 
+  // ==================== 验证 OSD ID ====================
   // whoami
   char *end;
   const char *id = g_conf()->name.get_id().c_str();
-  int whoami = strtol(id, &end, 10);
+  int whoami = strtol(id, &end, 10);                     // 从名称解析 OSD ID（如 "0" → 0）
   std::string data_path = g_conf().get_val<std::string>("osd_data");
   if (*end || end == id || whoami < 0) {
     derr << "must specify '-i #' where # is the osd number" << dendl;
@@ -319,6 +341,12 @@ int main(int argc, const char **argv)
     forker.exit(1);
   }
 
+  // ==================== 检测 ObjectStore 类型 ====================
+  // 三种方式确定存储后端类型：
+  //   1. 读 data_path/type 文件（最直接）
+  //   2. mkfs 模式：从配置 osd_objectstore 读取（默认 bluestore）
+  //   3. 推断：data_path/current/ 目录存在 → filestore
+  //             data_path/block 是符号链接 → bluestore
   // the store
   std::string store_type;
   {
@@ -343,14 +371,14 @@ int main(int argc, const char **argv)
 	  S_ISDIR(st.st_mode)) {
 	derr << "missing 'type' file, inferring filestore from current/ dir"
 	     << dendl;
-	store_type = "filestore";
+	store_type = "filestore";                        // 推断为 FileStore
       } else {
 	snprintf(fn, sizeof(fn), "%s/block", data_path.c_str());
 	if (::stat(fn, &st) == 0 &&
 	    S_ISLNK(st.st_mode)) {
 	  derr << "missing 'type' file, inferring bluestore from block symlink"
 	       << dendl;
-	  store_type = "bluestore";
+	  store_type = "bluestore";                      // 推断为 BlueStore
 	} else {
 	  derr << "missing 'type' file and unable to infer osd type" << dendl;
 	  forker.exit(1);
@@ -359,6 +387,8 @@ int main(int argc, const char **argv)
     }
   }
 
+  // ==================== 创建 ObjectStore 实例 ====================
+  // ObjectStore 是 Ceph 存储后端的抽象接口，BlueStore 是默认实现
   std::string journal_path = g_conf().get_val<std::string>("osd_journal");
   uint32_t flags = g_conf().get_val<uint64_t>("osd_os_flags");
   std::unique_ptr<ObjectStore> store = ObjectStore::create(g_ceph_context,
@@ -371,7 +401,7 @@ int main(int argc, const char **argv)
     forker.exit(-ENODEV);
   }
 
-
+  // ==================== 生成 OSD 密钥（通常与 --mkfs 搭配，不是一次性模式） ====================
   if (mkkey) {
     common_init_finish(g_ceph_context);
     KeyRing keyring;
@@ -383,13 +413,13 @@ int main(int argc, const char **argv)
     int ret = keyring.load(g_ceph_context, keyring_path);
     if (ret == 0 &&
 	keyring.get_auth(ename, eauth)) {
-      derr << "already have key in keyring " << keyring_path << dendl;
+      derr << "already have key in keyring " << keyring_path << dendl;  // key 已存在，跳过
     } else {
-      eauth.key.create(g_ceph_context, CEPH_CRYPTO_AES);
+      eauth.key.create(g_ceph_context, CEPH_CRYPTO_AES);         // 生成 AES 密钥
       keyring.add(ename, eauth);
       bufferlist bl;
       keyring.encode_plaintext(bl);
-      int r = bl.write_file(keyring_path.c_str(), 0600);
+      int r = bl.write_file(keyring_path.c_str(), 0600);         // 写入 keyring 文件（权限 0600）
       if (r)
 	derr << TEXT_RED << " ** ERROR: writing new keyring to "
              << keyring_path << ": " << cpp_strerror(r) << TEXT_NORMAL
@@ -399,10 +429,11 @@ int main(int argc, const char **argv)
     }
   }
 
+  // ==================== 一次性模式：格式化 OSD ====================
   if (mkfs) {
     common_init_finish(g_ceph_context);
 
-    if (g_conf().get_val<uuid_d>("fsid").is_zero()) {
+    if (g_conf().get_val<uuid_d>("fsid").is_zero()) {            // 必须有集群 FSID
       derr << "must specify cluster fsid" << dendl;
       forker.exit(-EINVAL);
     }
@@ -423,11 +454,11 @@ int main(int argc, const char **argv)
   if (mkkey) {
     forker.exit(0);
   }
-  // Run a benchmark if specified
+  // ==================== 一次性模式：磁盘基准测试 ====================
   if (run_benchmark) {
-    store->mount();
+    store->mount();                                        // 挂载存储后端
     tl::expected<std::string, int> res =
-      OSD::run_osd_bench(g_ceph_context, store.get());
+      OSD::run_osd_bench(g_ceph_context, store.get());     // 运行 SimpleBench
     if (!res.has_value()) {
       int ret = res.error();
       derr << TEXT_RED << " ** ERROR: error running benchmark: "
@@ -437,9 +468,10 @@ int main(int argc, const char **argv)
       forker.exit(ret);
     }
     cout << res.value() << std::endl;
-    store->umount();
+    store->umount();                                       // 卸载存储后端
     forker.exit(0);
   }
+  // ==================== 一次性模式：创建 journal ====================
   if (mkjournal) {
     common_init_finish(g_ceph_context);
     int err = store->mkjournal();
@@ -453,6 +485,7 @@ int main(int argc, const char **argv)
 	 << " for object store " << data_path << dendl;
     forker.exit(0);
   }
+  // ==================== 一次性模式：检查 journal 支持情况 ====================
   if (check_wants_journal) {
     if (store->wants_journal()) {
       cout << "wants journal: yes" << std::endl;
@@ -480,6 +513,7 @@ int main(int argc, const char **argv)
       forker.exit(1);
     }
   }
+  // ==================== 一次性模式：刷写 journal ====================
   if (flushjournal) {
     common_init_finish(g_ceph_context);
     int err = store->mount();
@@ -497,6 +531,7 @@ flushjournal_out:
     store.reset();
     forker.exit(err < 0 ? 1 : 0);
   }
+  // ==================== 一次性模式：导出 journal ====================
   if (dump_journal) {
     common_init_finish(g_ceph_context);
     int err = store->dump_journal(cout);
@@ -512,14 +547,15 @@ flushjournal_out:
     forker.exit(0);
   }
 
+  // ==================== 一次性模式：FileStore → BlueStore 转换 ====================
   if (convertfilestore) {
-    int err = store->mount();
+    int err = store->mount();                              // 挂载旧存储
     if (err < 0) {
       derr << TEXT_RED << " ** ERROR: error mounting store " << data_path
 	   << ": " << cpp_strerror(-err) << TEXT_NORMAL << dendl;
       forker.exit(1);
     }
-    err = store->upgrade();
+    err = store->upgrade();                                // 执行升级转换
     store->umount();
     if (err < 0) {
       derr << TEXT_RED << " ** ERROR: error converting store " << data_path
@@ -529,6 +565,7 @@ flushjournal_out:
     forker.exit(0);
   }
   
+  // ==================== 加载外部块设备插件 ====================
   {
     int r = extblkdev::preload(g_ceph_context);
     if (r < 0) {
@@ -537,6 +574,8 @@ flushjournal_out:
     }
   }
 
+  // ==================== 读取 OSD Superblock（on-disk 元数据） ====================
+  // Superblock 包含：magic 魔数、集群 FSID、OSD FSID、OSD ID 等关键信息
   string magic;
   uuid_d cluster_fsid, osd_fsid;
   ceph_release_t require_osd_release = ceph_release_t::unknown;
@@ -553,16 +592,17 @@ flushjournal_out:
     }
     forker.exit(1);
   }
-  if (w != whoami) {
+  if (w != whoami) {                                       // 磁盘上的 OSD ID 必须和命令行 -i 一致
     derr << "OSD id " << w << " != my id " << whoami << dendl;
     forker.exit(1);
   }
-  if (strcmp(magic.c_str(), CEPH_OSD_ONDISK_MAGIC)) {
+  if (strcmp(magic.c_str(), CEPH_OSD_ONDISK_MAGIC)) {     // 魔数校验
     derr << "OSD magic " << magic << " != my " << CEPH_OSD_ONDISK_MAGIC
 	 << dendl;
     forker.exit(1);
   }
 
+  // ==================== 一次性模式：获取集群/OSD FSID ====================
   if (get_cluster_fsid) {
     cout << cluster_fsid << std::endl;
     forker.exit(0);
@@ -572,6 +612,7 @@ flushjournal_out:
     forker.exit(0);
   }
 
+  // ==================== 检查 OSD 版本升级兼容性 ====================
   {
     ostringstream err;
     if (!can_upgrade_from(require_osd_release, "require_osd_release", err)) {
@@ -580,7 +621,8 @@ flushjournal_out:
     }
   }
 
-  // consider objectstore numa node
+  // ==================== NUMA 亲和性优化 ====================
+  // 如果 osd_numa_prefer_iface 开启，优先选择与存储设备同 NUMA 节点的网络接口
   int os_numa_node = -1;
   r = store->get_numa_node(&os_numa_node, nullptr, nullptr);
   if (r >= 0 && os_numa_node >= 0) {

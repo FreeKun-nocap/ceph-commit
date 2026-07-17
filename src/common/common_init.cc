@@ -106,26 +106,28 @@ void complain_about_parse_error(CephContext *cct,
 
 #ifndef WITH_CRIMSON
 
-/* Please be sure that this can safely be called multiple times by the
- * same application. */
+// 初始化收尾：在 fork（如果有）之后完成最后的初始化步骤
+// 必须在 fork 之后调用，因为要启动后台线程（fork 时不能有线程）
+// 可安全多次调用（_finished 标志防重复）
 void common_init_finish(CephContext *cct)
 {
-  // only do this once per cct
-  if (cct->_finished) {
+  if (cct->_finished) {                                // 已完成过，直接返回（幂等）
     return;
   }
-  cct->_finished = true;
-  cct->init_crypto();
-  ZTracer::ztrace_init();
+  cct->_finished = true;                               // 标记已完成
+
+  cct->init_crypto();                                  // 初始化加密子系统（AES 等）
+  ZTracer::ztrace_init();                              // 初始化分布式追踪（Jaeger/Zipkin）
 
   if (!cct->_log->is_started()) {
-    cct->_log->start();
+    cct->_log->start();                                // 启动日志线程（如果还没启动）
   }
 
   int flags = cct->get_init_flags();
   if (!(flags & CINIT_FLAG_NO_DAEMON_ACTIONS))
-    cct->start_service_thread();
+    cct->start_service_thread();                       // 启动 Admin Socket 后台服务线程
 
+  // 延迟降权：修正 admin socket 文件的所有者
   if ((flags & CINIT_FLAG_DEFER_DROP_PRIVILEGES) &&
       (cct->get_set_uid() || cct->get_set_gid())) {
     cct->get_admin_socket()->chown(cct->get_set_uid(), cct->get_set_gid());
@@ -133,13 +135,14 @@ void common_init_finish(CephContext *cct)
 
   const auto& conf = cct->_conf;
 
+  // 设置 admin socket 文件的权限模式
   if (!conf->admin_socket.empty() && !conf->admin_socket_mode.empty()) {
     int ret = 0;
     std::string err;
 
-    ret = strict_strtol(conf->admin_socket_mode.c_str(), 8, &err);
+    ret = strict_strtol(conf->admin_socket_mode.c_str(), 8, &err);  // 八进制字符串转整数（如 "0600" → 384）
     if (err.empty()) {
-      if (!(ret & (~ACCESSPERMS))) {
+      if (!(ret & (~ACCESSPERMS))) {                   // 确保没有超出权限位的值
         cct->get_admin_socket()->chmod(static_cast<mode_t>(ret));
       } else {
         lderr(cct) << "Invalid octal permissions string: "
