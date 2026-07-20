@@ -82,38 +82,38 @@ public:
    * @param req 需要的特征
    */
 
-  // 有状态服务器: 无损 + server + standby + resetcheck + 注册
-  // 用于 MON 等需要维护持久连接、空闲时 standby 等待重连的服务端
+  // 有状态服务器: 持久 + server + standby + resetcheck + 唯一连接
+  // 用于 MON、MDS 等有状态服务端，连接持久，空闲时 standby
   static Policy stateful_server(uint64_t req) {
     return Policy(false, true, true, true, true, req);
   }
-  // 无状态注册服务器: 有损 + server + 无 standby + 无 resetcheck + 注册
-  // 用于公网 Messenger（ms_public），要求客户端先注册才能通信
+  // 无状态注册服务器: 瞬断 + server + 无 standby + 无 resetcheck + 唯一连接
+  // 用于公网 Messenger（ms_public），接受外部客户端连接，同一客户端只保留一个连接
   static Policy stateless_registered_server(uint64_t req) {
     return Policy(true, true, false, false, true, req);
   }
-  // 无状态服务器: 有损 + server + 无 standby + 无 resetcheck + 不注册
-  // 用于不需要注册机制的纯无状态服务（如心跳 server、ms_cluster 默认策略）
+  // 无状态服务器: 瞬断 + server + 无 standby + 无 resetcheck + 不唯一
+  // 用于心跳 server 等轻量无状态服务，不跟踪客户端连接
   static Policy stateless_server(uint64_t req) {
     return Policy(true, true, false, false, false, req);
   }
-  // 无损对等体: 无损 + 非 server + standby + 无 resetcheck + 注册
-  // 用于 OSD 间集群通信，保证消息可靠投递，空闲时 standby
+  // 持久对等体: 持久 + 非 server + standby + 无 resetcheck + 唯一连接
+  // 用于 OSD 间集群内部通信，连接持久，断连自动重连
   static Policy lossless_peer(uint64_t req) {
     return Policy(false, false, true, false, true, req);
   }
-  // 无损对等体(可重用): 无损 + 非 server + standby + resetcheck + 注册
+  // 持久对等体(可重用): 持久 + 非 server + standby + resetcheck + 唯一连接
   // 与 lossless_peer 类似，额外检测会话重置以重用连接
   static Policy lossless_peer_reuse(uint64_t req) {
     return Policy(false, false, true, true, true, req);
   }
-  // 有损客户端: 有损 + 非 server + 无 standby + 无 resetcheck + 注册
-  // 用于外部客户端（如 librados）、MON/MGR 等可能断连的 peer
+  // 瞬断客户端: 瞬断 + 非 server + 无 standby + 无 resetcheck + 唯一连接
+  // 用于 librados 等外部客户端，连接出错即丢弃
   static Policy lossy_client(uint64_t req) {
     return Policy(true, false, false, false, true, req);
   }
-  // 无损客户端: 无损 + 非 server + 无 standby + resetcheck + 注册
-  // 用于需要可靠投递但非服务端的场景
+  // 持久客户端: 持久 + 非 server + 无 standby + resetcheck + 唯一连接
+  // 用于需要持久连接但非服务端的场景
   static Policy lossless_client(uint64_t req) {
     return Policy(false, false, false, true, true, req);
   }

@@ -703,7 +703,7 @@ flushjournal_out:
   ms_public->set_policy_throttlers(entity_name_t::TYPE_CLIENT,
 				   client_byte_throttler.get(),
 				   client_msg_throttler.get());
-  // MON/MGR 视为有损客户端（可能断连），需具备 osd_required 特性
+  // MON/MGR 视为瞬断客户端，连接出错即丢弃
   ms_public->set_policy(entity_name_t::TYPE_MON,
                         Messenger::Policy::lossy_client(osd_required));
   ms_public->set_policy(entity_name_t::TYPE_MGR,
@@ -712,17 +712,18 @@ flushjournal_out:
   // === ms_cluster: OSD 间内部集群通信的 Messenger ===
   // 默认策略: 无状态服务器，不维护持久连接
   ms_cluster->set_default_policy(Messenger::Policy::stateless_server(0));
-  // MON 视为有损客户端；OSD 之间使用无损对等连接（保证消息可靠投递）
+  // MON 视为瞬断客户端；OSD 之间使用持久对等连接
   ms_cluster->set_policy(entity_name_t::TYPE_MON, Messenger::Policy::lossy_client(0));
   ms_cluster->set_policy(entity_name_t::TYPE_OSD,
 			 Messenger::Policy::lossless_peer(osd_required));
-  // 拒绝客户端直连 cluster messenger
+  // cluster messenger 仅供 OSD 内部通信，客户端不应连接此通道
+  // stateless_server(0) 作为兜底：不跟踪连接、不验证特性、出错即丢弃
   ms_cluster->set_policy(entity_name_t::TYPE_CLIENT,
 			 Messenger::Policy::stateless_server(0));
 
   // === Heartbeat Messenger: OSD 心跳检测通道 ===
   // 分为 front（前端/公网）和 back（后端/集群网）两个独立通道
-  // 心跳 client 端: 有损连接，定时发送 ping 不保证可靠
+  // 心跳 client 端: 瞬断连接，定时发送 ping
   ms_hb_front_client->set_policy(entity_name_t::TYPE_OSD,
 			  Messenger::Policy::lossy_client(0));
   ms_hb_back_client->set_policy(entity_name_t::TYPE_OSD,
@@ -734,10 +735,11 @@ flushjournal_out:
 				 Messenger::Policy::stateless_server(0));
 
   // === ms_objecter: 用于 OSD 主动发起 RADOS 操作 ===
-  // 默认策略: 有损客户端，支持 OSDREPLYMUX 特性（多路复用回复）
+  // 默认策略: 瞬断客户端，支持 OSDREPLYMUX 特性（多路复用回复）
   ms_objecter->set_default_policy(Messenger::Policy::lossy_client(CEPH_FEATURE_OSDREPLYMUX));
 
   entity_addrvec_t public_addrs, public_bind_addrs, cluster_addrs;
+  // 选取对外通告的 public 地址（由 public_addr / public_network 配置决定）
   r = pick_addresses(g_ceph_context, CEPH_PICK_ADDRESS_PUBLIC, &public_addrs,
 		     iface_preferred_numa_node);
   if (r < 0) {
@@ -746,6 +748,8 @@ flushjournal_out:
   } else {
     dout(10) << "picked public_addrs " << public_addrs << dendl;
   }
+  // 选取实际绑定的 public 地址（由 public_bind_addr 配置决定）
+  // 可用于 NAT 场景：绑定在内网地址，对外通告公网地址
   r = pick_addresses(g_ceph_context, CEPH_PICK_ADDRESS_PUBLIC_BIND,
 		     &public_bind_addrs, iface_preferred_numa_node);
   if (r == -ENOENT) {
@@ -758,6 +762,8 @@ flushjournal_out:
   } else {
     dout(10) << "picked public_bind_addrs " << public_bind_addrs << dendl;
   }
+  // 选取集群网络地址（由 cluster_addr / cluster_network 配置决定）
+  // 未配置 cluster_network 时回退到 public 网络
   r = pick_addresses(g_ceph_context, CEPH_PICK_ADDRESS_CLUSTER, &cluster_addrs,
 		     iface_preferred_numa_node);
   if (r < 0) {
@@ -781,9 +787,9 @@ flushjournal_out:
     ms_hb_front_server->set_socket_priority(SOCKET_PRIORITY_MIN_DELAY);
   }
 
-  entity_addrvec_t hb_front_addrs = public_bind_addrs;
+  entity_addrvec_t hb_front_addrs = public_bind_addrs;  // 复用 public 的 IP
   for (auto& a : hb_front_addrs.v) {
-    a.set_port(0);
+    a.set_port(0);  // 端口置 0 → OS 自动分配端口
   }
   if (ms_hb_front_server->bindv(hb_front_addrs) < 0)
     forker.exit(1);
@@ -799,10 +805,13 @@ flushjournal_out:
   if (ms_hb_back_client->client_bind(hb_back_addrs.front()) < 0)
     forker.exit(1);
 
-  // install signal handlers
+  // 安装异步信号处理器
+  // SIGHUP → 重新打开日志文件（支持 logrotate）
   init_async_signal_handler();
   register_async_signal_handler(SIGHUP, sighup_handler);
 
+  // 初始化 LTTng 跟踪点（仅 WITH_LTTNG 编译时生效）
+  // 动态加载各个.so，使运行时能通过 lttng 命令采集跟踪数据
   TracepointProvider::initialize<osd_tracepoint_traits>(g_ceph_context);
   TracepointProvider::initialize<os_tracepoint_traits>(g_ceph_context);
   TracepointProvider::initialize<bluestore_tracepoint_traits>(g_ceph_context);
@@ -810,16 +819,21 @@ flushjournal_out:
   TracepointProvider::initialize<cyg_profile_traits>(g_ceph_context);
 #endif
 
+  // 初始化随机数种子，确保每个 OSD 实例的随机数序列不同
   srand(time(NULL) + getpid());
 
+  // 创建 asio 线程池，供 MonClient 等异步操作使用
   ceph::async::io_context_pool poolctx(
     cct->_conf.get_val<std::uint64_t>("osd_asio_thread_count"));
 
+  // 创建 MonClient 并获取初始 monmap（从 mon 或本地缓存）
   MonClient mc(g_ceph_context, poolctx);
   if (mc.build_initial_monmap() < 0)
     return -1;
+  // 切换到数据目录（由 osd_data 配置指定）
   global_init_chdir(g_ceph_context);
 
+  // 预加载纠删码库，确保后续 EC PG 创建时已可用
   if (global_init_preload_erasure_code(g_ceph_context) < 0) {
     forker.exit(1);
   }
@@ -839,6 +853,7 @@ flushjournal_out:
 		   journal_path,
 		   poolctx);
 
+  // 预初始化：检查 store 未被占用，注册配置观察者
   int err = osdptr->pre_init();
   if (err < 0) {
     derr << TEXT_RED << " ** ERROR: osd pre_init failed: " << cpp_strerror(-err)
@@ -846,6 +861,7 @@ flushjournal_out:
     forker.exit(1);
   }
 
+  // 启动所有 Messenger，进入监听状态
   ms_public->start();
   ms_hb_front_client->start();
   ms_hb_back_client->start();
@@ -854,7 +870,7 @@ flushjournal_out:
   ms_cluster->start();
   ms_objecter->start();
 
-  // start osd
+  // 主初始化：挂载 store、加载 OSDMap、创建恢复 PG
   err = osdptr->init();
   if (err < 0) {
     derr << TEXT_RED << " ** ERROR: osd init failed: " << cpp_strerror(-err)
@@ -873,11 +889,15 @@ flushjournal_out:
   register_async_signal_handler_oneshot(SIGINT, handle_osd_signal);
   register_async_signal_handler_oneshot(SIGTERM, handle_osd_signal);
 
+  // 最终初始化：注册 admin socket 管理命令
   osdptr->final_init();
 
+  // 调试用：模拟 SIGTERM 信号，触发 OSD 退出
   if (g_conf().get_val<bool>("inject_early_sigterm"))
     kill(getpid(), SIGTERM);
 
+  // 主线程在此等待各个 Messenger 的工作线程结束；OSD 正常运行时通常阻塞在第一个 wait()。
+  // 收到 SIGINT、SIGTERM 或其他关闭事件后，各 Messenger 停止，wait() 依次返回。
   ms_public->wait();
   ms_hb_front_client->wait();
   ms_hb_back_client->wait();
@@ -885,6 +905,8 @@ flushjournal_out:
   ms_hb_back_server->wait();
   ms_cluster->wait();
   ms_objecter->wait();
+
+  // 这里往下执行，说明 OSD 退出, 清理资源
 
   unregister_async_signal_handler(SIGHUP, sighup_handler);
   unregister_async_signal_handler(SIGINT, handle_osd_signal);
