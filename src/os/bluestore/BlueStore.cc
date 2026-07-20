@@ -8516,12 +8516,24 @@ int BlueStore::_setup_block_symlink_or_file(
   return 0;
 }
 
+/**
+ * 格式化 BlueStore 存储后端（由 OSD::mkfs() 调用）
+ *
+ * 核心流程:
+ *   1. 幂等性检查 — 如果已经 mkfs 过，直接返回（可选跑 fsck）
+ *   2. FSID 处理 — 读磁盘旧 FSID 或随机生成新 FSID
+ *   3. 块设备准备 — 创建 block/block.wal/block.db 符号链接或文件
+ *   4. 分配器初始化 — 计算 min_alloc_size、创建 Allocator、预留标签空间
+ *   5. RocksDB 初始化 — 写入 nid_max、blobid_max、min_alloc_size、ondisk_format 等
+ *   6. 元数据写入 — kv_backend、bluefs、elastic_shared_blobs、FSID、mkfs_done
+ */
 int BlueStore::mkfs()
 {
   dout(1) << __func__ << " path " << path << dendl;
   int r;
-  uuid_d old_fsid;
-  uint64_t reserved;
+  uuid_d old_fsid;       // 磁盘上已有的 FSID（可能为空）
+  uint64_t reserved;     // 标签+BlueFS超级块保留的空间大小
+  // 检查最大对象大小是否超出限制
   if (cct->_conf->osd_max_object_size > OBJECT_MAX_SIZE) {
     derr << __func__ << " osd_max_object_size "
 	 << cct->_conf->osd_max_object_size << " > bluestore max "
@@ -8529,11 +8541,14 @@ int BlueStore::mkfs()
     return -EINVAL;
   }
 
+  // ========== 步骤 1: 幂等性检查 ==========
+  // 如果已经有 mkfs_done 文件，说明之前已经格式化过，直接返回
   {
     string done;
     r = read_meta("mkfs_done", &done);
     if (r == 0) {
       dout(1) << __func__ << " already created" << dendl;
+      // 可选: 跑一遍 fsck 检查数据完整性
       if (cct->_conf->bluestore_fsck_on_mkfs) {
         r = fsck(cct->_conf->bluestore_fsck_on_mkfs_deep);
         if (r < 0) {
@@ -8546,46 +8561,52 @@ int BlueStore::mkfs()
           r = -EIO;
         }
       }
-      return r; // idempotent
+      return r; // 幂等: 多次 mkfs 是安全的
     }
   }
-  r = _open_path();
+  // ========== 步骤 2: 打开数据路径和 FSID 文件 ==========
+  r = _open_path();            // 打开 OSD 数据目录
   if (r < 0)
     return r;
 
-  r = _open_fsid(true);
+  r = _open_fsid(true);        // 打开/创建 fsid 文件（true=创建模式）
   if (r < 0)
     goto out_path_fd;
 
-  r = _lock_fsid();
+  r = _lock_fsid();            // 对 fsid 文件加排他锁（防止并发 mkfs）
   if (r < 0)
     goto out_close_fsid;
 
+  // ========== 步骤 3: FSID 处理（确定 OSD 的 UUID） ==========
   r = _read_fsid(&old_fsid);
   if (r < 0 || old_fsid.is_zero()) {
+    // 磁盘上没有 FSID → 首次 mkfs
     if (fsid.is_zero()) {
-      fsid.generate_random();
+      fsid.generate_random();                                 // 没提供则随机生成
       dout(1) << __func__ << " generated fsid " << fsid << dendl;
     } else {
-      dout(1) << __func__ << " using provided fsid " << fsid << dendl;
+      dout(1) << __func__ << " using provided fsid " << fsid << dendl;  // 使用配置提供的
     }
-    // we'll write it later.
   } else {
+    // 磁盘上已有 FSID → 校验一致性
     if (!fsid.is_zero() && fsid != old_fsid) {
       derr << __func__ << " on-disk fsid " << old_fsid
 	   << " != provided " << fsid << dendl;
       r = -EINVAL;
       goto out_close_fsid;
     }
-    fsid = old_fsid;
+    fsid = old_fsid;  // 以磁盘上的为准
   }
 
+  // ========== 步骤 4: 创建块设备符号链接（或文件） ==========
+  // 在 OSD 数据目录下创建 block/block.wal/block.db 符号链接，指向真实块设备
   r = _setup_block_symlink_or_file("block", cct->_conf->bluestore_block_path,
 				   cct->_conf->bluestore_block_size,
 				   cct->_conf->bluestore_block_create);
   if (r < 0)
     goto out_close_fsid;
   if (cct->_conf->bluestore_bluefs) {
+    // BlueFS 模式: 需要 WAL 和 DB 设备
     r = _setup_block_symlink_or_file("block.wal", cct->_conf->bluestore_block_wal_path,
 	cct->_conf->bluestore_block_wal_size,
 	cct->_conf->bluestore_block_wal_create);
@@ -8598,48 +8619,60 @@ int BlueStore::mkfs()
       goto out_close_fsid;
   }
 
-  r = _open_bdev(true);
+  // ========== 步骤 5: 打开块设备并写入 type 元数据 ==========
+  r = _open_bdev(true);          // 打开主块设备（true=创建模式）
   if (r < 0)
     goto out_close_fsid;
   {
     string type;
     r = read_meta("type", &type);
     if (r == 0) {
+      // type 文件已存在 → 校验必须是 "bluestore"
       if (type != "bluestore") {
 	derr << __func__ << " expected bluestore, but type is " << type << dendl;
 	return -EIO;
       }
     } else {
+      // type 文件不存在 → 写入 "bluestore"（后面 ceph_osd.cc 启动时读取）
       r = write_meta("type", "bluestore");
       if (r < 0)
         return r;
     }
   }
 
+  // 空闲列表类型固定为 bitmap
   freelist_type = "bitmap";
   dout(10) << " freelist_type " << freelist_type << dendl;
 
-  // choose min_alloc_size
+  // ========== 步骤 6: 确定最小分配单元 (min_alloc_size) ==========
+  // BlueStore 以 min_alloc_size 为单位分配磁盘空间，值必须为 2 的幂
   dout(5) << __func__ << " optimal_io_size 0x" << std::hex << optimal_io_size
 	  << " block_size: 0x" << block_size << std::dec << dendl;
+  // bluestore_use_optimal_io_size_for_min_alloc_size 默认 false，即不使用最优 IO 大小
+  // optimal_io_size 就是 cat /sys/block/sdb/queue/optimal_io_size 的结果
+  //   这个值是 磁盘固件/驱动上报给内核 的（厂家在 NVMe namespace 或 SCSI VPD 里定义）
+  //   普通 SSD/HDD 这个值通常是 0，QLC 等新型介质才会报非零值。
   if ((cct->_conf->bluestore_use_optimal_io_size_for_min_alloc_size) && (optimal_io_size != 0)) {
+    // 策略1: 使用设备最优 IO 大小
     dout(5) << __func__ << " optimal_io_size 0x" << std::hex << optimal_io_size
 		<< " for min_alloc_size 0x" << min_alloc_size << std::dec << dendl;
     min_alloc_size = optimal_io_size;
   }
   else if (cct->_conf->bluestore_min_alloc_size) {
+    // 策略2: 使用显式配置值
     min_alloc_size = cct->_conf->bluestore_min_alloc_size;
   } else {
+    // 策略3: 根据磁盘类型自动选择（HDD vs SSD）
     ceph_assert(bdev);
     if (_use_rotational_settings()) {
-      min_alloc_size = cct->_conf->bluestore_min_alloc_size_hdd;
+      min_alloc_size = cct->_conf->bluestore_min_alloc_size_hdd;  // HDD: 64KB
     } else {
-      min_alloc_size = cct->_conf->bluestore_min_alloc_size_ssd;
+      min_alloc_size = cct->_conf->bluestore_min_alloc_size_ssd;  // SSD: 16KB
     }
   }
-  _validate_bdev();
+  _validate_bdev();         // 验证块设备参数
 
-  // make sure min_alloc_size is power of 2 aligned.
+  // 校验: min_alloc_size 必须是 2 的幂
   if (!std::has_single_bit(min_alloc_size)) {
     derr << __func__ << " min_alloc_size 0x"
 	 << std::hex << min_alloc_size << std::dec
@@ -8649,7 +8682,8 @@ int BlueStore::mkfs()
     goto out_close_bdev;
   }
 
-  // make sure min_alloc_size is >= and aligned with block size
+  // 校验: min_alloc_size 必须是 block_size 的整数倍
+  // block_size 是硬盘物理扇区大小（硬件的最小可寻址单位）
   if (min_alloc_size % block_size != 0) {
     derr << __func__ << " min_alloc_size 0x"
 	 << std::hex << min_alloc_size
@@ -8659,21 +8693,20 @@ int BlueStore::mkfs()
     goto out_close_bdev;
   }
 
+  // ========== 步骤 7: 创建分配器 (Allocator) ==========
+  // 分配器管理磁盘空闲空间，决定新对象数据写到哪
   r = _create_alloc();
   if (r < 0) {
     goto out_close_bdev;
   }
 
-  // initialize alloc, remove regions taken
-  reserved = _get_ondisk_reserved();
-  // full free
-  alloc->init_add_free(0, p2align(bdev->get_size(), min_alloc_size));
-  // allocate bdev label + bluefs superblock reserved space.
-  alloc->init_rm_free(BDEV_FIRST_LABEL_POSITION, reserved);
+  // 初始化分配器: 标记整个磁盘为空闲，然后扣掉标签和 BlueFS 超级块区域
+  reserved = _get_ondisk_reserved();     // 标签+超级块占用的空间
+  alloc->init_add_free(0, p2align(bdev->get_size(), min_alloc_size));  // 全盘标记空闲
+  alloc->init_rm_free(BDEV_FIRST_LABEL_POSITION, reserved);            // 扣掉保留区域
 
-  // take possible bdev locations, so it will not be used
+  // 如果启用了多标签副本，扣掉每个副本占用的空间
   if (cct->_conf.get_val<bool>("bluestore_bdev_label_multi")) {
-    // take space for other bdev label copies
     for (size_t i = 1; i < bdev_label_positions.size(); i++) {
       uint64_t location = bdev_label_positions[i];
       uint64_t size = p2roundup(BDEV_LABEL_BLOCK_SIZE, min_alloc_size);
@@ -8683,28 +8716,31 @@ int BlueStore::mkfs()
     }
   }
 
-  r = _open_db(true);
+  // ========== 步骤 8: 打开 RocksDB 并写入初始键值 ==========
+  r = _open_db(true);          // 打开/创建 RocksDB（true=创建模式）
   if (r < 0)
     goto out_close_alloc;
 
   {
     KeyValueDB::Transaction t = db->get_transaction();
-    r = _open_fm(t, false, true);
+    r = _open_fm(t, false, true);     // 初始化 FreelistManager
     if (r < 0)
       goto out_close_db;
     {
+      // 写入 nid_max=0 和 blobid_max=0（ID 分配器的起点）
       bufferlist bl;
       encode((uint64_t)0, bl);
-      t->set(PREFIX_SUPER, "nid_max", bl);
-      t->set(PREFIX_SUPER, "blobid_max", bl);
+      t->set(PREFIX_SUPER, "nid_max", bl);  // 对象 ID 分配器的起点，下次启动从 0 开始递增
+      t->set(PREFIX_SUPER, "blobid_max", bl);  // Blob ID 分配器的起点
     }
 
     {
       bufferlist bl;
       encode((uint64_t)min_alloc_size, bl);
-      t->set(PREFIX_SUPER, "min_alloc_size", bl);
+      t->set(PREFIX_SUPER, "min_alloc_size", bl);   // 持久化分配单元大小
     }
     {
+      // 持久化 OMAP 模式（正常: OMAP_PER_PG, 调试: OMAP_BULK）
       bufferlist bl;
       if (cct->_conf.get_val<bool>("bluestore_debug_legacy_omap")) {
 	bl.append(stringify(OMAP_BULK));
@@ -8714,11 +8750,14 @@ int BlueStore::mkfs()
       t->set(PREFIX_SUPER, "per_pool_omap", bl);
     }
 
-    ondisk_format = latest_ondisk_format;
+    // 持久化磁盘格式版本号
+    ondisk_format = latest_ondisk_format;  // 确定磁盘数据结构的版本，用于向后兼容
     _prepare_ondisk_format_super(t);
-    db->submit_transaction_sync(t);
+    db->submit_transaction_sync(t);    // 同步提交（必须持久化后才能继续）
   }
 
+  // ========== 步骤 9: 写入元数据文件 ==========
+  // osd_data/ 下的 普通文件
   r = write_meta("kv_backend", cct->_conf->bluestore_kvbackend);
   if (r < 0)
     goto out_close_fm;
@@ -8732,6 +8771,7 @@ int BlueStore::mkfs()
   if (r < 0)
     goto out_close_fm;
 
+  // 如果 FSID 是新生成的，写入磁盘
   if (fsid != old_fsid) {
     r = _write_fsid();
     if (r < 0) {
@@ -8740,19 +8780,21 @@ int BlueStore::mkfs()
     }
   }
 
+  // ========== 清理：按逆序关闭所有已打开的资源 ==========
  out_close_fm:
-  _close_fm();
+  _close_fm();       // 关闭 FreelistManager
  out_close_db:
-  _close_db();
+  _close_db();       // 关闭 RocksDB
  out_close_alloc:
-  _close_alloc();
+  _close_alloc();    // 关闭分配器
  out_close_bdev:
-  _close_bdev();
+  _close_bdev();     // 关闭块设备
  out_close_fsid:
-  _close_fsid();
+  _close_fsid();     // 关闭 fsid 文件
  out_path_fd:
-  _close_path();
+  _close_path();     // 关闭数据目录
 
+  // ========== 格式化后可选: 运行 fsck 检查 ==========
   if (r == 0 &&
       cct->_conf->bluestore_fsck_on_mkfs) {
     int rc = fsck(cct->_conf->bluestore_fsck_on_mkfs_deep);
@@ -8764,8 +8806,8 @@ int BlueStore::mkfs()
     }
   }
 
+  // ========== 写入 mkfs_done 标记（幂等性检查依赖此文件） ==========
   if (r == 0) {
-    // indicate success by writing the 'mkfs_done' file
     r = write_meta("mkfs_done", "yes");
   }
 
@@ -12102,12 +12144,26 @@ void BlueStore::collect_metadata(map<string,string> *pm)
   }
 }
 
+/**
+ * 获取 BlueStore 所有块设备所在的 NUMA 节点
+ *
+ * 遍历 block、block.db、block.wal 等所有设备，通过
+ * /sys/block/{dev}/device/numa_node 读取每个设备的 NUMA 节点号。
+ *
+ * 只有当所有设备在同一个 NUMA 节点、且全部读取成功时，才填充
+ * final_node 有效值（否则为 -1），因为跨节点时 NUMA 绑定无意义。
+ *
+ * @param final_node  输出：确认的 NUMA 节点号（-1 表示不确定）
+ * @param out_nodes   输出：所有节点号的集合（可选）
+ * @param out_failed  输出：无法检测 NUMA 的设备名集合（可选）
+ */
 int BlueStore::get_numa_node(
   int *final_node,
   set<int> *out_nodes,
   set<string> *out_failed)
 {
   int node = -1;
+  // 获取所有块设备路径名（block、block.db、block.wal 等）
   set<string> devices;
   get_devices(&devices);
   set<int> nodes;
@@ -12115,20 +12171,21 @@ int BlueStore::get_numa_node(
   for (auto& devname : devices) {
     int n;
     BlkDev bdev(devname);
-    int r = bdev.get_numa_node(&n);
+    int r = bdev.get_numa_node(&n);                    // 读 /sys/block/{dev}/device/numa_node
     if (r < 0) {
       dout(10) << __func__ << " bdev " << devname << " can't detect numa_node"
 	       << dendl;
-      failed.insert(devname);
+      failed.insert(devname);                          // 检测失败（如虚拟设备、旧内核）
       continue;
     }
     dout(10) << __func__ << " bdev " << devname << " on numa_node " << n
 	     << dendl;
     nodes.insert(n);
     if (node < 0) {
-      node = n;
+      node = n;                                        // 记录第一个设备的节点号作为基准
     }
   }
+  // 确认：所有设备在同一节点 + 全部检测成功 → 有效 NUMA 节点
   if (node >= 0 && nodes.size() == 1 && failed.empty()) {
     *final_node = node;
   }

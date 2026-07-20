@@ -2146,6 +2146,23 @@ void OSD::write_superblock(CephContext* cct, OSDSuperblock& sb, ObjectStore::Tra
   t.omap_setkeys(coll_t::meta(), OSD_SUPERBLOCK_GOBJECT, attrs);
 }
 
+/**
+ * 格式化 OSD 磁盘（ceph-osd --mkfs 的核心逻辑）
+ *
+ * 参数:
+ *   cct        - CephContext 上下文
+ *   store      - ObjectStore 对象（所有权转移，mkfs 负责释放）
+ *   fsid       - 集群 FSID（UUID）
+ *   whoami     - OSD 编号（如 0, 1, 2...）
+ *   osdspec_affinity - OSD spec affinity（设备亲和性标签）
+ *
+ * 流程:
+ *   1. store->mkfs()     — 底层存储格式化（BlueStore: 初始化 RocksDB、创建 block 符号链接等）
+ *   2. store->mount()    — 挂载刚格式化的存储卷
+ *   3. 创建/校验 superblock — 如果 meta collection 不存在则新建并写入 superblock；
+ *                             如果已存在（重复 mkfs）则校验 whoami 和 fsid 一致
+ *   4. write_meta()      — 写入元数据文件（ceph_fsid、fsid、whoami、magic、type 等）
+ */
 int OSD::mkfs(CephContext *cct,
 	      std::unique_ptr<ObjectStore> store,
 	      uuid_d fsid,
@@ -2156,9 +2173,11 @@ int OSD::mkfs(CephContext *cct,
 
   OSDSuperblock sb;
   bufferlist sbbl;
-  // if we are fed a uuid for this osd, use it.
+  // 设置 OSD 的 UUID
   store->set_fsid(cct->_conf->osd_uuid);
 
+  // 步骤 1: 底层存储格式化
+  // BlueStore: 创建 RocksDB、BlueFS、block 符号链接、type 文件等
   ret = store->mkfs();
   if (ret) {
     derr << "OSD::mkfs: ObjectStore::mkfs failed with error "
@@ -2166,8 +2185,9 @@ int OSD::mkfs(CephContext *cct,
     return ret;
   }
 
-  store->set_cache_shards(1);  // doesn't matter for mkfs!
+  store->set_cache_shards(1);  // mkfs 阶段缓存分片数无所谓，设为 1
 
+  // 步骤 2: 挂载存储卷（打开 RocksDB、块设备等）
   ret = store->mount();
   if (ret) {
     derr << "OSD::mkfs: couldn't mount ObjectStore: error "
@@ -2175,52 +2195,61 @@ int OSD::mkfs(CephContext *cct,
     return ret;
   }
 
+  // scope_guard: 无论成功还是失败，函数退出时自动 umount
   auto umount_store = make_scope_guard([&] {
     store->umount();
   });
 
+  // 步骤 3: 创建或校验 superblock
+  // meta collection 存放 OSD 的元数据（superblock 等信息）
   ObjectStore::CollectionHandle ch =
     store->open_collection(coll_t::meta());
   if (ch) {
+    // meta collection 已存在 → 说明之前已经 mkfs 过
+    // 读出现有 superblock，校验 whoami 和 cluster_fsid 一致
     ret = store->read(ch, OSD_SUPERBLOCK_GOBJECT, 0, 0, sbbl);
     if (ret < 0) {
       derr << "OSD::mkfs: have meta collection but no superblock" << dendl;
       return ret;
     }
-    /* if we already have superblock, check content of superblock */
     dout(0) << " have superblock" << dendl;
     auto p = sbbl.cbegin();
     decode(sb, p);
+    // 校验: OSD 编号必须一致（不能把 OSD 0 的盘格式化为 OSD 1）
     if (whoami != sb.whoami) {
       derr << "provided osd id " << whoami << " != superblock's " << sb.whoami
 	   << dendl;
       return -EINVAL;
     }
+    // 校验: 集群 FSID 必须一致（不能把集群 A 的盘挂到集群 B）
     if (fsid != sb.cluster_fsid) {
       derr << "provided cluster fsid " << fsid
 	   << " != superblock's " << sb.cluster_fsid << dendl;
       return -EINVAL;
     }
   } else {
-    // create superblock
-    sb.cluster_fsid = fsid;
-    sb.osd_fsid = store->get_fsid();
-    sb.whoami = whoami;
-    sb.compat_features = get_osd_initial_compat_set();
+    // meta collection 不存在 → 首次 mkfs，创建 superblock
+    sb.cluster_fsid = fsid;                          // 集群 UUID
+    sb.osd_fsid = store->get_fsid();                 // OSD 自己的 UUID
+    sb.whoami = whoami;                              // OSD 编号
+    sb.compat_features = get_osd_initial_compat_set(); // 兼容特性集
+    // 创建 meta collection 并写入 superblock
     ObjectStore::CollectionHandle ch = store->create_new_collection(
       coll_t::meta());
     ObjectStore::Transaction t;
     t.create_collection(coll_t::meta(), 0);
-    write_superblock(cct, sb, t);
-    ret = store->queue_transaction(ch, std::move(t));
+    write_superblock(cct, sb, t);                    // 编码 superblock 到事务
+    ret = store->queue_transaction(ch, std::move(t)); // 提交事务，写入磁盘
     if (ret) {
       derr << "OSD::mkfs: error while writing OSD_SUPERBLOCK_GOBJECT: "
 	   << "queue_transaction returned " << cpp_strerror(ret) << dendl;
       return ret;
     }
-    ch->flush();
+    ch->flush();  // 刷写缓存，确保 superblock 持久化
   }
 
+  // 步骤 4: 写入元数据文件（ceph_fsid, fsid, whoami, magic, type 等）
+  // 这些文件存放在 OSD 数据目录下，供后续正常启动时读取
   ret = write_meta(cct, store.get(), sb.cluster_fsid, sb.osd_fsid, whoami, osdspec_affinity);
   if (ret) {
     derr << "OSD::mkfs: failed to write fsid file: error "

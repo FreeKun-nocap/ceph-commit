@@ -401,7 +401,7 @@ int main(int argc, const char **argv)
     forker.exit(-ENODEV);
   }
 
-  // ==================== 生成 OSD 密钥（通常与 --mkfs 搭配，不是一次性模式） ====================
+  // ==================== 生成 OSD 密钥（通常与 --mkfs 搭配） ====================
   if (mkkey) {
     common_init_finish(g_ceph_context);
     KeyRing keyring;
@@ -471,7 +471,7 @@ int main(int argc, const char **argv)
     store->umount();                                       // 卸载存储后端
     forker.exit(0);
   }
-  // ==================== 一次性模式：创建 journal ====================
+  // ==================== 一次性模式：创建 journal （FileStore 专用） ====================
   if (mkjournal) {
     common_init_finish(g_ceph_context);
     int err = store->mkjournal();
@@ -485,7 +485,7 @@ int main(int argc, const char **argv)
 	 << " for object store " << data_path << dendl;
     forker.exit(0);
   }
-  // ==================== 一次性模式：检查 journal 支持情况 ====================
+  // ==================== 一次性模式：检查 journal 支持情况 （FileStore 专用） ====================
   if (check_wants_journal) {
     if (store->wants_journal()) {
       cout << "wants journal: yes" << std::endl;
@@ -513,7 +513,7 @@ int main(int argc, const char **argv)
       forker.exit(1);
     }
   }
-  // ==================== 一次性模式：刷写 journal ====================
+  // ==================== 一次性模式：刷写 journal （FileStore 专用） ====================
   if (flushjournal) {
     common_init_finish(g_ceph_context);
     int err = store->mount();
@@ -531,7 +531,7 @@ flushjournal_out:
     store.reset();
     forker.exit(err < 0 ? 1 : 0);
   }
-  // ==================== 一次性模式：导出 journal ====================
+  // ==================== 一次性模式：导出 journal （FileStore 专用） ====================
   if (dump_journal) {
     common_init_finish(g_ceph_context);
     int err = store->dump_journal(cout);
@@ -547,7 +547,7 @@ flushjournal_out:
     forker.exit(0);
   }
 
-  // ==================== 一次性模式：FileStore → BlueStore 转换 ====================
+  // ==================== 一次性模式：FileStore → BlueStore 转换 （FileStore 专用） ====================
   if (convertfilestore) {
     int err = store->mount();                              // 挂载旧存储
     if (err < 0) {
@@ -622,7 +622,10 @@ flushjournal_out:
   }
 
   // ==================== NUMA 亲和性优化 ====================
-  // 如果 osd_numa_prefer_iface 开启，优先选择与存储设备同 NUMA 节点的网络接口
+  // 如果 osd_numa_prefer_iface 开启
+  // 获取获取所有块设备路径名（block、block.db、block.wal 等）的 NUMA 节点号
+  // 确认：所有设备在同一节点 + 全部检测成功 → 有效 NUMA 节点
+  // 否则 os_numa_node 为 -1
   int os_numa_node = -1;
   r = store->get_numa_node(&os_numa_node, nullptr, nullptr);
   if (r >= 0 && os_numa_node >= 0) {
@@ -633,7 +636,7 @@ flushjournal_out:
     iface_preferred_numa_node = os_numa_node;
   }
 
-  // messengers
+  // Messenger: Ceph 的 网络通信抽象层 ，负责 OSD 之间、OSD 与 MON、OSD 与客户端之间的所有网络消息传递。
   std::string msg_type = g_conf().get_val<std::string>("ms_type");
   std::string public_msg_type =
     g_conf().get_val<std::string>("ms_public_type");
@@ -642,6 +645,7 @@ flushjournal_out:
 
   public_msg_type = public_msg_type.empty() ? msg_type : public_msg_type;
   cluster_msg_type = cluster_msg_type.empty() ? msg_type : cluster_msg_type;
+  // 区分不同的进程/连接 — 同一个 OSD 进程会创建多个 Messenger，但它们共享同一个 nonce，对端可以通过 nonce 识别"这些连接来自同一个 OSD 进程
   uint64_t nonce = Messenger::get_random_nonce();
   Messenger *ms_public = Messenger::create(g_ceph_context, public_msg_type,
 					   entity_name_t::OSD(whoami), "client", nonce);
@@ -659,6 +663,13 @@ flushjournal_out:
 					     entity_name_t::OSD(whoami), "ms_objecter", nonce);
   if (!ms_public || !ms_cluster || !ms_hb_front_client || !ms_hb_back_client || !ms_hb_back_server || !ms_hb_front_server || !ms_objecter)
     forker.exit(1);
+  // 设置集群内部协议版本号（CEPH_OSD_PROTOCOL = 10）。
+  // 当两个同类型节点（OSD↔OSD）建立连接时，双方在握手阶段交换各自的
+  // cluster_protocol 值，用于协商兼容的通信协议版本。如果版本不匹配，
+  // 连接会被拒绝或降级。
+  // 注：ms_public 和 ms_objecter 不设此项，因为它们面向客户端/MON 等
+  //     外部节点，走的是公共协议（如 CEPH_OSDC_PROTOCOL），不由 OSD
+  //     内部版本号控制。
   ms_cluster->set_cluster_protocol(CEPH_OSD_PROTOCOL);
   ms_hb_front_client->set_cluster_protocol(CEPH_OSD_PROTOCOL);
   ms_hb_back_client->set_cluster_protocol(CEPH_OSD_PROTOCOL);
@@ -672,10 +683,10 @@ flushjournal_out:
           << dendl;
 
   uint64_t message_size =
-    g_conf().get_val<Option::size_t>("osd_client_message_size_cap");
+    g_conf().get_val<Option::size_t>("osd_client_message_size_cap");  // 限制所有客户端 in-flight 请求占用的总内存上限
   boost::scoped_ptr<Throttle> client_byte_throttler(
     new Throttle(g_ceph_context, "osd_client_bytes", message_size));
-  uint64_t message_cap = g_conf().get_val<uint64_t>("osd_client_message_cap");
+  uint64_t message_cap = g_conf().get_val<uint64_t>("osd_client_message_cap");  // 限制同时处理中的客户端请求数量上限
   boost::scoped_ptr<Throttle> client_msg_throttler(
     new Throttle(g_ceph_context, "osd_client_messages", message_cap));
 
@@ -685,31 +696,45 @@ flushjournal_out:
     CEPH_FEATURE_PGID64 |
     CEPH_FEATURE_OSDENC;
 
+  // === ms_public: 面向客户端/外部通信的公网 Messenger ===
+  // 默认策略: 无状态注册服务器，需要 peer 先注册才能通信
   ms_public->set_default_policy(Messenger::Policy::stateless_registered_server(0));
+  // 对客户端消息进行限流（字节数和消息数）
   ms_public->set_policy_throttlers(entity_name_t::TYPE_CLIENT,
 				   client_byte_throttler.get(),
 				   client_msg_throttler.get());
+  // MON/MGR 视为有损客户端（可能断连），需具备 osd_required 特性
   ms_public->set_policy(entity_name_t::TYPE_MON,
                         Messenger::Policy::lossy_client(osd_required));
   ms_public->set_policy(entity_name_t::TYPE_MGR,
                         Messenger::Policy::lossy_client(osd_required));
 
+  // === ms_cluster: OSD 间内部集群通信的 Messenger ===
+  // 默认策略: 无状态服务器，不维护持久连接
   ms_cluster->set_default_policy(Messenger::Policy::stateless_server(0));
+  // MON 视为有损客户端；OSD 之间使用无损对等连接（保证消息可靠投递）
   ms_cluster->set_policy(entity_name_t::TYPE_MON, Messenger::Policy::lossy_client(0));
   ms_cluster->set_policy(entity_name_t::TYPE_OSD,
 			 Messenger::Policy::lossless_peer(osd_required));
+  // 拒绝客户端直连 cluster messenger
   ms_cluster->set_policy(entity_name_t::TYPE_CLIENT,
 			 Messenger::Policy::stateless_server(0));
 
+  // === Heartbeat Messenger: OSD 心跳检测通道 ===
+  // 分为 front（前端/公网）和 back（后端/集群网）两个独立通道
+  // 心跳 client 端: 有损连接，定时发送 ping 不保证可靠
   ms_hb_front_client->set_policy(entity_name_t::TYPE_OSD,
 			  Messenger::Policy::lossy_client(0));
   ms_hb_back_client->set_policy(entity_name_t::TYPE_OSD,
 			  Messenger::Policy::lossy_client(0));
+  // 心跳 server 端: 无状态服务器，只响应心跳请求
   ms_hb_back_server->set_policy(entity_name_t::TYPE_OSD,
 				Messenger::Policy::stateless_server(0));
   ms_hb_front_server->set_policy(entity_name_t::TYPE_OSD,
 				 Messenger::Policy::stateless_server(0));
 
+  // === ms_objecter: 用于 OSD 主动发起 RADOS 操作 ===
+  // 默认策略: 有损客户端，支持 OSDREPLYMUX 特性（多路复用回复）
   ms_objecter->set_default_policy(Messenger::Policy::lossy_client(CEPH_FEATURE_OSDREPLYMUX));
 
   entity_addrvec_t public_addrs, public_bind_addrs, cluster_addrs;

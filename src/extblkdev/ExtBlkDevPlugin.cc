@@ -181,26 +181,39 @@ namespace ceph {
     }
 #endif
 
-    // preload set of extblkdev plugins defined in config
+    /**
+     * 预加载配置中指定的外部块设备插件（extblkdev plugins）
+     *
+     * 外部块设备插件允许 BlueStore 通过非标准接口（如 NVMe-oF、PMEM、自定义驱动）
+     * 访问块设备。插件命名约定：实际插件名为 "ebd_{名称}"。
+     *
+     * 流程：
+     *   1. 从 osd_extblkdev_plugins 配置读取逗号分隔的插件名称列表
+     *   2. 遍历列表，通过 PluginRegistry 加载每个插件（加锁保护）
+     *   3. Linux 上降权后限制进程能力位（capabilities）
+     */
     int preload(CephContext *cct)
     {
       const auto& conf = cct->_conf;
+      // 获取配置的插件列表，如 "nvmeof,pmem"
       string plugins = conf.get_val<std::string>("osd_extblkdev_plugins");
       dout(10) << "starting preload of extblkdev plugins: " << plugins << dendl;
 
+      // 将逗号分隔的字符串拆分为列表
       list<string> plugins_list;
       get_str_list(plugins, plugins_list);
 
       auto registry = cct->get_plugin_registry();
       {
-	std::lock_guard l(registry->lock);
+	std::lock_guard l(registry->lock);                           // 加锁：PluginRegistry 是全局共享的
 	for (auto& plg : plugins_list) {
 	  dout(10) << "starting load of extblkdev plugin: " << plg << dendl;
+	  // 插件加载约定：类型为 "extblkdev"，实际名称加 "ebd_" 前缀
 	  int rc = registry->load("extblkdev", std::string("ebd_") + plg);
 	  if (rc) {
 	    derr << __func__ << " failed preloading extblkdev plugin: " << plg << dendl;
-	    return rc;
-	  }else{
+	    return rc;                                             // 任一插件加载失败则整体失败
+	  } else {
 	    dout(10) << "successful load of extblkdev plugin: " << plg << dendl;
 	  }
 	}

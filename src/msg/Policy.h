@@ -19,15 +19,20 @@ using peer_type_t = int;
 template<class ThrottleType>
 struct Policy {
   /// If true, the Connection is tossed out on errors.
+  // 一旦连接出现错误，是否丢弃该连接
   bool lossy;
   /// If true, the underlying connection can't be re-established from this end.
+  // 当底层连接断开时，是否不允许重新建立连接；当为 true 时，本端为服务端，被动等待 对端（客户端）来连接，自己不发起重连；当为 false 时，本端为客户端，可以主动发起重连
   bool server;
   /// If true, we will standby when idle
+  // 当连接空闲（idle）时，不直接销毁连接，而是进入 standby（待命）状态，等待后续需要时恢复。
   bool standby;
   /// If true, we will try to detect session resets
+  // 当对端重连时，本端会检测是否是同一个 session（会话）的恢复，还是全新的连接。如果检测到 session 被重置（比如对端重启导致连接标识变了），会执行清理动作。
   bool resetcheck;
 
   /// Server: register lossy client connections.
+  // 服务端是否将客户端的有损连接注册到连接跟踪表中。如果为 true ，服务端会跟踪每个客户端的连接，确保同一客户端（相同 peer addr）最多只有一个活跃连接。
   bool register_lossy_clients = true;
   // The net result of this is that a given client can only have one
   // open connection with the server.  If a new connection is made,
@@ -66,24 +71,49 @@ private:
       features_required(req) {}
   
 public:
+  /**
+   * 以下提供一些常用的 Policy 配置，用于不同的场景
+   * Policy 构造器入参说明
+   * @param lossy 一旦连接出现错误，是否丢弃该连接
+   * @param server 当底层连接断开时，是否不允许重新建立连接；当为 true 时，本端为服务端，被动等待 对端（客户端）来连接，自己不发起重连；当为 false 时，本端为客户端，可以主动发起重连
+   * @param standby 当连接空闲（idle）时，不直接销毁连接，而是进入 standby（待命）状态，等待后续需要时恢复。
+   * @param resetcheck 当对端重连时，本端会检测是否是同一个 session（会话）的恢复，还是全新的连接。如果检测到 session 被重置（比如对端重启导致连接标识变了），会执行清理动作。
+   * @param register_lossy_clients 服务端是否将客户端的有损连接注册到连接跟踪表中。如果为 true ，服务端会跟踪每个客户端的连接，确保同一客户端（相同 peer addr）最多只有一个活跃连接。
+   * @param req 需要的特征
+   */
+
+  // 有状态服务器: 无损 + server + standby + resetcheck + 注册
+  // 用于 MON 等需要维护持久连接、空闲时 standby 等待重连的服务端
   static Policy stateful_server(uint64_t req) {
     return Policy(false, true, true, true, true, req);
   }
+  // 无状态注册服务器: 有损 + server + 无 standby + 无 resetcheck + 注册
+  // 用于公网 Messenger（ms_public），要求客户端先注册才能通信
   static Policy stateless_registered_server(uint64_t req) {
     return Policy(true, true, false, false, true, req);
   }
+  // 无状态服务器: 有损 + server + 无 standby + 无 resetcheck + 不注册
+  // 用于不需要注册机制的纯无状态服务（如心跳 server、ms_cluster 默认策略）
   static Policy stateless_server(uint64_t req) {
     return Policy(true, true, false, false, false, req);
   }
+  // 无损对等体: 无损 + 非 server + standby + 无 resetcheck + 注册
+  // 用于 OSD 间集群通信，保证消息可靠投递，空闲时 standby
   static Policy lossless_peer(uint64_t req) {
     return Policy(false, false, true, false, true, req);
   }
+  // 无损对等体(可重用): 无损 + 非 server + standby + resetcheck + 注册
+  // 与 lossless_peer 类似，额外检测会话重置以重用连接
   static Policy lossless_peer_reuse(uint64_t req) {
     return Policy(false, false, true, true, true, req);
   }
+  // 有损客户端: 有损 + 非 server + 无 standby + 无 resetcheck + 注册
+  // 用于外部客户端（如 librados）、MON/MGR 等可能断连的 peer
   static Policy lossy_client(uint64_t req) {
     return Policy(true, false, false, false, true, req);
   }
+  // 无损客户端: 无损 + 非 server + 无 standby + resetcheck + 注册
+  // 用于需要可靠投递但非服务端的场景
   static Policy lossless_client(uint64_t req) {
     return Policy(false, false, false, true, true, req);
   }
