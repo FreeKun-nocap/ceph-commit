@@ -1856,6 +1856,13 @@ protected:
     std::atomic_store(&_osdmap, osdmap);
 #endif
   }
+  /**
+   * @brief 无锁获取当前 OSDMap 指针
+   * 作用 ：在 publish_map()（写入端）在锁保护下更新，
+   * 此访问器通过原子加载实现无锁读取。
+   * C++20 可用 std::atomic<shared_ptr> 的成员 load()，
+   * 否则回退到弃用的 std::atomic_load 自由函数。
+   */
   OSDMapRef get_osdmap() const {
 #ifdef __cpp_lib_atomic_shared_ptr
     return _osdmap.load();

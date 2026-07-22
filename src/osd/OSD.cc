@@ -2420,6 +2420,34 @@ int OSD::peek_meta(ObjectStore *store,
 
 // cons/des
 
+/**
+ * OSD 构造函数
+ *
+ * 初始化所有基础成员，包括：
+ *   - 定时器（绑定各自对应的锁）
+ *   - 网络层（5 对 Messenger：cluster/client/hb_front/hb_back/objecter）
+ *   - 监控客户端（MonClient、MgrClient）
+ *   - 统计计数器（logger、recoverystate_perf）
+ *   - 后端对象存储
+ *   - 日志客户端
+ *   - op 线程池和分片 work queue
+ *   - boot finisher、heartbeat、op_tracker
+ *   - OSDService（PG 服务层）
+ *
+ * 参数说明：
+ *   @param cct_                  Ceph 全局上下文
+ *   @param store_                后端对象存储（BlueStore 等）
+ *   @param id                    OSD ID（whoami）
+ *   @param internal_messenger    cluster 网络（OSD 间通信）
+ *   @param external_messenger    client 网络（与客户端通信）
+ *   @param hb_client_front/back   心跳客户端（主动发送心跳）
+ *   @param hb_front_serverm/back  心跳服务端（接收心跳）
+ *   @param osdc_messenger        objecter 网络（tiering 跨 OSD 读写）
+ *   @param mc                    Monitor 客户端
+ *   @param dev                   数据路径
+ *   @param jdev                  日志/Journal 路径
+ *   @param poolctx               io_context 线程池
+ */
 OSD::OSD(CephContext *cct_,
 	 std::unique_ptr<ObjectStore> store_,
 	 int id,
@@ -2434,56 +2462,55 @@ OSD::OSD(CephContext *cct_,
 	 const std::string &dev, const std::string &jdev,
 	 ceph::async::io_context_pool& poolctx) :
   Dispatcher(cct_),
-  tick_timer(cct, osd_lock),
-  tick_timer_without_osd_lock(cct, tick_timer_lock),
+  tick_timer(cct, osd_lock),                    // 绑定 osd_lock 的周期性 tick 定时器
+  tick_timer_without_osd_lock(cct, tick_timer_lock),  // 不持有 osd_lock 的 tick 定时器
   gss_ktfile_client(cct->_conf.get_val<std::string>("gss_ktab_client_file")),
-  cluster_messenger(internal_messenger),
-  client_messenger(external_messenger),
-  objecter_messenger(osdc_messenger),
+  cluster_messenger(internal_messenger),         // OSD 间集群通信
+  client_messenger(external_messenger),          // 客户端通信
+  objecter_messenger(osdc_messenger),            // objecter（tiering 代理读写）
   monc(mc),
-  mgrc(cct_, client_messenger, &mc->monmap),
-  logger(create_logger()),
-  recoverystate_perf(create_recoverystate_perf()),
-  store(std::move(store_)),
+  mgrc(cct_, client_messenger, &mc->monmap),     // MgrClient 注册
+  logger(create_logger()),                       // OSD 级统计计数器
+  recoverystate_perf(create_recoverystate_perf()), // recovery 状态统计
+  store(std::move(store_)),                      // 后端对象存储（BlueStore 等）
   log_client(cct, client_messenger, &mc->monmap, LogClient::NO_FLAGS),
   clog(log_client.create_channel()),
   whoami(id),
   dev_path(dev), journal_path(jdev),
-  store_is_rotational(store->is_rotational()),
+  store_is_rotational(store->is_rotational()),       // 存储介质类型（HDD/SSD）
   trace_endpoint("0.0.0.0", 0, "osd"),
   asok_hook(NULL),
   m_osd_pg_epoch_max_lag_factor(cct->_conf.get_val<double>(
 				  "osd_pg_epoch_max_lag_factor")),
-  osd_compat(get_osd_compat_set()),
-  osd_op_tp(cct, "OSD::osd_op_tp", "tp_osd_tp",
+  osd_compat(get_osd_compat_set()),                  // 本 OSD 可执行文件支持的 compat set
+  osd_op_tp(cct, "OSD::osd_op_tp", "tp_osd_tp",     // op 处理线程池
 	    get_num_op_threads(), get_num_op_shards()),
   heartbeat_stop(false),
   heartbeat_need_update(true),
-  hb_front_client_messenger(hb_client_front),
-  hb_back_client_messenger(hb_client_back),
-  hb_front_server_messenger(hb_front_serverm),
-  hb_back_server_messenger(hb_back_serverm),
+  hb_front_client_messenger(hb_client_front),        // 前端心跳（主动）
+  hb_back_client_messenger(hb_client_back),          // 后端心跳（主动）
+  hb_front_server_messenger(hb_front_serverm),       // 前端心跳（被动）
+  hb_back_server_messenger(hb_back_serverm),         // 后端心跳（被动）
   daily_loadavg(0.0),
-  heartbeat_thread(this),
-  heartbeat_dispatcher(this),
-  op_tracker(cct, cct->_conf->osd_enable_op_tracker,
+  heartbeat_thread(this),                            // 心跳线程
+  heartbeat_dispatcher(this),                        // 心跳消息分发器
+  op_tracker(cct, cct->_conf->osd_enable_op_tracker, // op 操作追踪器（慢请求检测）
                   cct->_conf->osd_num_op_tracker_shard),
   test_ops_hook(NULL),
-  op_shardedwq(
+  op_shardedwq(                                      // 分片 work queue（op 调度核心）
     this,
     ceph::make_timespan(cct->_conf->osd_op_thread_timeout),
     ceph::make_timespan(cct->_conf->osd_op_thread_suicide_timeout),
     &osd_op_tp),
   last_pg_create_epoch(0),
-  boot_finisher(cct),
+  boot_finisher(cct),                                // boot 阶段专用异步执行器
   up_thru_wanted(0),
   requested_full_first(0),
   requested_full_last(0),
-  service(this, poolctx)
+  service(this, poolctx)                             // OSDService（PG 服务层）
 {
-
+  // 如果配置了 GSSAPI 客户端 keytab，导出 KRB5_CLIENT_KTNAME 环境变量
   if (!gss_ktfile_client.empty()) {
-    // Assert we can export environment variable
     /*
         The default client keytab is used, if it is present and readable,
         to automatically obtain initial credentials for GSSAPI client
@@ -2498,21 +2525,28 @@ OSD::OSD(CephContext *cct_,
     ceph_assert(set_result == 0);
   }
 
+  // 将 MonClient 与 client messenger 绑定
   monc->set_messenger(client_messenger);
+
+  // 配置 op 追踪器（慢请求告警时间、日志阈值、历史记录大小）
   op_tracker.set_complaint_and_threshold(cct->_conf->osd_op_complaint_time,
                                          cct->_conf->osd_op_log_threshold);
   op_tracker.set_history_size_and_duration(cct->_conf->osd_op_history_size,
                                            cct->_conf->osd_op_history_duration);
   op_tracker.set_history_slow_op_size_and_threshold(cct->_conf->osd_op_history_slow_op_size,
                                                     cct->_conf->osd_op_history_slow_op_threshold);
+
+  // 设置对象清理区域的最大区间数
   ObjectCleanRegions::set_max_num_intervals(cct->_conf->osd_object_clean_region_max_num_intervals);
+
 #ifdef WITH_BLKIN
+  // 设置 Blkin 跟踪端点名称（如 "osd.0"）
   std::stringstream ss;
   ss << "osd." << whoami;
   trace_endpoint.copy_name(ss.str());
 #endif
 
-  // Determine scheduler type for this OSD
+  // 确定 op 调度器类型（mClockScheduler 或 WeightedPriorityQueue）
   auto get_op_queue_type = [this, &conf = cct->_conf]() {
     op_queue_type_t queue_type;
     if (auto type = conf.get_val<std::string>("osd_op_queue");
@@ -2520,11 +2554,11 @@ OSD::OSD(CephContext *cct_,
       if (auto qt = get_op_queue_type_by_name(type); qt.has_value()) {
         queue_type = *qt;
       } else {
-        // This should never happen
         dout(0) << "Invalid value passed for 'osd_op_queue': " << type << dendl;
         ceph_abort_msg("Unsupported op queue type");
       }
     } else {
+      // debug_random：随机选择调度器类型，用于测试
       static const std::vector<op_queue_type_t> index_lookup = {
         op_queue_type_t::mClockScheduler,
         op_queue_type_t::WeightedPriorityQueue
@@ -2537,7 +2571,7 @@ OSD::OSD(CephContext *cct_,
   };
   op_queue_type_t op_queue = get_op_queue_type();
 
-  // Determine op queue cutoff
+  // 确定 op 队列优先级截止点（high/low）
   auto get_op_queue_cut_off = [&conf = cct->_conf]() {
     if (conf.get_val<std::string>("osd_op_queue_cut_off") == "debug_random") {
       std::random_device rd;
@@ -2546,13 +2580,12 @@ OSD::OSD(CephContext *cct_,
     } else if (conf.get_val<std::string>("osd_op_queue_cut_off") == "high") {
       return CEPH_MSG_PRIO_HIGH;
     } else {
-      // default / catch-all is 'low'
       return CEPH_MSG_PRIO_LOW;
     }
   };
   unsigned op_queue_cut_off = get_op_queue_cut_off();
 
-  // initialize shards
+  // 初始化 op 处理分片（shard），每个 shard 有独立的调度队列
   num_shards = get_num_op_shards();
   for (uint32_t i = 0; i < num_shards; i++) {
     OSDShard *one_shard = new OSDShard(
@@ -2592,18 +2625,27 @@ void OSD::handle_signal(int signum)
   shutdown();
 }
 
+/**
+ * @brief OSD 预初始化，在 init() 之前调用
+ *
+ * @note 检查对象存储是否已被占用，注册配置观察者。
+ * pre_init() 在 OSD 进程启动早期执行（甚至在 mount 对象存储之前），
+ * 确保存储没有被另一个 OSD 进程使用。
+ */
 int OSD::pre_init()
 {
   std::lock_guard lock(osd_lock);
   if (is_stopping())
     return 0;
 
+  // 检查对象存储是否已被挂载（检测是否有其他进程正在使用）
   if (store->test_mount_in_use()) {
     derr << "OSD::pre_init: object store '" << dev_path << "' is "
          << "currently in use. (Is ceph-osd already running?)" << dendl;
     return -EBUSY;
   }
 
+  // 注册为配置观察者，当配置变更时收到通知
   cct->_conf.add_observer(this);
   return 0;
 }
@@ -3695,40 +3737,82 @@ float OSD::get_osd_snap_trim_sleep()
   return cct->_conf.get_val<double>("osd_snap_trim_sleep_hdd");
 }
 
+/**
+ * @brief OSD 守护进程的主初始化函数
+ * init() 不仅仅是"启动"，也包含了**"第一次在新版上启动时，把磁盘格式升级到当前版本兼容的状态"**的工作。
+ *
+ * 按照以下阶段依次完成初始化：
+ *   1. 基础设施初始化（定时器、boot finisher）
+ *   2. 底层对象存储挂载
+ *   3. 元数据加载（superblock、OSDMap）
+ *   4. 兼容性检查和升级
+ *   5. 网络层和认证初始化
+ *   6. PG 加载和 split/merge 处理
+ *   7. 线程池和心跳启动
+ *   8. Monitor 认证、CRUSH 更新
+ *   9. 最后初始化并启动 boot 流程
+ */
 int OSD::init()
 {
   OSDMapRef osdmap;
   CompatSet initial, diff;
-  std::lock_guard lock(osd_lock);
+  std::lock_guard lock(osd_lock);   // 持有 osd_lock 进入初始化
   if (is_stopping())
     return 0;
-  tracing::osd::tracer.init(cct, "osd");
-  tick_timer.init();
-  tick_timer_without_osd_lock.init();
-  service.recovery_request_timer.init();
-  service.sleep_timer.init();
 
+  // 初始化 Blkin/LTTng 分布式跟踪基础设施，设置 OSD 跟踪器
+  tracing::osd::tracer.init(cct, "osd");
+  /**
+   * @brief 初始化 OSD 定护进程的各类定时器
+   *  - tick_timer （在 OSD 中）
+   *    它做的事情是 OSD 级别的：
+   *    清理 markdown 日志、更新心跳 peer、检查新 map。这些与具体 PG 无关， OSD 自己是唯一的用户 。
+   *  - recovery_request_timer （在 OSDService 中）
+   *    它服务的是 PG 层面的延迟事件 （peering 事件、backfill 授权等）。 
+   *    OSDService 本身就是为 PG 提供运行时服务的接口层， PG 通过 OSDService 与 OSD 交互，而不需要了解 OSD 整体的全貌。
+   */
+  tick_timer.init();  // 创建一个后台定时器线程 ，用于调度延迟/周期性回调
+  tick_timer_without_osd_lock.init();  // 将不需要 osd_lock 的轻量周期性任务分离出来 ，避免这些简单操作阻塞 osd_lock 上等待的客户端 IO 请求
+  // OSDService 是 OSD 的 服务层封装类；PG 与数据面 的具体服务，如：PG 恢复、清洗等
+  service.recovery_request_timer.init();  // OSDService 中的恢复请求定时器，用于节流恢复请求
+  service.sleep_timer.init();  // OSDService 中的 sleep 定时器，用于节流 sleep 操作
+
+  // 启动 boot_finisher 线程池，用于异步执行 boot 阶段的任务
+  /**
+   * Finisher 是什么？
+   *    一个带有 独立后台线程 的任务队列。
+   *    你向它 queue() 一个回调（ Context ），它的线程就会异步执行这个回调。
+   *
+   * boot_finisher 的用途 ：
+   *    在 OSD boot 过程中，当需要等待 PG 追上最新的 OSDMap epoch 时，
+   *    把 等待操作 offload 到另一个线程 ，避免阻塞当前线程
+   */
   boot_finisher.start();
 
+  // 从持久化存储读取上一次集群所需的 OSD 版本号
   {
     string val;
     store->read_meta("require_osd_release", &val);
     last_require_osd_release = ceph_release_from_name(val);
   }
 
-  // mount.
+  // mount 对象存储（BlueStore 等）
   dout(2) << "init " << dev_path
 	  << " (looks like " << (store_is_rotational ? "hdd" : "ssd") << ")"
 	  << dendl;
   dout(2) << "journal " << journal_path << dendl;
-  ceph_assert(store);  // call pre_init() first!
+  ceph_assert(store);  // 必须在之前调用 pre_init()
 
+  // 设置缓存分片数，减少锁竞争
   store->set_cache_shards(get_num_cache_shards());
 
+  // 与 Monitor 认证时，旋转密钥可能尚未就绪，需要重试
+  // （用于 init 后半段 monc->authenticate() 之后的等待逻辑）
  int rotating_auth_attempts = 0;
  auto rotating_auth_timeout =
    g_conf().get_val<int64_t>("rotating_keys_bootstrap_timeout");
 
+  // 挂载底层对象存储（如 BlueStore 的 RocksDB）
   int r = store->mount();
   if (r < 0) {
     derr << "OSD:init: unable to mount object store" << dendl;
@@ -3738,10 +3822,13 @@ int OSD::init()
   dout(2) << "journal looks like " << (journal_is_rotational ? "hdd" : "ssd")
           << dendl;
 
+  // 挂载成功后关闭 FUSE，防止意外访问
+  // FUSE 是一个可选的调试接口 ，把对象存储挂载成文件系统方便人眼查看。 init() 开头关掉它只是确保初始状态正确。
   enable_disable_fuse(false);
 
   dout(2) << "boot" << dendl;
 
+  // 打开 meta collection，存储 OSD 级别的元数据
   service.meta_ch = store->open_collection(coll_t::meta());
   if (!service.meta_ch) {
     derr << "OSD:init: unable to open meta collection"
@@ -3749,7 +3836,8 @@ int OSD::init()
     r = -ENOENT;
     goto out;
   }
-  // initialize the daily loadavg with current 15min loadavg
+  // 用当前系统的 15 分钟负载均值初始化 daily_loadavg
+  // 整个代码库没有任何地方用它做决策或输出。 看起来是一个 遗留字段
   double loadavgs[3];
   if (getloadavg(loadavgs, 3) == 3) {
     daily_loadavg = loadavgs[2];
@@ -3758,7 +3846,11 @@ int OSD::init()
     daily_loadavg = 1.0;
   }
 
-  // sanity check long object name handling
+  /**
+   * @brief 校验配置的 object name/namespace 最大长度是否被后端存储支持
+   * 作用 ：防止客户端创建过长的对象名导致后端存储（尤其是 BlueStore 底层的 RocksDB）键值对溢出或性能退化。
+   * RocksDB 的键有长度限制，如果对象名太长，会超出底层存储引擎的能力。
+   */
   {
     hobject_t l;
     l.oid.name = string(cct->_conf->osd_max_object_name_len, 'n');
@@ -3783,7 +3875,7 @@ int OSD::init()
     }
   }
 
-  // read superblock
+  // 读取 superblock（包含 OSD 标识、兼容性特征位、epoch 信息等）
   r = read_superblock();
   if (r < 0) {
     derr << "OSD::init() : unable to read osd superblock" << dendl;
@@ -3791,6 +3883,18 @@ int OSD::init()
     goto out;
   }
 
+  // 禁止旧版本降级读取新版写入的数据
+  //
+  // 场景：新版 Ceph 在写入数据时往磁盘标记了新的 feature flag，
+  // 旧版 OSD 不认识这个 flag，启动时在这里被拦住。
+  //
+  // osd_compat：当前可执行文件认识的特征集合
+  // superblock.compat_features：磁盘上实际标记的特征集合
+  // compare() < 0  → 磁盘上存在当前代码不识别的 feature
+  //
+  // 根据这个未知 feature 是否影响"可写性"分两种拒绝方式：
+  //   可写 → 报错但仍然可读（降级只读）
+  //   不可写 → 完全无法操作磁盘
   if (osd_compat.compare(superblock.compat_features) < 0) {
     derr << "The disk uses features unsupported by the executable." << dendl;
     derr << " ondisk features " << superblock.compat_features << dendl;
@@ -3810,6 +3914,7 @@ int OSD::init()
     }
   }
 
+  // 验证 superblock 中的 OSD ID 与本进程的 whoami 一致
   assert_warn(whoami == superblock.whoami);
   if (whoami != superblock.whoami) {
     derr << "OSD::init: superblock says osd"
@@ -3818,9 +3923,10 @@ int OSD::init()
     goto out;
   }
 
+  // 记录 OSD 启动时间
   startup_time = ceph::mono_clock::now();
 
-  // load up "current" osdmap
+  // 加载当前 OSDMap
   assert_warn(!get_osdmap());
   if (get_osdmap()) {
     derr << "OSD::init: unable to read current osdmap" << dendl;
@@ -3830,7 +3936,17 @@ int OSD::init()
   osdmap = get_map(superblock.current_epoch);
   set_osdmap(osdmap);
 
-  // make sure we don't have legacy pgs deleting
+  // 检查是否存在已被删除 pool 的遗留 PG，确保升级前已完成清理
+  //
+  // final_pool_<pool_id> 对象：
+  //   当 pool 被删除时，Ceph 在 meta collection 中创建一个墓碑对象
+  //   "final_pool_<pool_id>"，记录 pool 被删前的最终配置
+  //   final_pool_<pool_id> 保留了 pool 被删时的完整配置（如副本数、纠删码配置），
+  //   让 OSD 在加载这些残留 PG 时能知道它们原本属于什么样的 pool，从而正确完成清理。
+  //
+  // 这里检查：如果 pool 已不存在于 osdmap，但磁盘上还有其 PG 的
+  // collection，且 final_pool_info 也丢了 → 说明清理元数据不完整，
+  // 直接 abort，防止数据不一致。
   {
     vector<coll_t> ls;
     int r = store->list_collections(ls);
@@ -3851,23 +3967,28 @@ int OSD::init()
     }
   }
 
+  // 获取本版本 OSD 期望的初始 compat set，检查是否需要升级 superblock
   initial = get_osd_initial_compat_set();
   diff = superblock.compat_features.unsupported(initial);
   if (superblock.compat_features.merge(initial)) {
-    // Are we adding SNAPMAPPER2?
+    // 检查是否添加了 SNAPMAPPER2 feature（Octopus 之前的快照映射格式不再支持）
     if (diff.incompat.contains(CEPH_OSD_FEATURE_INCOMPAT_SNAPMAPPER2)) {
       derr << __func__ << " snap_mapper upgrade from pre-octopus"
 	   << " is no longer supported" << dendl;
       ceph_abort();
     }
-    // We need to persist the new compat_set before we
-    // do anything else
+    // 在继续其他操作前，持久化新的 compat_set
     dout(5) << "Upgrading superblock adding: " << diff << dendl;
 
+    // 新版新增了 cluster_osdmap_trim_lower_bound 字段。
+    // 旧版 superblock 没有这个字段（值为 0），
+    // 升级后初始化为本地最老 epoch，表示"还不知道 Monitor 的裁剪下界时，
+    // 先保守一点，不裁掉任何 map"。后续收到 Monitor 的 MOSDMap 后会更新为集群统一值。
     if (!superblock.cluster_osdmap_trim_lower_bound) {
       superblock.cluster_osdmap_trim_lower_bound = superblock.get_oldest_map();
     }
 
+    // 将更新后的 superblock 持久化到 meta collection
     ObjectStore::Transaction t;
     write_superblock(cct, superblock, t);
     r = store->queue_transaction(service.meta_ch, std::move(t));
@@ -3875,7 +3996,16 @@ int OSD::init()
       goto out;
   }
 
-  // make sure snap mapper object exists
+  // 确保 snap_mapper 和 purged_snaps 元数据对象存在
+  /**
+  * snap_mapper 对象介绍
+  * 作用 : 记录每个 snapshot 与对象之间的映射关系。
+  * 具体来说，它维护了 (snapid, object_locator) -> hobject_t 的映射（或其反向映射），即 某个快照包含了哪些对象 。
+  *
+  * purged_snaps 对象介绍
+  * 作用 : 记录 已经被彻底清理（purge）掉的 snapshot ID 集合 。
+  * 当一个 snapshot 的所有关联对象都处理完毕（例如所有对该 snapshot 的引用都被移除），该 snapshot ID 就会被记录到 purged_snaps 中。
+  */
   if (!store->exists(service.meta_ch, OSD::make_snapmapper_oid())) {
     dout(10) << "init creating/touching snapmapper object" << dendl;
     ObjectStore::Transaction t;
@@ -3893,33 +4023,48 @@ int OSD::init()
       goto out;
   }
 
+  // 可选：启动时预加载所有 class handler（rados class extensions）
+  // class 是通过 libcls_*.so 动态库注册的自定义对象操作方法，
+  // 可被客户端通过 rados_exec() 调用。内置 class 包括：
+  //   rbd    - RBD 块设备操作
+  //   rgw    - RGW 对象存储操作
+  //   lock   - 分布式对象锁
+  //   log    - 日志条目追加/查询
+  //   version - 对象版本控制
+  //   refcount - 引用计数（克隆/快照）
+  //   cas    - 内容寻址存储
+  //   fifo   - FIFO 有序队列
+  //   等约 20 个
   if (cct->_conf->osd_open_classes_on_start) {
     int r = ClassHandler::get_instance().open_all_classes();
     if (r)
       dout(1) << "warning: got an error loading one or more classes: " << cpp_strerror(r) << dendl;
   }
 
+  // 检查 OSDMap 特性是否满足要求
   check_osdmap_features();
 
+  // 绑定当前 epoch 到 service 层
   {
     epoch_t bind_epoch = osdmap->get_epoch();
     service.set_epochs(NULL, NULL, &bind_epoch);
   }
 
+  // 清理重启遗留的临时对象
   clear_temp_objects();
 
-  // initialize osdmap references in sharded wq
+  // 初始化每个 shard 的 OSDMap 引用（用于 sharded work queue）
   for (auto& shard : shards) {
     std::lock_guard l(shard->osdmap_lock);
     shard->shard_osdmap = osdmap;
   }
 
-  // load up pgs (as they previously existed)
+  // 加载之前存在的 PG
   load_pgs();
 
   dout(2) << "superblock: I am osd." << superblock.whoami << dendl;
 
-  // prime osd stats
+  // 初始化 OSD 级别的统计信息（磁盘容量、告警等）
   {
     struct store_statfs_t stbuf;
     osd_alert_list_t alerts;
@@ -3928,7 +4073,8 @@ int OSD::init()
     service.set_statfs(stbuf, alerts);
   }
 
-  // client_messenger's auth_client will be set up by monc->init() later.
+  // 为 Messenger 设置认证客户端和服务器
+  // client_messenger 的 auth_client 将由 monc->init() 稍后设置
   for (auto m : { cluster_messenger,
 	objecter_messenger,
 	hb_front_client_messenger,
@@ -3945,12 +4091,14 @@ int OSD::init()
   }
   monc->set_handle_authentication_dispatcher(this);
 
+  // 设置需要订阅的 Monitor 实体类型（MON + OSD + MGR）
   monc->set_want_keys(CEPH_ENTITY_TYPE_MON | CEPH_ENTITY_TYPE_OSD
                       | CEPH_ENTITY_TYPE_MGR);
   r = monc->init();
   if (r < 0)
     goto out;
 
+  // 初始化 MgrClient，注册 PG 统计和性能指标查询回调
   mgrc.set_pgstats_cb([this]() { return collect_pg_stats(); });
   mgrc.set_perf_metric_query_cb(
     [this](const ConfigPayload &config_payload) {
@@ -3961,11 +4109,11 @@ int OSD::init()
       });
   mgrc.init();
 
-  // tell monc about log_client so it will know about mon session resets
+  // 告诉 monc 关于 log_client 的信息，以便它知道 Monitor 会话重置
   monc->set_log_client(&log_client);
   update_log_config();
 
-  // i'm ready!
+  // 注册消息分发器（dispatcher），按优先级处理不同类型的消息
   client_messenger->add_dispatcher_tail(&mgrc);
   client_messenger->add_dispatcher_tail(this);
   cluster_messenger->add_dispatcher_head(this);
@@ -3977,13 +4125,14 @@ int OSD::init()
 
   objecter_messenger->add_dispatcher_head(service.objecter.get());
 
+  // 初始化 OSD service 层并发布当前 map/superblock
   service.init();
   service.publish_map(osdmap);
   service.publish_superblock(superblock);
 
+  // 处理所有 PG 的 split 和 merge（拓扑变化后的 PG 分裂与合并）
   for (auto& shard : shards) {
-    // put PGs in a temporary set because we may modify pg_slots
-    // unordered_map below.
+    // 先将 PG 放入临时 set，避免在遍历过程中修改 pg_slots unordered_map
     set<PGRef> pgs;
     for (auto& i : shard->pg_slots) {
       PGRef pg = i.second->pg;
@@ -4013,12 +4162,13 @@ int OSD::init()
     }
   }
 
+  // 启动 OSD op 线程池（处理客户端 IO 请求）
   osd_op_tp.start();
 
-  // start the heartbeat
+  // 启动心跳线程（检测 peer OSD 存活状态）
   heartbeat_thread.create("osd_srv_heartbt");
 
-  // tick
+  // 启动周期性 tick 定时器（持有 osd_lock 和不持有锁的两个版本）
   tick_timer.add_event_after(get_tick_interval(),
 			     new C_Tick(this));
   {
@@ -4027,8 +4177,10 @@ int OSD::init()
 						new C_Tick_WithoutOSDLock(this));
   }
 
+  // 释放 osd_lock，然后进行需要网络通信的初始化步骤
   osd_lock.unlock();
 
+  // 向 Monitor 进行身份验证
   r = monc->authenticate();
   if (r < 0) {
     derr << __func__ << " authentication failed: " << cpp_strerror(r)
@@ -4036,6 +4188,7 @@ int OSD::init()
     exit(1);
   }
 
+  // 等待获取旋转认证密钥（rotating service keys），失败则重试
   while (monc->wait_auth_rotating(rotating_auth_timeout) < 0) {
     derr << "unable to obtain rotating service keys; retrying" << dendl;
     ++rotating_auth_attempts;
@@ -4046,6 +4199,7 @@ int OSD::init()
     }
   }
 
+  // 向 CRUSH map 更新本 OSD 的设备类型（如 ssd/hdd/nvme）
   r = update_crush_device_class();
   if (r < 0) {
     derr << __func__ << " unable to update_crush_device_class: "
@@ -4053,6 +4207,7 @@ int OSD::init()
     exit(1);
   }
 
+  // 向 CRUSH map 更新本 OSD 的位置信息（如 rack/row/datacenter）
   r = update_crush_location();
   if (r < 0) {
     derr << __func__ << " unable to update_crush_location: "
@@ -4060,46 +4215,52 @@ int OSD::init()
     exit(1);
   }
 
+  // 重新获取 osd_lock，完成剩余的初始化
   osd_lock.lock();
   if (is_stopping())
     return 0;
 
+  // 可选：启动时对对象存储的 DB（RocksDB）进行压缩
   if (cct->_conf.get_val<bool>("osd_compact_on_start")) {
     dout(2) << "compacting object store's DB" << dendl;
     store->compact();
   }
 
-  // start objecter *after* we have authenticated, so that we don't ignore
-  // the OSDMaps it requests.
+  // 在认证完成后初始化 objecter（避免忽略其请求的 OSDMap）
   service.final_init();
 
+  // 检查配置一致性
   check_config();
 
+  // 确保所有 PG 已经消费了之前所有的 OSDMap epoch
   dout(10) << "ensuring pgs have consumed prior maps" << dendl;
   consume_map();
 
   dout(0) << "done with init, starting boot process" << dendl;
 
-  // subscribe to any pg creations
+  // 向 Monitor 订阅 PG 创建通知
   monc->sub_want("osd_pg_creates", last_pg_create_epoch, 0);
 
-  // MgrClient needs this (it doesn't have MonClient reference itself)
+  // MgrClient 需要订阅 mgrmap（它自己没有 MonClient 引用）
   monc->sub_want("mgrmap", 0, 0);
 
-  // we don't need to ask for an osdmap here; objecter will
+  // 不需要在这里订阅 osdmap，objecter 会处理
   //monc->sub_want("osdmap", osdmap->get_epoch(), CEPH_SUBSCRIBE_ONETIME);
 
   monc->renew_subs();
 
+  // 开始 OSD 的 boot 流程（向 Monitor 注册自己）
   start_boot();
 
-  // Override a few options if mclock scheduler is enabled.
+  // 如果启用了 mclock 调度器，覆盖部分 QoS 相关配置
   maybe_override_sleep_options_for_qos();
   maybe_override_options_for_qos();
   maybe_override_max_osd_capacity_for_qos();
 
   return 0;
 
+  // --- 错误处理出口 ---
+  // 重新启用 FUSE，卸载对象存储，返回错误码
 out:
   enable_disable_fuse(true);
   store->umount();
@@ -8863,16 +9024,16 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 
 void OSD::check_osdmap_features()
 {
-  // adjust required feature bits?
+  // 当 OSDMap 更新时，同步更新 Messenger 的 feature 要求，
+  // 确保与 OSDMap 中记录的集群最小 feature 版本一致。
+  // 这样低版本 client/mon/osd 连接时会因 feature 不满足而被拒绝。
 
-  // we have to be a bit careful here, because we are accessing the
-  // Policy structures without taking any lock.  in particular, only
-  // modify integer values that can safely be read by a racing CPU.
-  // since we are only accessing existing Policy structures a their
-  // current memory location, and setting or clearing bits in integer
-  // fields, and we are the only writer, this is not a problem.
+  // 注意：这里不持锁直接修改 Policy 中的整数字段（features_required），
+  // 因为位操作是原子的（单 writer，多 reader 只读），是安全的。
 
   const auto osdmap = get_osdmap();
+
+  // 1) 调整 client 连接的协议 feature 要求
   {
     Messenger::Policy p = client_messenger->get_default_policy();
     uint64_t mask;
@@ -8884,6 +9045,8 @@ void OSD::check_osdmap_features()
       client_messenger->set_default_policy(p);
     }
   }
+
+  // 2) 调整 mon 连接的协议 feature 要求
   {
     Messenger::Policy p = client_messenger->get_policy(entity_name_t::TYPE_MON);
     uint64_t mask;
@@ -8896,6 +9059,9 @@ void OSD::check_osdmap_features()
       client_messenger->set_policy(entity_name_t::TYPE_MON, p);
     }
   }
+
+  // 3) 调整 OSD 间通信的协议 feature 要求，
+  //    同时检查并更新 superblock 的 on-disk 兼容特性
   {
     Messenger::Policy p = cluster_messenger->get_policy(entity_name_t::TYPE_OSD);
     uint64_t mask;
@@ -8908,6 +9074,9 @@ void OSD::check_osdmap_features()
       cluster_messenger->set_policy(entity_name_t::TYPE_OSD, p);
     }
 
+    // SHARDS 特性标识 OSD 支持纠删码（erasure code）的 shard 语义。
+    // 一旦集群启用了纠删码 pool，所有 OSD 的 superblock 都需要标记
+    // CEPH_OSD_FEATURE_INCOMPAT_SHARDS，确保降级后无法回退到旧版本。
     if (!superblock.compat_features.incompat.contains(CEPH_OSD_FEATURE_INCOMPAT_SHARDS)) {
       dout(0) << __func__ << " enabling on-disk ERASURE CODES compat feature" << dendl;
       superblock.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_SHARDS);
@@ -8918,6 +9087,9 @@ void OSD::check_osdmap_features()
     }
   }
 
+  // 4) 根据 require_osd_release 版本控制 heartbeat 消息是否需要鉴权（authorizer）
+  //    < nautilus: 不需要鉴权（兼容旧版本）
+  //    >= nautilus: 要求鉴权（增强安全性）
   if (osdmap->require_osd_release < ceph_release_t::nautilus) {
     hb_front_server_messenger->set_require_authorizer(false);
     hb_back_server_messenger->set_require_authorizer(false);
@@ -8926,6 +9098,8 @@ void OSD::check_osdmap_features()
     hb_back_server_messenger->set_require_authorizer(true);
   }
 
+  // 5) 追踪 require_osd_release 的变化并持久化到 Store 元数据中，
+  //    确保 OSD 重启后能恢复之前记录的集群最小版本
   if (osdmap->require_osd_release != last_require_osd_release) {
     dout(1) << __func__ << " require_osd_release " << last_require_osd_release
 	    << " -> " << to_string(osdmap->require_osd_release) << dendl;
