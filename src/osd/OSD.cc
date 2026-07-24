@@ -4109,15 +4109,28 @@ int OSD::init()
       });
   mgrc.init();
 
-  // 告诉 monc 关于 log_client 的信息，以便它知道 Monitor 会话重置
+  // 将 LogClient 注册到 monc，当 Monitor 连接会话中断后重连时，
+  // monc 会自动重新发送积压的日志消息，确保日志不因断连而丢失
   monc->set_log_client(&log_client);
   update_log_config();
 
-  // 注册消息分发器（dispatcher），按优先级处理不同类型的消息
+  // 注册 Dispatcher（消息分发器）。Messenger 收到消息后按链表顺序依次
+  // 调用各 Dispatcher->ms_dispatch(msg)，返回 true 则停止传递。
+  //
+  // 各 Messenger 职责分工：
+  //   client_messenger     — 与客户端（RBD/RGW/CephFS）通信
+  //   cluster_messenger    — OSD 间通信（PG 操作、数据复制等）
+  //   hb_*_messenger (x4)  — 专用心跳通道，主逻辑卡死时仍正常收发心跳
+  //   objecter_messenger   — OSD 内部 RPC 客户端
+  //
+  // add_dispatcher_head(dp) — dp 插入链表头部，优先处理
+  // add_dispatcher_tail(dp) — dp 追加到链表尾部，后处理
   client_messenger->add_dispatcher_tail(&mgrc);
   client_messenger->add_dispatcher_tail(this);
   cluster_messenger->add_dispatcher_head(this);
 
+  // 心跳使用独立的 Messenger + HeartbeatDispatcher，不经过 OSD 主分发逻辑，
+  // 避免被业务消息阻塞，保证低延迟高可靠
   hb_front_client_messenger->add_dispatcher_head(&heartbeat_dispatcher);
   hb_back_client_messenger->add_dispatcher_head(&heartbeat_dispatcher);
   hb_front_server_messenger->add_dispatcher_head(&heartbeat_dispatcher);
@@ -4145,15 +4158,25 @@ int OSD::init()
       std::scoped_lock l{*pg};
       set<pair<spg_t,epoch_t>> new_children;
       set<pair<spg_t,epoch_t>> merge_pgs;
+      /**
+       * 遍历所有 PG，逐一检查在 map 更新后是否需要 split 或 merge
+       * @param old_osdmap PG 当前使用的旧 map
+       * @param osdmap 最新的 map
+       * @param pg_id 当前 PG 的 ID
+       * @param new_children 收到 split 结果
+       * @param merge_pgs 收到 merge 结果
+       */
       service.identify_splits_and_merges(pg->get_osdmap(), osdmap, pg->pg_id,
 					 &new_children, &merge_pgs);
       if (!new_children.empty()) {
+        // 有分裂 → 需要 prime_splits 预先创建好子 PG 的槽位
 	for (auto shard : shards) {
 	  shard->prime_splits(osdmap, &new_children);
 	}
 	ceph_assert(new_children.empty());
       }
       if (!merge_pgs.empty()) {
+        // 有合并 → 处理合并
 	for (auto shard : shards) {
 	  shard->prime_merges(osdmap, &merge_pgs);
 	}
@@ -4220,7 +4243,7 @@ int OSD::init()
   if (is_stopping())
     return 0;
 
-  // 可选：启动时对对象存储的 DB（RocksDB）进行压缩
+  // 可选：启动时对对象存储的 DB（RocksDB）进行压缩，默认 false
   if (cct->_conf.get_val<bool>("osd_compact_on_start")) {
     dout(2) << "compacting object store's DB" << dendl;
     store->compact();
@@ -4232,7 +4255,24 @@ int OSD::init()
   // 检查配置一致性
   check_config();
 
-  // 确保所有 PG 已经消费了之前所有的 OSDMap epoch
+  /**
+   * 确保所有 PG 已经消费了之前所有的 OSDMap epoch
+   *
+   * OSD 正式上线前把积压的 map 全部处理干净，避免 PG 带着过期的 map 进入 boot。
+   *
+   * 主要步骤：
+   * - 发布最新 OSDMap — 经 pre_publish → await_reserved_maps → publish_map 三步推给各组件
+   * - 识别并处理 PG 的 split / merge — 根据新 map 计算哪些 PG 需要拆分或合并
+   * - 让各个 shard 消费新 map — shard->consume_map() 里会更新每个 PG 对最新 map 的认知
+   * - 入队 NullEvt — 触发每个 PG 内部也消费这份最新的 OSDMap
+   *
+   * 调用时机：
+   * - 这是在 OSD 初始化（init）的最后阶段调用的，此时 OSD 可能已经累积了多个 
+   *   OSDMap epoch（比如启动期间 Monitor 发来的 map）。
+   * - 调用 consume_map() 确保所有 PG 都把之前积压的所有 map 都消费完了，
+   *   然后才进入 boot 阶段。
+   * - 正常情况下，新的 OSDMap 到达时也会调用 consume_map()。
+   */
   dout(10) << "ensuring pgs have consumed prior maps" << dendl;
   consume_map();
 
@@ -4268,6 +4308,8 @@ out:
   return r;
 }
 
+// 完成 OSD 的后期初始化：注册管理套接字命令及其处理钩子，
+// 使运行中的 OSD 可通过 admin socket 执行状态查询、诊断和维护操作。
 void OSD::final_init()
 {
   AdminSocket *admin_socket = cct->get_admin_socket();
@@ -5483,9 +5525,11 @@ PGRef OSD::lookup_lock_pg(spg_t pgid)
 
 void OSD::load_pgs()
 {
+  // 确保 osd_lock 已被持有，load_pgs 必须在持有该锁的情况下调用
   ceph_assert(ceph_mutex_is_locked(osd_lock));
   dout(0) << "load_pgs" << dendl;
 
+  // 从持久化存储中读取 pg_num_history（PG 数量历史记录）
   {
     auto pghist = make_pg_num_history_oid();
     bufferlist bl;
@@ -5497,6 +5541,7 @@ void OSD::load_pgs()
     dout(20) << __func__ << " pg_num_history " << pg_num_history << dendl;
   }
 
+  // 列出 OSD 本地存储上的所有 collection（即所有 PG 目录）
   vector<coll_t> ls;
   int r = store->list_collections(ls);
   if (r < 0) {
@@ -5504,10 +5549,12 @@ void OSD::load_pgs()
   }
 
   int num = 0;
+  // 遍历每个 collection，逐一恢复其 PG 对象
   for (vector<coll_t>::iterator it = ls.begin();
        it != ls.end();
        ++it) {
     spg_t pgid;
+    // 清理临时 PG（is_temp）和已被标记删除的 PG（_has_removal_flag），直接删除其数据
     if (it->is_temp(&pgid) ||
        (it->is_pg(&pgid) && PG::_has_removal_flag(store.get(), pgid))) {
       dout(10) << "load_pgs " << *it
@@ -5516,12 +5563,15 @@ void OSD::load_pgs()
       continue;
     }
 
+    // 跳过既不是 PG 也不是临时 collection 的未知 collection
     if (!it->is_pg(&pgid)) {
       dout(10) << "load_pgs ignoring unrecognized " << *it << dendl;
       continue;
     }
 
     dout(10) << "pgid " << pgid << " coll " << coll_t(pgid) << dendl;
+    // 读取 PG 元数据中记录的 OSDMap epoch（即最近一次写入 PG 信息时的 map 版本），
+    // 后续将用该 epoch 对应的 OSDMap 来构造 PG，而非直接用当前 OSDMap
     epoch_t map_epoch = 0;
     int r = PG::peek_map_epoch(store.get(), pgid, &map_epoch);
     if (r < 0) {
@@ -5532,8 +5582,11 @@ void OSD::load_pgs()
 
     PGRef pg;
     if (map_epoch > 0) {
+      // 用 PG 所属 epoch 的 OSDMap 来构造 PG 对象，确保 PG 看到正确的映射
       OSDMapRef pgosdmap = service.try_get_map(map_epoch);
       if (!pgosdmap) {
+	// 如果找不到对应 epoch 的 map 但该 pool 在当前 map 中也不存在，
+	// 说明是已知 bug 10617 的遗留问题，跳过而非崩溃
 	if (!get_osdmap()->have_pg_pool(pgid.pool())) {
 	  derr << __func__ << ": could not find map for epoch " << map_epoch
 	       << " on pg " << pgid << ", but the pool is not present in the "
@@ -5542,6 +5595,7 @@ void OSD::load_pgs()
 	       << "to clean it up later." << dendl;
 	  continue;
 	} else {
+	  // 如果 pool 仍存在但 map 丢失，则直接崩溃（数据不一致，不可恢复）
 	  derr << __func__ << ": have pgid " << pgid << " at epoch "
 	       << map_epoch << ", but missing map.  Crashing."
 	       << dendl;
@@ -5550,21 +5604,23 @@ void OSD::load_pgs()
       }
       pg = _make_pg(pgosdmap, pgid);
     } else {
+      // map_epoch == 0，说明 PG 元数据中没有记录 epoch（可能是旧版本遗留的 PG），用当前 OSDMap 构造
       pg = _make_pg(get_osdmap(), pgid);
     }
+    // _make_pg 返回空指针说明该 PG 无效（如 pool 已被删除），清理其数据
     if (!pg) {
       recursive_remove_collection(cct, store.get(), pgid, *it);
       continue;
     }
 
-    // there can be no waiters here, so we don't call _wake_pg_slot
-
     pg->lock();
+    // 打开该 PG 对应的底层 collection 句柄
     pg->ch = store->open_collection(pg->coll);
 
-    // read pg state, log
+    // 从持久化存储中读取 PG 状态、PG 日志等元数据
     pg->read_state(store.get());
 
+    // 如果 PG 不存在（dne, does not exist），清理并跳过
     if (pg->dne())  {
       dout(10) << "load_pgs " << *it << " deleting dne" << dendl;
       pg->ch = nullptr;
@@ -5573,6 +5629,8 @@ void OSD::load_pgs()
       continue;
     }
     {
+      // 将 PG 的提交队列绑定到对应 shard 的 context_queue 上，
+      // 实现 PG 的 I/O 请求按 shard 分发
       uint32_t shard_index = pgid.hash_to_shard(shards.size());
       ceph_assert(NULL != shards[shard_index]);
       store->set_collection_commit_queue(pg->coll, &(shards[shard_index]->context_queue));
@@ -5581,6 +5639,7 @@ void OSD::load_pgs()
     dout(10) << __func__ << " loaded " << *pg << dendl;
     pg->unlock();
 
+    // 将恢复的 PG 注册到 OSD 的 pg_map 中，使其可被外部请求访问
     register_pg(pg);
     ++num;
   }
@@ -7735,24 +7794,35 @@ bool OSD::heartbeat_dispatch(Message *m)
   return true;
 }
 
+/**
+ * Messenger 收到消息后回调 Dispatcher 接口的 ms_dispatch() 虚函数。
+ * OSD 继承 Dispatcher 并实现此方法，作为所有业务消息的入口。
+ * 调用链路：
+ *   Messenger (client/cluster) → Dispatcher::ms_dispatch() → OSD::ms_dispatch() → _dispatch()
+ * 注意：此函数与 ms_fast_dispatch() 不同，需要持 osd_lock 才能处理。
+ */
 bool OSD::ms_dispatch(Message *m)
 {
   dout(20) << "OSD::ms_dispatch: " << *m << dendl;
+
+  // 特殊快速路径：MARK_ME_DOWN 是停服确认信号，无需加锁直接处理
   if (m->get_type() == MSG_OSD_MARK_ME_DOWN) {
     service.got_stop_ack();
     m->put();
     return true;
   }
 
-  // lock!
-
+  // 加锁：后续所有操作在 osd_lock 保护下进行
   osd_lock.lock();
+
+  // 二次检查：加锁瞬间可能已进入停止流程
   if (is_stopping()) {
     osd_lock.unlock();
     m->put();
     return true;
   }
 
+  // 按消息类型分发给对应的 handler（内部通过 switch(m->get_type()) 分发）
   _dispatch(m);
 
   osd_lock.unlock();
@@ -8007,23 +8077,33 @@ bool OSD::ms_handle_fast_authentication(Connection *con)
   }
 }
 
+/**
+ * @brief _dispatch 由 ms_dispatch() 在持有 osd_lock 时调用。
+ * 
+ * 按消息类型分发给对应的 handler。
+ *
+ * 注意：只有"慢路径"消息在此处理。
+ * PG 操作类消息（如 peering、子操作）由 ms_fast_dispatch() 直接处理，不经过这里。
+ */
 void OSD::_dispatch(Message *m)
 {
   ceph_assert(ceph_mutex_is_locked(osd_lock));
   dout(20) << "_dispatch " << m << " " << *m << dendl;
 
   switch (m->get_type()) {
-    // -- don't need OSDMap --
+    // -- 以下消息无需等待 OSDMap，可直接处理 --
 
-    // map and replication
+    // OSDMap 更新：来自 MON，触发 PG 创建/删除/分裂等
   case CEPH_MSG_OSD_MAP:
     handle_osd_map(static_cast<MOSDMap*>(m));
     break;
+
+    // MON 回复已清理的快照信息
   case MSG_MON_GET_PURGED_SNAPS_REPLY:
     handle_get_purged_snaps_reply(static_cast<MMonGetPurgedSnapsReply*>(m));
     break;
 
-    // osd
+    // 管理命令：pg query、注入、配置修改等
   case MSG_COMMAND:
     handle_command(static_cast<MCommand*>(m));
     return;
@@ -8356,8 +8436,42 @@ int OSD::trim_stale_maps()
   return num_removed;
 }
 
+/**
+ * 处理来自 Monitor 或其他 OSD 的 OSDMap 消息
+ *
+ * 这是 OSD 处理地图更新的核心入口函数。其工作流程如下：
+ *   1. 等待 PG 消费地图（防止地图堆积过快）
+ *   2. 校验 fsid、会话权限
+ *   3. 与 Objecter 共享地图
+ *   4. 校验地图连续性，跳过重复/过时地图，处理地图空洞
+ *   5. 解码并存储全量地图和增量地图到本地 OSDMap 缓存及磁盘事务
+ *   6. 记录 pg_num 变更历史、purged_snaps
+ *   7. 更新 superblock 并提交磁盘事务
+ *
+ * @param m MOSDMap 消息指针（包含一批全量/增量地图）
+ */
 void OSD::handle_osd_map(MOSDMap *m)
 {
+  /**
+   * OSDMap 是集群全局状态快照（epoch 版本号递增），含 OSD 状态、
+   * pool 配置、CRUSH 拓扑等。核心设计理念：
+   *
+   * 1. PG 按需消费 OSDMap，不同步紧跟
+   *    - 正常客户端读写不触发 OSDMap 更新
+   *    - PG 只在与自身相关的变更时才查新地图
+   *    - 因此 PG 的 osdmap 版本通常落后于 OSD
+   *
+   * 2. 背压机制（本阶段）
+   *    - max_lag = osd_map_cache_size * max_lag_factor
+   *    - 当 PG 最慢版本 < OSD 版本 - max_lag，说明 PG 落后超出缓存上限
+   *    - 阻塞等待 PG 消费到 need = osdmap_epoch - max_lag
+   *    - 阻塞前临时释放 osd_lock，避免死锁
+   *
+   */
+  // == 阶段 1: 等待 PG 追上地图进度 ==
+  // 如果 OSD 地图堆积过快（超出 max_lag_factor 限制），
+  // 则阻塞等待 PG 消费完旧地图后再继续接收新地图，
+  // 防止地图缓存无限增长。
   // wait for pgs to catch up
   {
     // we extend the map cache pins to accomodate pgs slow to consume maps
@@ -8367,6 +8481,8 @@ void OSD::handle_osd_map(MOSDMap *m)
     epoch_t max_lag = cct->_conf->osd_map_cache_size *
       m_osd_pg_epoch_max_lag_factor;
     ceph_assert(max_lag > 0);
+
+    // 获取所有 shard 中最小的 PG 消费进度
     epoch_t osd_min = 0;
     for (auto shard : shards) {
       epoch_t min = shard->get_min_pg_epoch();
@@ -8374,11 +8490,13 @@ void OSD::handle_osd_map(MOSDMap *m)
 	osd_min = min;
       }
     }
+  
     epoch_t osdmap_epoch = get_osdmap_epoch();
     if (osd_min > 0 &&
 	osdmap_epoch > max_lag &&
 	osdmap_epoch - max_lag > osd_min) {
-      epoch_t need = osdmap_epoch - max_lag;
+      // 进入这里表示 OSD 地图堆积超过了最大限制，需要等待 PG 消费旧地图
+      epoch_t need = osdmap_epoch - max_lag;  // 允许落后的最大 epoch
       dout(10) << __func__ << " waiting for pgs to catch up (need " << need
 	       << " max_lag " << max_lag << ")" << dendl;
       for (auto shard : shards) {
@@ -8389,27 +8507,32 @@ void OSD::handle_osd_map(MOSDMap *m)
 		   << ", map cache is " << cct->_conf->osd_map_cache_size
 		   << ", max_lag_factor " << m_osd_pg_epoch_max_lag_factor
 		   << ")" << dendl;
-	  unlock_guard unlock{osd_lock};
+	  unlock_guard unlock{osd_lock};  // unlock_guard 析构时自动重新上锁（RAII 机制），恢复到进入 if 前的锁定状态
 	  shard->wait_min_pg_epoch(need);
 	}
       }
     }
   }
 
+  // == 阶段 2: 校验消息合法性 ==
   ceph_assert(ceph_mutex_is_locked(osd_lock));
   map<epoch_t,OSDMapRef> added_maps;
+
+  // 校验 fsid 是否匹配集群
   if (m->fsid != monc->get_fsid()) {
     dout(0) << "handle_osd_map fsid " << m->fsid << " != "
 	    << monc->get_fsid() << dendl;
-    m->put();
+    m->put();  // 减引用计数
     return;
   }
+  // 初始化未完成前忽略地图消息
   if (is_initializing()) {
     dout(0) << "ignoring osdmap until we have initialized" << dendl;
     m->put();
     return;
   }
 
+  // 检查会话权限：只有 mon 或 osd 发送的地图消息才被接受
   auto session = ceph::ref_cast<Session>(m->get_connection()->get_priv());
   if (session && !(session->entity_name.is_mon() ||
 		   session->entity_name.is_osd())) {
@@ -8420,10 +8543,12 @@ void OSD::handle_osd_map(MOSDMap *m)
     return;
   }
 
+  // 将地图转发给 Objecter，使其能够感知集群拓扑变化
   // share with the objecter
   if (!is_preboot())
     service.objecter->handle_osd_map(m);
 
+  // == 阶段 3: 记录日志与指标 ==
   epoch_t first = m->get_first();
   epoch_t last = m->get_last();
   dout(3) << "handle_osd_map epochs [" << first << "," << last << "], i have "
@@ -8432,6 +8557,7 @@ void OSD::handle_osd_map(MOSDMap *m)
           << "," << m->newest_map << "]"
 	  << dendl;
 
+  // 累加 perf 计数器：收到地图消息的次数
   logger->inc(l_osd_map);
   if (!m->maps.empty()) {
     logger->inc(l_osd_full_map_received, m->maps.size());
@@ -8445,10 +8571,12 @@ void OSD::handle_osd_map(MOSDMap *m)
            << " incremental maps"
            << dendl;
 
+  // 累加地图 epoch 范围对应的计数器，并记录重复的地图
   logger->inc(l_osd_mape, last - first + 1);
   if (first <= superblock.get_newest_map())
     logger->inc(l_osd_mape_dup, superblock.get_newest_map() - first + 1);
 
+  // 如果消息中的裁剪下界比本地记录的更大（更新），则更新本地记录
   if (superblock.cluster_osdmap_trim_lower_bound <
       m->cluster_osdmap_trim_lower_bound) {
     superblock.cluster_osdmap_trim_lower_bound =
@@ -8459,14 +8587,15 @@ void OSD::handle_osd_map(MOSDMap *m)
       superblock.cluster_osdmap_trim_lower_bound >= superblock.get_oldest_map());
   }
 
-  // make sure there is something new, here, before we bother flushing
-  // the queues and such
+  // 检查消息中是否有新地图：如果 last <= 本地已有最新 epoch，则无有效新数据
+  // 直接丢弃消息，避免进行后续不必要的解码和磁盘写入
   if (last <= superblock.get_newest_map()) {
     dout(10) << " no new maps here, dropping" << dendl;
     m->put();
     return;
   }
 
+  // 处理地图空洞：如果收到的地图起始 epoch 跳过了本地已有地图之后的一些 epoch
   if (first > superblock.get_newest_map() + 1) {
     dout(10) << "handle_osd_map message skips epochs "
 	     << superblock.get_newest_map() + 1 << ".." << (first-1) << dendl;
@@ -8486,9 +8615,11 @@ void OSD::handle_osd_map(MOSDMap *m)
     }
   }
 
+  // == 阶段 4: 解码并存储地图 ==
   ObjectStore::Transaction t;
   uint64_t txn_size = 0;
 
+  // 记录新地图中每个 epoch 的 purged_snaps 信息，用于后续持久化
   map<epoch_t,mempool::osdmap::map<int64_t,snap_interval_set_t>> purged_snaps;
 
   // store new maps: queue for disk and put in the osdmap cache
@@ -8500,6 +8631,7 @@ void OSD::handle_osd_map(MOSDMap *m)
     }
     txn_size = t.get_num_bytes();
     map<epoch_t,bufferlist>::iterator p;
+    // 处理全量地图：直接解码并写入磁盘事务
     p = m->maps.find(e);
     if (p != m->maps.end()) {
       dout(10) << "handle_osd_map  got full map for epoch " << e << dendl;
@@ -8520,6 +8652,7 @@ void OSD::handle_osd_map(MOSDMap *m)
       continue;
     }
 
+    // 处理增量地图：基于前一 epoch 的地图应用增量，编码为全量地图写入磁盘
     p = m->incremental_maps.find(e);
     if (p != m->incremental_maps.end()) {
       dout(10) << "handle_osd_map  got inc map for epoch " << e << dendl;
@@ -8528,6 +8661,7 @@ void OSD::handle_osd_map(MOSDMap *m)
       t.write(coll_t::meta(), oid, 0, bl.length(), bl);
 
       OSDMap *o = new OSDMap;
+      // 从上一 epoch 的地图执行深拷贝作为基础
       if (e > 1) {
         OSDMapRef prev;
         auto p = added_maps.find(e - 1);
@@ -8540,6 +8674,7 @@ void OSD::handle_osd_map(MOSDMap *m)
         o->deepish_copy_from(*prev);
       }
 
+      // 解码增量数据并应用到基础地图上
       OSDMap::Incremental inc;
       if (!bl.is_page_aligned()) {
         bl.rebuild_page_aligned();
@@ -8552,9 +8687,11 @@ void OSD::handle_osd_map(MOSDMap *m)
 	ceph_abort_msg("bad fsid");
       }
 
+      // 将应用增量后的地图重新编码为全量格式，用于磁盘持久化和 CRC 校验
       bufferlist fbl;
       o->encode(fbl, inc.encode_features | CEPH_FEATURE_RESERVED);
 
+      // 注入 CRC 校验失败（仅用于测试，由配置 osd_inject_bad_map_crc_probability 控制）
       bool injected_failure = false;
       if (cct->_conf->osd_inject_bad_map_crc_probability > 0 &&
 	  (rand() % 10000) < cct->_conf->osd_inject_bad_map_crc_probability*10000.0) {
@@ -8562,6 +8699,7 @@ void OSD::handle_osd_map(MOSDMap *m)
 	injected_failure = true;
       }
 
+      // CRC 校验：如果增量中携带了 crc 且本地编码后的 crc 不匹配，则请求全量地图
       if ((inc.have_crc && o->get_crc() != inc.full_crc) || injected_failure) {
 	dout(2) << "got incremental " << e
 		<< " but failed to encode full with correct crc; requesting"
@@ -8594,21 +8732,27 @@ void OSD::handle_osd_map(MOSDMap *m)
     ceph_abort_msg("MOSDMap lied about what maps it had?");
   }
 
+  // == 阶段 5: 后处理 ==
+  // 通知 Monitor 订阅系统我们已经收到了指定 epoch 的地图
   // even if this map isn't from a mon, we may have satisfied our subscription
   monc->sub_got("osdmap", last);
 
+  // 如果还有未收到的全量地图，重新发起请求
   if (!m->maps.empty() && requested_full_first) {
     dout(10) << __func__ << " still missing full maps " << requested_full_first
 	     << ".." << requested_full_last << dendl;
     rerequest_full_maps();
   }
 
+  // 跟踪 pool 创建/删除以及 pg_num 变更，记录到 pg_num_history 中
   track_pools_and_pg_num_changes(added_maps, t);
 
+  // 裁剪旧的 OSDMap 和 pg_num_history
   if (!superblock.is_maps_empty()) {
     trim_maps(m->cluster_osdmap_trim_lower_bound);
     pg_num_history.prune(superblock.get_oldest_map());
   }
+  // 更新 superblock 中的地图 epoch 区间信息
   superblock.insert_osdmap_epochs(first, last);
   if (superblock.get_maps_num_intervals() > 1) {
     // we had a map gap and not yet trimmed all the way up to
@@ -8625,6 +8769,7 @@ void OSD::handle_osd_map(MOSDMap *m)
     superblock.clean_thru = last;
   }
 
+  // 持久化 pg_num_history 到磁盘
   {
     bufferlist bl;
     ::encode(pg_num_history, bl);
@@ -8644,6 +8789,7 @@ void OSD::handle_osd_map(MOSDMap *m)
     dout(20) << __func__ << " pg_num_history " << pg_num_history << dendl;
   }
 
+  // 持久化 purged_snaps 信息
   // record new purged_snaps
   if (superblock.purged_snaps_last == start - 1) {
     OSDriver osdriver{store.get(), service.meta_ch, make_purged_snaps_oid()};
@@ -8659,6 +8805,8 @@ void OSD::handle_osd_map(MOSDMap *m)
 	     << ", not recording new purged_snaps" << dendl;
   }
 
+  // == 阶段 6: 提交事务 ==
+  // 写入 superblock、注册提交回调、将事务入队到 ObjectStore
   // superblock and commit
   write_superblock(cct, superblock, t);
   t.register_on_commit(new C_OnMapCommit(this, start, last, m));
@@ -9357,6 +9505,7 @@ bool OSD::advance_pg(
 
 void OSD::consume_map()
 {
+  // 每个新 OSDMap epoch 到达时，OSD 调用此函数消费该 map
   ceph_assert(ceph_mutex_is_locked(osd_lock));
   auto osdmap = get_osdmap();
   dout(20) << __func__ << " version " << osdmap->get_epoch() << dendl;
@@ -9365,20 +9514,24 @@ void OSD::consume_map()
    *  speak the older sorting version any more. Be careful not to force
    *  a shutdown if we are merely processing old maps, though.
    */
+  // 确保集群启用了 SORTBITWISE 标志（按位排序），OSD 不支持旧的排序方式
+  // 如果 OSD 已激活但此标志未设置，说明集群兼容性有问题，直接终止
   if (!osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE) && is_active()) {
     derr << __func__ << " SORTBITWISE flag is not set" << dendl;
     ceph_abort();
   }
+  // 三步发布新 OSDMap：预发布 → 等待预留 map 完成 → 正式发布
   service.pre_publish_map(osdmap);
   service.await_reserved_maps();
   service.publish_map(osdmap);
   dout(20) << "consume_map " << osdmap->get_epoch() << " -- publish done" << dendl;
-  // prime splits and merges
-  set<pair<spg_t,epoch_t>> newly_split;  // splits, and when
-  set<pair<spg_t,epoch_t>> merge_pgs;    // merge participants, and when
+  // 识别当前 map 中需要 split（拆分）和 merge（合并）的 PG
+  set<pair<spg_t,epoch_t>> newly_split;  // 将要拆分的 PG 及对应 epoch
+  set<pair<spg_t,epoch_t>> merge_pgs;    // 将要合并的 PG 及对应 epoch
   for (auto& shard : shards) {
     shard->identify_splits_and_merges(osdmap, &newly_split, &merge_pgs);
   }
+  // 处理 PG 拆分：为新的子 PG 预创建必要的结构
   if (!newly_split.empty()) {
     for (auto& shard : shards) {
       shard->prime_splits(osdmap, &newly_split);
@@ -9386,7 +9539,7 @@ void OSD::consume_map()
     ceph_assert(newly_split.empty());
   }
 
-  // prune sent_ready_to_merge
+  // 清理已发送 ready_to_merge 但不再需要合并的记录
   service.prune_sent_ready_to_merge(osdmap);
 
   // FIXME, maybe: We could race against an incoming peering message
@@ -9397,6 +9550,7 @@ void OSD::consume_map()
   // clean, so it'd have to be an imported PG to an OSD with a
   // slightly stale OSDMap...), so I'm ignoring it for now.  We plan to
   // replace all of this with a seastar-based code soon anyway.
+  // 处理 PG 合并：标记已有的 PG，或为缺失的参与 PG 创建空壳
   if (!merge_pgs.empty()) {
     // mark the pgs we already have, or create new and empty merge
     // participants for those we are missing.  do this all under the
@@ -9408,16 +9562,20 @@ void OSD::consume_map()
     ceph_assert(merge_pgs.empty());
   }
 
+  // 清理不再映射到此 OSD 的 PG 的创建记录
   service.prune_pg_created();
 
+  // 让各个 shard 消费新 map，并收集可以释放的推送（push）额度
   unsigned pushes_to_free = 0;
   for (auto& shard : shards) {
     shard->consume_map(osdmap, &pushes_to_free);
   }
 
+  // 获取本 OSD 上所有 PG 的 ID 列表
   vector<spg_t> pgids;
   _get_pgids(&pgids);
 
+  // 统计 PG 角色分布：primary / replica / stray（孤本）
   // count (FIXME, probably during seastar rewrite)
   int num_pg_primary = 0, num_pg_replica = 0, num_pg_stray = 0;
   vector<PGRef> pgs;
@@ -9434,6 +9592,7 @@ void OSD::consume_map()
   }
 
   {
+    // 清理 pending_creates_from_osd：如果 PG 不再映射到此 OSD，丢弃其创建请求
     // FIXME (as part of seastar rewrite): move to OSDShard
     std::lock_guard l(pending_creates_lock);
     for (auto pg = pending_creates_from_osd.begin();
@@ -9448,15 +9607,18 @@ void OSD::consume_map()
     }
   }
 
+  // （调试用）在关键点注入可配置的延迟，用于模拟慢 OSD
   service.maybe_inject_dispatch_delay();
 
+  // 处理等待此新 map 才能进行分发的客户端会话
   dispatch_sessions_waiting_on_map();
 
   service.maybe_inject_dispatch_delay();
 
+  // 释放之前预留的推送额度，允许新的 recovery 推送
   service.release_reserved_pushes(pushes_to_free);
 
-  // queue null events to push maps down to individual PGs
+  // 为每个 PG 入队一个空事件（NullEvt），触发 PG 内部消费最新的 OSDMap
   for (auto pgid : pgids) {
     enqueue_peering_evt(
       pgid,
@@ -9466,6 +9628,7 @@ void OSD::consume_map()
 	  osdmap->get_epoch(),
 	  NullEvt())));
   }
+  // 更新监控计数器：PG 总数 / primary / replica / stray
   logger->set(l_osd_pg, pgids.size());
   logger->set(l_osd_pg_primary, num_pg_primary);
   logger->set(l_osd_pg_replica, num_pg_replica);
@@ -10721,12 +10884,14 @@ void OSD::update_log_config()
 
 void OSD::check_config()
 {
-  // some sanity checks
+  // 一些配置合理性检查，在 OSD 初始化时调用
+  // 检查 osd_map_cache_size 是否足够大，以容纳持久化过程中可能滞后的 PG epoch
   if (cct->_conf->osd_map_cache_size <= (int)cct->_conf->osd_pg_epoch_persisted_max_stale + 2) {
     clog->warn() << "osd_map_cache_size (" << cct->_conf->osd_map_cache_size << ")"
 		 << " is not > osd_pg_epoch_persisted_max_stale ("
 		 << cct->_conf->osd_pg_epoch_persisted_max_stale << ")";
   }
+  // 检查对象清理区域的最大区间数是否为负，负值表示未正确配置
   if (cct->_conf->osd_object_clean_region_max_num_intervals < 0) {
     clog->warn() << "osd_object_clean_region_max_num_intervals ("
                  << cct->_conf->osd_object_clean_region_max_num_intervals
