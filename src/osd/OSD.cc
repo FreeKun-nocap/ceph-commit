@@ -7515,18 +7515,22 @@ void OSD::request_full_map(epoch_t first, epoch_t last)
 
 void OSD::got_full_map(epoch_t e)
 {
+  // 该区间表示已请求但尚未全部收到的 full map epoch 范围
   ceph_assert(requested_full_first <= requested_full_last);
   ceph_assert(ceph_mutex_is_locked(osd_lock));
+  // 当前没有未完成的 full map 请求，无需更新进度
   if (requested_full_first == 0) {
     dout(20) << __func__ << " " << e << ", nothing requested" << dendl;
     return;
   }
+  // 收到的是请求区间之前的旧 map，忽略它
   if (e < requested_full_first) {
     dout(10) << __func__ << " " << e << ", requested " << requested_full_first
 	     << ".." << requested_full_last
 	     << ", ignoring" << dendl;
     return;
   }
+  // 已收到请求区间的最后一张（或更新的）map，请求已经完成
   if (e >= requested_full_last) {
     dout(10) << __func__ << " " << e << ", requested " << requested_full_first
 	     << ".." << requested_full_last << ", resetting" << dendl;
@@ -7534,6 +7538,7 @@ void OSD::got_full_map(epoch_t e)
     return;
   }
 
+  // 区间仅完成了一部分，下一张需要等待的 map 是 e + 1
   requested_full_first = e + 1;
 
   dout(10) << __func__ << " " << e << ", requested " << requested_full_first
@@ -8595,19 +8600,19 @@ void OSD::handle_osd_map(MOSDMap *m)
     return;
   }
 
-  // 处理地图空洞：如果收到的地图起始 epoch 跳过了本地已有地图之后的一些 epoch
+  // 检查地图空洞：本地最新 epoch + 1 < 消息起始 epoch，说明中间缺了若干 epoch
+  // 例如：本地有 epoch 100，消息从 105 开始，则缺少 101-104
   if (first > superblock.get_newest_map() + 1) {
     dout(10) << "handle_osd_map message skips epochs "
 	     << superblock.get_newest_map() + 1 << ".." << (first-1) << dendl;
+    // 如果源（monitor/OSD）还存有这些缺失的地图，则发起订阅请求补缺
     if (m->cluster_osdmap_trim_lower_bound <= superblock.get_newest_map() + 1) {
       osdmap_subscribe(superblock.get_newest_map() + 1, false);
       m->put();
       return;
     }
-    // always try to get the full range of maps--as many as we can.  this
-    //  1- is good to have
-    //  2- is at present the only way to ensure that we get a *full* map as
-    //     the first map!
+    // 退而求其次：源已 trim 掉缺失的 epoch，无法补缺
+    // 请求尽可能多的全量地图（force=true），确保第一张是 full map 而非 incremental
     if (m->cluster_osdmap_trim_lower_bound < first) {
       osdmap_subscribe(m->cluster_osdmap_trim_lower_bound - 1, true);
       m->put();
@@ -8635,20 +8640,20 @@ void OSD::handle_osd_map(MOSDMap *m)
     p = m->maps.find(e);
     if (p != m->maps.end()) {
       dout(10) << "handle_osd_map  got full map for epoch " << e << dendl;
-      OSDMap *o = new OSDMap;
+      OSDMap *o = new OSDMap;             // 创建新 OSDMap 对象
       bufferlist& bl = p->second;
 
       if (!bl.is_page_aligned()) {
-        bl.rebuild_page_aligned();
+        bl.rebuild_page_aligned();        // 页对齐，避免后续直接 I/O 时出错
       }
-      o->decode(bl);
+      o->decode(bl);                       // 解码全量地图到内存
 
-      purged_snaps[e] = o->get_new_purged_snaps();
+      purged_snaps[e] = o->get_new_purged_snaps();  // 记录本 epoch 已清理的 snamps
 
-      ghobject_t fulloid = get_osdmap_pobject_name(e);
-      t.write(coll_t::meta(), fulloid, 0, bl.length(), bl);
-      added_maps[e] = add_map(o);
-      got_full_map(e);
+      ghobject_t fulloid = get_osdmap_pobject_name(e);  // 生成磁盘上的对象名（如 "osdmap.105"）
+      t.write(coll_t::meta(), fulloid, 0, bl.length(), bl);  // 将原始编码写入磁盘事务
+      added_maps[e] = add_map(o);          // 加入 OSD 全局 map_cache（去重后返回共享引用），用于后续 post-processing
+      got_full_map(e);                     // 更新内部状态（标记已收到全量地图）
       continue;
     }
 
@@ -8817,64 +8822,78 @@ void OSD::handle_osd_map(MOSDMap *m)
 }
 
 /*
- *  Compare between the previous last_map we had to
- *  each one of the added_maps.
- *  Track all of the changes relevant in pg_num_history.
+ * 将之前持有的 last_map 与新增的每个 map 进行逐轮比较，
+ * 将所有与 pg_num 相关的变更记录到 pg_num_history 中。
  */
 void OSD::track_pools_and_pg_num_changes(
   const map<epoch_t,OSDMapRef>& added_maps,
   ObjectStore::Transaction& t)
 {
+  // 新增 maps 的首尾 epoch
   epoch_t first = added_maps.begin()->first;
   epoch_t last = added_maps.rbegin()->first;
 
-  // Unless this is the first start of this OSD,
-  // lastmap should be the newest_map we have.
+  // 如果不是 OSD 首次启动，lastmap 应当是我们本地已存的最新 map
   OSDMapRef lastmap;
 
   if (superblock.is_maps_empty()) {
+    // 本地未存储任何 map，说明是 OSD 首次启动，
+    // 直接将第一份 added_map 作为 lastmap
     dout(10) << __func__ << " no maps stored, this is probably "
              << "the first start of this osd" << dendl;
     lastmap = added_maps.at(first);
   } else {
+    // 如果新增的起始 epoch 跳过了我们本地最新 map，需要检查其合法性
     if (first > superblock.get_newest_map() + 1) {
       ceph_assert(first == superblock.cluster_osdmap_trim_lower_bound);
       dout(20) << __func__ << " can't get previous map "
                << superblock.get_newest_map()
                << " first start of this osd after a map gap" << dendl;
     }
+    // 尝试从本地缓存中获取最新的 map 作为比较基准
     if (!(lastmap =
           service.try_get_map(superblock.get_newest_map()))) {
-      // This is unexpected
+      // 获取不到是意外情况，直接 abort
       ceph_abort();
     }
   }
 
-  // For each added map, record any changes into pg_num_history
-  // and update lastmap afterwards.
+  // 遍历每一份新增 map，与上一份 lastmap 做比较，
+  // 将 pg_num/pgp_num 的变化记录到 pg_num_history 中，
+  // 并更新 lastmap 指向当前 map，供下一轮比较使用。
   for (auto& [current_added_map_epoch, current_added_map] : added_maps) {
     _track_pools_and_pg_num_changes(t, lastmap,
                                     current_added_map,
                                     current_added_map_epoch);
     lastmap = current_added_map;
   }
+  // 记录最新已处理的 epoch
   pg_num_history.epoch = last;
 }
 
+/*
+ * 比较 lastmap 与 current_added_map 两个相邻 epoch 的 OSDMap，
+ * 检测以下三类 pool 变更并记录到 pg_num_history：
+ *   1) pool 被删除
+ *   2) 已有 pool 的 pg_num 发生变化（split/merge）
+ *   3) 新创建了 pool
+ */
 void OSD::_track_pools_and_pg_num_changes(
   ObjectStore::Transaction& t,
   const OSDMapRef& lastmap,
   const OSDMapRef& current_added_map,
   epoch_t current_added_map_epoch)
 {
-  // 1) Check if a pool was deleted
+  // 1) 检测 pool 删除：遍历上一张 map 中的 pool，检查当前 map 中是否已消失
   for (auto& [pool_id, pg_pool] : lastmap->get_pools()) {
     if (!current_added_map->have_pg_pool(pool_id)) {
+      // 记录 pool 删除事件
       pg_num_history.log_pool_delete(current_added_map_epoch, pool_id);
       dout(10) << __func__ << " recording final pg_pool_t for pool "
                << pool_id << dendl;
-      // this information is needed by _make_pg() if have to restart before
-      // the pool is deleted and need to instantiate a new (zombie) PG[Pool].
+      // 将 pool 的最终信息（pg_pool_t、名称、ec profile）持久化到磁盘。
+      // 这样如果在 pool 正式删除前 OSD 重启，_make_pg() 仍能拿到完整信息
+      // 来创建 zombie PG，避免状态不一致。
       ghobject_t obj = make_final_pool_info_oid(pool_id);
       bufferlist bl;
       encode(pg_pool, bl, CEPH_FEATURES_ALL);
@@ -8888,7 +8907,7 @@ void OSD::_track_pools_and_pg_num_changes(
       encode(profile, bl);
       t.write(coll_t::meta(), obj, 0, bl.length(), bl);
 
-    // 2) For existing pools, check if pg_num was changed
+    // 2) 检测已有 pool 的 pg_num 变化（split 增加 pg 数 / merge 减少 pg 数）
     } else if (unsigned new_pg_num = current_added_map->get_pg_num(pool_id);
                new_pg_num != pg_pool.get_pg_num()) {
       dout(10) << __func__ << " recording pool " << pool_id << " pg_num "
@@ -8899,11 +8918,12 @@ void OSD::_track_pools_and_pg_num_changes(
     }
   }
 
-  // 3) Check if a pool was created
+  // 3) 检测 pool 创建：遍历当前 map 中的 pool，找出上一张 map 中没有的新 pool
   for (auto& [pool_id, pg_pool] : current_added_map->get_pools()) {
     if (!lastmap->have_pg_pool(pool_id)) {
         dout(10) << __func__ << " recording new pool " <<pool_id << " pg_num "
                  << pg_pool.get_pg_num() << dendl;
+    // 新 pool 首次出现，记录它的初始 pg_num
     pg_num_history.log_pg_num_change(current_added_map_epoch,
                                      pool_id,
                                      pg_pool.get_pg_num());
