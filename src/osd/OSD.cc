@@ -7923,14 +7923,26 @@ void OSD::dispatch_session_waiting(const ceph::ref_t<Session>& session, OSDMapRe
   }
 }
 
+/**
+ * Messenger 已经通过 OSD::ms_can_fast_dispatch() 确认该消息可以走
+ * fast-dispatch 路径。这里运行在 Messenger 的接收线程中，不持有
+ * OSD::osd_lock，因此只做轻量检查和入队，耗时操作由 ShardedOpWQ
+ * 的工作线程在对应 PG 上执行。
+ */
 void OSD::ms_fast_dispatch(Message *m)
 {
+  // 启用 WITH_EVENTTRACE 时，记录本函数的进入和退出事件，主要服务于性能分析和调试，默认不会启用
   FUNCTRACE(cct);
+
+  // osd 停止过程中不再接收新工作。ms_fast_dispatch() 消费消息引用，
+  // 因此丢弃消息时必须调用 put()。
   if (service.is_stopping()) {
     m->put();
     return;
   }
-  // peering event?
+
+  // 一部分无需进入通用 PG op 队列的消息在这里直接处理。例如 ping、
+  // scrub/PG 创建控制消息，以及可以直接转换为 PGPeeringEvent 的消息。
   switch (m->get_type()) {
   case CEPH_MSG_PING:
     dout(10) << "ping from " << m->get_source() << dendl;
@@ -7962,6 +7974,8 @@ void OSD::ms_fast_dispatch(Message *m)
   case MSG_OSD_PG_LEASE_ACK:
     {
       MOSDPeeringOp *pm = static_cast<MOSDPeeringOp*>(m);
+      // 校验消息确实来自合法的 OSD peer，然后把 peering 事件投递给
+      // 对应 PG。enqueue_peering_evt() 之后，原始 Message 即可释放。
       if (require_osd_peer(pm)) {
 	enqueue_peering_evt(
 	  pm->get_spg(),
@@ -7972,6 +7986,9 @@ void OSD::ms_fast_dispatch(Message *m)
     }
   }
 
+  // 其余 fast-dispatch 消息统一封装成 OpRequest。OpRequest 负责请求的
+  // 生命周期、状态跟踪、延迟统计和 tracing；后续队列中传递的是它，
+  // 而不是直接传递裸 Message 指针。
   OpRequestRef op = op_tracker.create_request<OpRequest, Message*>(m);
   {
 #ifdef WITH_LTTNG
@@ -7980,7 +7997,11 @@ void OSD::ms_fast_dispatch(Message *m)
     tracepoint(osd, ms_fast_dispatch, reqid.name._type,
         reqid.name._num, reqid.tid, reqid.inc);
   }
-
+  
+  /**
+   * 这段是在给当前 OSD 请求建立“分布式追踪上下文”，方便观察一次请求在客户端、网络、OSD 和后端各阶段花了多长时间。
+   * 它不参与 rados put 的业务处理。
+   */ 
   if (m->otel_trace.IsValid()) {
     op->osd_parent_span = tracing::osd::tracer.add_span("op-request-created", m->otel_trace);
   } else {
@@ -7990,17 +8011,18 @@ void OSD::ms_fast_dispatch(Message *m)
   if (m->trace)
     op->osd_trace.init("osd op", &trace_endpoint, &m->trace);
 
-  // note sender epoch, min req's epoch
+  // 记录发送方构造请求时使用的 OSDMap epoch。
+  // sent_epoch：发送方当时使用的 map；min_epoch：处理该请求至少需要的 map。
+  // OSD 当前 map 尚未达到 min_epoch 时，请求必须等待 map 更新。
   op->sent_epoch = static_cast<MOSDFastDispatchOp*>(m)->get_map_epoch();
   op->min_epoch = static_cast<MOSDFastDispatchOp*>(m)->get_min_epoch();
   ceph_assert(op->min_epoch <= op->sent_epoch); // sanity check!
 
-  service.maybe_inject_dispatch_delay();
+  service.maybe_inject_dispatch_delay();  // 这是一个故障注入（fault injection）点，用于测试/调试，不是正常业务逻辑。
 
-  // Pre-tentacle clients sending requests to EC shards other than 0 may
-  // set the shard incorrectly because of how pg_temp encodes primary
-  // shards first. These requests need to be routed through
-  // dispatch_session_waiting which uses the OSDMap to correct the shard.
+  // 老客户端可能根据旧的 pg_temp 编码方式生成错误的 EC shard。
+  // 副本池 (NO_SHARD) 和 EC shard 0 不受影响，其余情况必须借助本地 OSDMap
+  // 重新计算正确的 spg_t，不能直接按消息携带的 shard 入队。
   bool legacy = !m->get_connection()->has_features(CEPH_FEATUREMASK_SERVER_TENTACLE);
   spg_t spg = static_cast<MOSDFastDispatchOp*>(m)->get_spg();
   if (legacy) {
@@ -8013,20 +8035,23 @@ void OSD::ms_fast_dispatch(Message *m)
   if (!legacy &&
       (m->get_connection()->has_features(CEPH_FEATUREMASK_RESEND_ON_SPLIT) ||
        m->get_type() != CEPH_MSG_OSD_OP)) {
-    // queue it directly
+    // 新客户端已经携带明确且可信的 spg_t，可直接进入按 PG 分片的
+    // op_shardedwq。真正的请求处理从 ShardedOpWQ::_process() 开始。
     enqueue_op(
       spg,
       std::move(op),
       static_cast<MOSDFastDispatchOp*>(m)->get_map_epoch());
   } else {
-    // legacy client, and this is an MOSDOp (the *only* fast dispatch
-    // message that didn't have an explicit spg_t); we need to map
-    // them to an spg_t while preserving delivery order.
+    // 需要重新映射的 MOSDOp（legacy shard 编码，或客户端不支持 RESEND_ON_SPLIT）不能直接使用消息中的 spg_t。
+    // 先按连接 Session 保存到 waiting_on_map，再使用当前 nextmap 计算目标 PG；
+    // session_dispatch_lock 同时保证同一连接上的请求不会在此过程中乱序。
     auto priv = m->get_connection()->get_priv();
     if (auto session = static_cast<Session*>(priv.get()); session) {
       std::lock_guard l{session->session_dispatch_lock};
       op->get();
       session->waiting_on_map.push_back(*op);
+      // dispatch_session_waiting() 只分发 min_epoch 已被 nextmap 满足的 请求；
+      // 其余请求继续留在 waiting_on_map，等 handle_osd_map() 推进 map 后再次唤醒。
       OSDMapRef nextmap = service.get_nextmap_reserved();
       dispatch_session_waiting(session, nextmap);
       service.release_map(nextmap);
@@ -8671,8 +8696,10 @@ void OSD::handle_osd_map(MOSDMap *m)
         OSDMapRef prev;
         auto p = added_maps.find(e - 1);
         if (p != added_maps.end()) {
+          // 如果上一 epoch 的地图在本次消息中已经处理过，则直接使用它
           prev = p->second;
         } else {
+          // 否则从本地缓存中获取上一 epoch 的地图
           prev = get_map(e - 1);
         }
 
@@ -8833,7 +8860,6 @@ void OSD::track_pools_and_pg_num_changes(
   epoch_t first = added_maps.begin()->first;
   epoch_t last = added_maps.rbegin()->first;
 
-  // 如果不是 OSD 首次启动，lastmap 应当是我们本地已存的最新 map
   OSDMapRef lastmap;
 
   if (superblock.is_maps_empty()) {
@@ -10260,23 +10286,28 @@ bool OSD::op_is_discardable(const MOSDOp *op)
 
 void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
 {
-  const utime_t stamp = op->get_req()->get_recv_stamp();
-  const utime_t latency = ceph_clock_now() - stamp;
-  const unsigned priority = op->get_req()->get_priority();
-  const int cost = op->get_req()->get_cost();
-  const uint64_t owner = op->get_req()->get_source().num();
-  const int type = op->get_req()->get_type();
+  // 提取调度器需要的元数据：接收时间用于计算排队延迟，priority/cost
+  // 决定调度顺序和资源权重，owner 用于按请求来源进行公平调度。
+  const utime_t stamp = op->get_req()->get_recv_stamp();  // 请求接收时间
+  const utime_t latency = ceph_clock_now() - stamp;  // 请求从接收至入队的延迟
+  const unsigned priority = op->get_req()->get_priority();  // 请求优先级（与请求类型相关）
+  const int cost = op->get_req()->get_cost();  // 请求预计会消耗多少资源的抽象数值。它不是统一的时间单位，也不一定单纯等于字节数，具体由消息类型决定。例如：副本写请求，使用写入数据长度作为成本。PG recovery push 会累计每个对象的恢复成本。
+  const uint64_t owner = op->get_req()->get_source().num();  // 请求发送方编号
+  const int type = op->get_req()->get_type();  // 消息类型
 
   dout(15) << "enqueue_op " << *op->get_req() << " prio " << priority
            << " type " << type
 	   << " cost " << cost
 	   << " latency " << latency
 	   << " epoch " << epoch << dendl;
+  // 将入队信息写入请求级 trace，便于定位请求进入 OSD 后的等待耗时。
   op->osd_trace.event("enqueue op");
   op->osd_trace.keyval("priority", priority);
   op->osd_trace.keyval("cost", cost);
 
+  // 创建一个新的追踪片段（Span），名为当前函数名（__func__）
   auto enqueue_span = tracing::osd::tracer.add_span(__func__, op->osd_parent_span);
+  // OpenTelemetry span 记录同一组调度属性，用于跨组件追踪。
   enqueue_span->AddEvent(__func__, {
     {"priority", priority},
     {"cost", cost},
@@ -10285,8 +10316,11 @@ void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
     {"type", type}
     });
 
+  // 标记请求已经进入 PG 队列，并统计从网络接收到正式入队前的耗时。
   op->mark_queued_for_pg();
   logger->tinc(l_osd_op_before_queue_op_lat, latency);
+  // recovery 消息与普通 PG 操作使用不同的 Queueable 类型，
+  // 使工作线程在出队后进入各自的处理路径；二者最终都由 op_shardedwq 调度。
   if (PGRecoveryMsg::is_recovery_msg(op)) {
     op_shardedwq.queue(
       OpSchedulerItem(
@@ -11792,14 +11826,18 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
 }
 
 void OSD::ShardedOpWQ::_enqueue(OpSchedulerItem&& item) {
+  // fast shutdown 不再接收新任务，避免关闭过程中继续向工作队列追加请求。
   if (unlikely(m_fast_shutdown) ) {
     // stop enqueing when we are in the middle of a fast shutdown
     return;
   }
 
+  // ordering token 通常是目标 spg_t。对它做稳定哈希，保证同一 PG 的任务
+  // 始终进入同一个 OSDShard，从而在该 shard 内维护请求顺序并减少锁竞争。
   uint32_t shard_index =
     item.get_ordering_token().hash_to_shard(osd->shards.size());
 
+  // 取得目标 shard；每个 shard 都有独立的调度器、PG slot 和工作线程等待条件。
   OSDShard* sdata = osd->shards[shard_index];
   assert (NULL != sdata);
 
@@ -11807,16 +11845,22 @@ void OSD::ShardedOpWQ::_enqueue(OpSchedulerItem&& item) {
 
   bool empty = true;
   {
+    // scheduler 由 shard 内的多个入队线程和工作线程共享，必须在
+    // shard_lock 保护下检查队列状态并完成入队，避免竞争。
     std::lock_guard l{sdata->shard_lock};
     empty = sdata->scheduler->empty();
+    // 调度器根据任务类别、priority、cost、owner 等信息决定实际出队顺序。
     sdata->scheduler->enqueue(std::move(item));
   }
 
   {
+    // 唤醒正在等待该 shard 新任务的工作线程。
     std::lock_guard l{sdata->sdata_wait_lock};
     if (empty) {
+      // 队列从空变为非空时唤醒全部等待者，让线程重新参与取任务。
       sdata->sdata_cond.notify_all();
     } else if (sdata->waiting_threads) {
+      // 队列原本已有任务时，只需再唤醒一个等待线程来增加处理能力。
       sdata->sdata_cond.notify_one();
     }
   }
