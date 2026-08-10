@@ -293,20 +293,29 @@ void ShardedThreadPool::reset_tp_timeout(heartbeat_handle_d *hb,
 
 void ShardedThreadPool::shardedthreadpool_worker(uint32_t thread_index, uint32_t shard_index)
 {
+  // 工作队列在 ShardedWQ 构造时注册到线程池，工作线程启动前必须有效。
   ceph_assert(wq != NULL);
   ldout(cct,10) << "worker start" << dendl;
 
+  // pthread_self() 是 POSIX 提供的当前线程标识。
+  // 将本线程注册到 Ceph heartbeat map，用于检测工作线程是否长时间卡住。
   std::stringstream ss;
   ss << name << " thread " << (void *)pthread_self();
   auto hb = cct->get_heartbeat_map()->add_worker(ss.str(), pthread_self());
   {
+      // 保存 heartbeat 与线程编号的双向关系；
+      // 同一 shard 的线程在持锁等待时，可以一起刷新超时状态，避免被误判为卡死。
       std::lock_guard lck(shardedpool_lock);
       hb_to_thread_index[hb] = thread_index;
       thread_index_to_hb[thread_index] = hb;
   }
 
+  // 每个工作线程持续消费自己负责的 shard，直到 stop() 设置 stop_threads。
   while (!stop_threads) {
     if (pause_threads) {
+      // pause 要求所有线程停止取新任务。
+      // 当前线程登记为 paused，并通知 pause() 调用者；
+      // 在 unpause() 清除标志前只定期醒来刷新 heartbeat。
       std::unique_lock ul(shardedpool_lock);
       ++num_paused;
       wait_cond.notify_all();
@@ -322,6 +331,8 @@ void ShardedThreadPool::shardedthreadpool_worker(uint32_t thread_index, uint32_t
       --num_paused;
     }
     if (drain_threads) {
+      // drain 与 pause 不同：队列未空时线程继续向下处理；
+      // 只有本线程负责的 shard 已空，才登记为 drained 并等待所有 shard 完成排空。
       std::unique_lock ul(shardedpool_lock);
       if (wq->is_shard_empty(thread_index, shard_index)) {
         ++num_drained;
@@ -339,20 +350,25 @@ void ShardedThreadPool::shardedthreadpool_worker(uint32_t thread_index, uint32_t
       }
     }
 
+    // 开始一次处理前设置 heartbeat 的正常超时和强制终止超时；
+    // 具体工作队列可在等待任务期间暂时清除并在醒来后重新设置这些超时。
     cct->get_heartbeat_map()->reset_timeout(
-	hb,
-	wq->timeout_interval.load(),
-	wq->suicide_interval.load());
+		hb,
+		wq->timeout_interval.load(),
+		wq->suicide_interval.load());
+    // 虚函数调用：对 OSD 的 op_shardedwq，实际进入 OSD::ShardedOpWQ::_process()，从指定 shard 调度并处理一个任务。
     wq->_process(thread_index, shard_index, hb);
   }
 
   ldout(cct,10) << "sharded worker finish" << dendl;
 
   {
+      // 线程退出前移除编号映射，避免其他线程继续刷新已退出线程的 heartbeat。
       std::lock_guard lck(shardedpool_lock);
       hb_to_thread_index.erase(hb);
       thread_index_to_hb.erase(thread_index);
   }
+  // 从全局 heartbeat map 注销当前工作线程。
   cct->get_heartbeat_map()->remove_worker(hb);
 
 }

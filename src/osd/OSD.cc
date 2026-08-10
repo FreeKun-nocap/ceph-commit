@@ -10356,6 +10356,7 @@ void OSD::dequeue_op(
 {
   const Message *m = op->get_req();
 
+  // 用于性能追踪和调试，不参与客户端请求的业务处理。
   FUNCTRACE(cct);
   OID_EVENT_TRACE_WITH_MSG(m, "DEQUEUE_OP_BEGIN", false);
 
@@ -10372,6 +10373,7 @@ void OSD::dequeue_op(
 
   logger->tinc(l_osd_op_before_dequeue_op_lat, latency);
 
+  // 如果发送方是客户端，尝试将最新的 OSDMap 发送给它，以便客户端在后续请求中使用最新的集群状态。
   service.maybe_share_map(m->get_connection().get(),
 			  pg->get_osdmap(),
 			  op->sent_epoch);
@@ -10379,7 +10381,7 @@ void OSD::dequeue_op(
   if (pg->is_deleting())
     return;
 
-  op->mark_reached_pg();
+  op->mark_reached_pg();  // 它不修改 PG，也不执行读写操作，主要用于慢请求诊断、状态显示和 tracing。
   op->osd_trace.event("dequeue_op");
 
   pg->do_request(op, handle);
@@ -11490,6 +11492,8 @@ void OSD::ShardedOpWQ::_add_slot_waiter(
 
 void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, heartbeat_handle_d *hb)
 {
+  // op_shardedwq 的消费者入口。工作线程每次调用最多从指定 shard 取出并执行一个 OpSchedulerItem；
+  // 任务可能是客户端 IO、recovery、peering 或 PG 管理事件，不一定都是网络消息。
   auto& sdata = osd->shards[shard_index];
   ceph_assert(sdata);
 
@@ -11497,9 +11501,11 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
   // problem.  So we choose the thread which has the smallest
   // thread_index(thread_index < num_shards) of shard to do oncommit
   // callback.
+  // 每个 shard 只让编号最小的关联线程执行 oncommit 回调，
+  // 避免多个线程并发消费 context_queue 导致提交回调顺序错乱。
   bool is_smallest_thread_index = thread_index < osd->num_shards;
 
-  // peek at spg_t
+  // 阶段 1：等待 shard 出现可消费的调度项或 oncommit 回调。
   sdata->shard_lock.lock();
   if (sdata->scheduler->empty() &&
       (!is_smallest_thread_index || sdata->context_queue.empty())) {
@@ -11509,6 +11515,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
       wait_lock.unlock();
     } else if (!sdata->stop_waiting) {
       dout(20) << __func__ << " empty q, waiting" << dendl;
+      // 队列为空属于正常休眠，不应被内部 heartbeat 误判为线程卡死。
       osd->cct->get_heartbeat_map()->clear_timeout(hb);
       sdata->shard_lock.unlock();
       sdata->sdata_cond.wait(wait_lock);
@@ -11532,9 +11539,12 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
 
   list<Context *> oncommits;
   if (is_smallest_thread_index) {
+    // 将已完成存储事务的回调移到本地，稍后在不持有 shard_lock 时执行。
     sdata->context_queue.move_to(oncommits);
   }
 
+  // 阶段 2：从 mClock/WPQ 调度器取得一个当前可以运行的任务。
+  // WorkItem 也可能携带未来可运行时间，而不是实际 OpSchedulerItem。
   WorkItem work_item;
   while (!std::get_if<OpSchedulerItem>(&work_item)) {
     if (sdata->scheduler->empty()) {
@@ -11561,37 +11571,47 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
       return;    // OSD shutdown, discard.
     }
 
-    // If the work item is scheduled in the future, wait until
-    // the time returned in the dequeue response before retrying.
+    // mClock 的 dequeue() 不一定返回任务：如果当前请求受 QoS 配额限制，
+    // WorkItem 中会保存一个 double，表示最早可以再次调度的绝对时间。
     if (auto when_ready = std::get_if<double>(&work_item)) {
       if (is_smallest_thread_index) {
+        // 等待 mClock 配额期间不要阻塞已经完成的事务回调。
+        // 回调可能获取其他锁，因此先释放 shard_lock，执行完毕后再恢复队列保护锁。
         sdata->shard_lock.unlock();
         handle_oncommits(oncommits);
         sdata->shard_lock.lock();
       }
+      // sdata_wait_lock 与 sdata_cond 配套，防止检查/进入等待与入队线程的 notify 之间出现丢失唤醒。
       std::unique_lock wait_lock{sdata->sdata_wait_lock};
+      // 将 mClock 返回的 double 时间转换为 condition_variable 使用的时间点。
       auto future_time = ceph::real_clock::from_double(*when_ready);
       dout(10) << __func__ << " dequeue future request at " << future_time << dendl;
-      // Disable heartbeat timeout until we find a non-future work item to process.
+      // 此时线程是主动等待调度额度，并非处理任务时卡死，暂时关闭内部 heartbeat 超时检测，醒来后再恢复。
       osd->cct->get_heartbeat_map()->clear_timeout(hb);
+      // 等待时不能持有 shard_lock，否则入队线程无法把新任务加入 scheduler。
       sdata->shard_lock.unlock();
+      // 记录正在定时等待的线程数；_enqueue() 据此决定是否 notify_one()。
       ++sdata->waiting_threads;
+      // mClock 认为任务尚未获得运行配额，等待到指定时间；
+      // 新高优先级任务入队时也可通过 sdata_cond 提前唤醒该线程重新调度。
       sdata->sdata_cond.wait_until(wait_lock, future_time);
+      // 无论是到期、notify 还是虚假唤醒，当前线程都已离开等待状态。
       --sdata->waiting_threads;
+      // 先释放条件变量锁，再重新获取 shard_lock 访问 scheduler/context_queue。
       wait_lock.unlock();
       sdata->shard_lock.lock();
-      // Reapply default wq timeouts
+      // 恢复工作线程的正常 heartbeat 和强制终止超时。
       osd->cct->get_heartbeat_map()->reset_timeout(hb,
         timeout_interval.load(), suicide_interval.load());
-      // Populate the oncommits list if there were any additions
-      // to the context_queue while we were waiting
+      // 等待期间可能有新的存储事务完成；指定线程把这些回调移入本地列表，
+      // 下一轮等待或本次任务处理结束时再统一执行。
       if (is_smallest_thread_index) {
         sdata->context_queue.move_to(oncommits);
       }
     }
   } // while
 
-  // Access the stored item
+  // 调度器已经返回实际任务，从 variant 中取出 OpSchedulerItem 所有权。
   auto item = std::move(std::get<OpSchedulerItem>(work_item));
   if (osd->is_stopping()) {
     sdata->shard_lock.unlock();
@@ -11602,6 +11622,8 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
     return;    // OSD shutdown, discard.
   }
 
+  // 阶段 3：按 ordering token（通常是 spg_t）找到 PG slot。
+  // 同一 PG 的任务都进入同一个 slot，以维持该 PG 内部的处理顺序。
   const auto token = item.get_ordering_token();
   auto r = sdata->pg_slots.emplace(token, nullptr);
   if (r.second) {
@@ -11619,22 +11641,25 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
 	   << " queued" << dendl;
 
  retry_pg:
+  // slot 可能尚未挂接实际 PG，例如 PG 正在创建、split 或等待新 map。
   PGRef pg = slot->pg;
 
-  // lock pg (if we have it)
+  // 阶段 4：如果 PG 已存在，先取得 PG 锁。获取 PG 锁时必须暂时释放 shard_lock，
+  // 随后重新验证 slot，处理期间可能发生的删除或重新入队竞争。
   if (pg) {
     // note the requeue seq now...
     uint64_t requeue_seq = slot->requeue_seq;
     ++slot->num_running;
 
     sdata->shard_lock.unlock();
-    osd->service.maybe_inject_dispatch_delay();
+    osd->service.maybe_inject_dispatch_delay();  // 是 Ceph 的测试/故障注入点。它故意在释放和获取锁之间增加延迟，以扩大并发竞争窗口，帮助测试发现竞态问题；正常配置下不会引入业务逻辑。
     pg->lock();
     osd->service.maybe_inject_dispatch_delay();
     sdata->shard_lock.lock();
 
     auto q = sdata->pg_slots.find(token);
     if (q == sdata->pg_slots.end()) {
+      // slot 已经被别的线程删除
       // this can happen if we race with pg removal.
       dout(20) << __func__ << " slot " << token << " no longer there" << dendl;
       pg->unlock();
@@ -11646,6 +11671,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
     --slot->num_running;
 
     if (slot->to_process.empty()) {
+      // 任务已经被别的线程消费完了，可能是
       // raced with _wake_pg_slot or consume_map
       dout(20) << __func__ << " " << token
 	       << " nothing queued" << dendl;
@@ -11655,6 +11681,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
       return;
     }
     if (requeue_seq != slot->requeue_seq) {
+      // 任务已经被别的线程重新入队，可能是 raced with _wake_pg_slot
       dout(20) << __func__ << " " << token
 	       << " requeue_seq " << slot->requeue_seq << " > our "
 	       << requeue_seq << ", we raced with _wake_pg_slot"
@@ -11665,6 +11692,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
       return;
     }
     if (slot->pg != pg) {
+      // slot 已经被别的线程重新挂接到新的 PG
       // this can happen if we race with pg removal.
       dout(20) << __func__ << " slot " << token << " no longer attached to "
 	       << pg << dendl;
@@ -11678,84 +11706,104 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
 	   << " waiting " << slot->waiting
 	   << " waiting_peering " << slot->waiting_peering << dendl;
 
+  // TPHandle 允许长操作刷新本工作线程的 heartbeat 超时。
   ThreadPool::TPHandle tp_handle(osd->cct, hb, timeout_interval.load(),
-				 suicide_interval.load(), &osd->osd_op_tp);
+					 suicide_interval.load(), &osd->osd_op_tp);
 
-  // take next item
+  // 从 PG slot 头部取任务，确保同一 ordering token 按 slot 顺序处理。
   auto qi = std::move(slot->to_process.front());
   slot->to_process.pop_front();
   dout(20) << __func__ << " " << qi << " pg " << pg << dendl;
   set<pair<spg_t,epoch_t>> new_children;
   OSDMapRef osdmap;
 
+  // 阶段 5：PG 不存在时，依据 map epoch、split 状态和任务类型决定等待、
+  // 创建 PG、执行无 PG peering 事件，或者丢弃已经不映射到本 OSD 的任务。
   while (!pg) {
-    // should this pg shard exist on this osd in this (or a later) epoch?
+    // 使用 shard 当前已消费的 OSDMap 判断这个 PG shard 是否应存在于本 OSD。
     osdmap = sdata->shard_osdmap;
+    // 只有 PGNotify 等能够触发 PG 创建的任务才会返回非空 create_info。
     const PGCreateInfo *create_info = qi.creates_pg();
     if (!slot->waiting_for_split.empty()) {
+      // 分裂产生的子 PG 尚未实例化：当前任务不能越过 split，移入 slot 的等待队列，
+      // 待 split 完成并唤醒 slot 后重新进入调度器。
       dout(20) << __func__ << " " << token
-	       << " splitting " << slot->waiting_for_split << dendl;
+		       << " splitting " << slot->waiting_for_split << dendl;
       _add_slot_waiter(token, slot, std::move(qi));
     } else if (qi.get_map_epoch() > osdmap->get_epoch()) {
+      // 任务依赖的 map 比本 shard 当前 map 新，现有映射信息不足以安全处理；
+      // 等 consume_map() 推进 shard_osdmap 后再唤醒任务。
       dout(20) << __func__ << " " << token
 	       << " map " << qi.get_map_epoch() << " > "
 	       << osdmap->get_epoch() << dendl;
       _add_slot_waiter(token, slot, std::move(qi));
     } else if (qi.is_peering()) {
+      // peering 任务需要单独处理：部分事件不要求 PG 存在，另一些事件可以在本 OSD 属于 up/acting 集合时创建或操作 PG。
       if (!qi.peering_requires_pg()) {
-	// for pg-less events, we run them under the ordering lock, since
-	// we don't have the pg lock to keep them ordered.
-	qi.run(osd, sdata, pg, tp_handle);
+		// for pg-less events, we run them under the ordering lock, since
+		// we don't have the pg lock to keep them ordered.
+		// PGQuery 等无 PG 事件直接执行；当前仍持有 shard_lock，利用 slot 的 ordering token 保证它与同一 PG 的其他任务有序。
+		qi.run(osd, sdata, pg, tp_handle);
       } else if (osdmap->is_up_acting_osd_shard(token, osd->whoami)) {
-	if (create_info) {
-	  if (create_info->by_mon &&
+		// 当前 map 认为该 PG shard 应位于本 OSD，但内存中还没有 PG。
+		if (create_info) {
+		  // Monitor 发出的创建请求可能已经过时：若本 OSD 已不是 acting primary，则忽略，避免在错误节点创建 PG。
+		  if (create_info->by_mon &&
 	      osdmap->get_pg_acting_primary(token.pgid) != osd->whoami) {
 	    dout(20) << __func__ << " " << token
 		     << " no pg, no longer primary, ignoring mon create on "
 		     << qi << dendl;
-	  } else {
-	    dout(20) << __func__ << " " << token
+		  } else {
+		    // 创建条件仍有效，依据 peering 事件携带的信息实例化 PG。
+		    dout(20) << __func__ << " " << token
 		     << " no pg, should create on " << qi << dendl;
-	    pg = osd->handle_pg_create_info(osdmap, create_info);
-	    if (pg) {
-	      // we created the pg! drop out and continue "normally"!
-	      sdata->_attach_pg(slot, pg.get());
-	      sdata->_wake_pg_slot(token, slot);
+		    pg = osd->handle_pg_create_info(osdmap, create_info);
+		    if (pg) {
+		      // 创建成功：把 PG 挂到 slot，并唤醒此前等待 PG 的任务。
+		      sdata->_attach_pg(slot, pg.get());
+		      sdata->_wake_pg_slot(token, slot);
 
-	      // identify split children between create epoch and shard epoch.
-	      osd->service.identify_splits_and_merges(
+		      // PG 使用的创建 epoch 可能落后于 shard 当前 epoch；
+		      // 补算期间发生的 split，并先为子 PG 建立等待 slot。
+		      osd->service.identify_splits_and_merges(
 		pg->get_osdmap(), osdmap, pg->pg_id, &new_children, nullptr);
 	      sdata->_prime_splits(&new_children);
-	      // distribute remaining split children to other shards below!
-	      break;
+		      // PG 已存在，跳出 while，进入下面的正常任务执行路径。
+		      break;
 	    }
 	    dout(20) << __func__ << " ignored create on " << qi << dendl;
 	  }
-	} else {
-	  dout(20) << __func__ << " " << token
+		} else {
+		  // 事件要求实际 PG，但既没有现存 PG，也不携带创建信息，无法处理。
+		  dout(20) << __func__ << " " << token
 		   << " no pg, peering, !create, discarding " << qi << dendl;
-	}
+		}
       } else {
-	dout(20) << __func__ << " " << token
+		// 当前 OSD 已不在该 PG 的 up/acting 集合中，不应在这里创建或处理 PG。
+		dout(20) << __func__ << " " << token
 		 << " no pg, peering, doesn't map here e" << osdmap->get_epoch()
 		 << ", discarding " << qi
 		 << dendl;
       }
     } else if (osdmap->is_up_acting_osd_shard(token, osd->whoami)) {
+      // 普通 IO/recovery 任务的目标确实在本 OSD，但 PG 尚未实例化；
+      // 保留任务，等待后续 peering/create 流程挂接 PG 后重新调度。
       dout(20) << __func__ << " " << token
 	       << " no pg, should exist e" << osdmap->get_epoch()
 	       << ", will wait on " << qi << dendl;
       _add_slot_waiter(token, slot, std::move(qi));
     } else {
+      // 普通任务的目标 PG 已不映射到本 OSD，当前节点无法执行，直接丢弃。
       dout(20) << __func__ << " " << token
 	       << " no pg, shouldn't exist e" << osdmap->get_epoch()
 	       << ", dropping " << qi << dendl;
-      // share map with client?
+      // 如果任务来自客户端，按需向连接共享更新的 OSDMap，使客户端能够重新计算目标 PG/OSD 并重发请求。
       if (std::optional<OpRequestRef> _op = qi.maybe_get_op()) {
 	osd->service.maybe_share_map((*_op)->get_req()->get_connection().get(),
 				     sdata->shard_osdmap,
 				     (*_op)->sent_epoch);
       }
+      // recovery push 任务可能预留了并发额度；任务被丢弃时必须归还，否则后续 recovery 会因为额度泄漏而无法继续。
       unsigned pushes_to_free = qi.get_reserved_pushes();
       if (pushes_to_free > 0) {
 	sdata->shard_lock.unlock();
@@ -11764,11 +11812,14 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
 	return;
       }
     }
+    // 除“成功创建 PG 并 break”外，上述分支已经执行、等待或丢弃 qi；
+    // 统一释放 shard_lock、处理提交回调并结束本轮消费。
     sdata->shard_lock.unlock();
     handle_oncommits(oncommits);
     return;
   }
   if (qi.is_peering()) {
+    // PG 已存在时，来自未来 epoch 的 peering 事件仍需等待 shard map 推进。
     OSDMapRef osdmap = sdata->shard_osdmap;
     if (qi.get_map_epoch() > osdmap->get_epoch()) {
       _add_slot_waiter(token, slot, std::move(qi));
@@ -11781,6 +11832,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
   sdata->shard_lock.unlock();
 
   if (!new_children.empty()) {
+    // PG 创建后发现跨 epoch 的 split，在所有 shard 上预建子 PG slot。
     for (auto shard : osd->shards) {
       shard->prime_splits(osdmap, &new_children);
     }
@@ -11800,6 +11852,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
         reqid.name._num, reqid.tid, reqid.inc);
   }
 
+  // 输出一份调度队列的 JSON 调试快照，便于排查请求出队时队列中还有哪些任务。它不参与请求处理逻辑。
   lgeneric_subdout(osd->cct, osd, 30) << "dequeue status: ";
   Formatter *f = Formatter::create("json");
   f->open_object_section("q");
@@ -11809,6 +11862,8 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
   delete f;
   *_dout << dendl;
 
+  // 阶段 6：多态执行任务。普通 PGOpItem 会进入 OSD::dequeue_op()，
+  // 其他 Queueable 类型则分别进入 recovery、peering 或 PG 管理路径。
   qi.run(osd, sdata, pg, tp_handle);
 
   {
@@ -11822,6 +11877,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
         reqid.name._num, reqid.tid, reqid.inc);
   }
 
+  // 执行本轮收集的存储事务完成回调；此时不再持有 shard_lock。
   handle_oncommits(oncommits);
 }
 
@@ -11845,8 +11901,8 @@ void OSD::ShardedOpWQ::_enqueue(OpSchedulerItem&& item) {
 
   bool empty = true;
   {
-    // scheduler 由 shard 内的多个入队线程和工作线程共享，必须在
-    // shard_lock 保护下检查队列状态并完成入队，避免竞争。
+    // scheduler 由 shard 内的多个入队线程和工作线程共享，
+    // 必须在 shard_lock 保护下检查队列状态并完成入队，避免竞争。
     std::lock_guard l{sdata->shard_lock};
     empty = sdata->scheduler->empty();
     // 调度器根据任务类别、priority、cost、owner 等信息决定实际出队顺序。

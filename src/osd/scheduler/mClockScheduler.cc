@@ -75,27 +75,38 @@ void mClockScheduler::dump(ceph::Formatter &f) const
 
 void mClockScheduler::enqueue(OpSchedulerItem&& item)
 {
+  // 将任务类型转换为 mClock 客户端标识，其中 class_id 区分 client、
+  // background_recovery、background_best_effort 和 immediate 等调度类别。
   auto id = get_scheduler_id(item);
+  // 保留消息携带的原始优先级，用于判断是否绕过常规 mClock 队列。
   unsigned priority = item.get_priority();
-  
+
   // TODO: move this check into OpSchedulerItem, handle backwards compat
   if (SchedulerClass::immediate == id.class_id) {
+    // immediate 任务使用最大优先级进入严格高优先级队列，优先于 mClock
+    // 队列中的 client、recovery 和 best-effort 请求执行。
     enqueue_high(immediate_class_priority, std::move(item));
   } else if (priority >= cutoff_priority) {
+    // 达到 cutoff 的任务同样绕过 mClock QoS，按原始优先级进入高优先级队列。
     enqueue_high(priority, std::move(item));
   } else {
+    // 普通任务进入 mClock 队列。将消息的抽象 cost 换算为 mClock 使用的 QoS 成本，
+    // 使不同请求的数据量/IO 开销能够参与配额计算。
     auto cost = calc_scaled_cost(item.get_cost());
+    // 保存换算后的成本，供出队统计及后续完成请求时使用。
     item.set_qos_cost(cost);
     dout(20) << __func__ << " " << id
              << " item_cost: " << item.get_cost()
              << " scaled_cost: " << cost
              << dendl;
 
-    // Add item to scheduler queue
+    // 按调度类别 id 和换算后的 cost 加入 dmClock 队列；
+    // dmClock 将依据该类别配置的 reservation、weight 和 limit 决定请求何时可以出队。
     scheduler.add_request(
       std::move(item),
       id,
       cost);
+    // 确保该调度类别对应的 mClock 性能计数器已经建立。
     mclock_conf.get_mclock_counter(id);
   }
 

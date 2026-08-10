@@ -1837,16 +1837,17 @@ void PrimaryLogPG::do_request(
   OpRequestRef& op,
   ThreadPool::TPHandle &handle)
 {
+  // PG 层的统一请求入口。调用者已持有 PG 锁；本函数先检查 map 和 PG 状态，
+  // 再将请求分派到客户端 IO、recovery、backfill 或 scrub 路径。
   if (op->osd_trace) {
+    // 在已有 OSD trace 下创建 PG 子 trace，记录请求进入 PG 的时刻。
     op->pg_trace.init("pg op", &trace_endpoint, &op->osd_trace);
     op->pg_trace.event("do request");
   }
-
-
-// make sure we have a new enough map
+  // 阶段 1：确保 PG 已获得处理请求所需的 OSDMap，并维持同一来源的顺序。
   auto p = waiting_for_map.find(op->get_source());
   if (p != waiting_for_map.end()) {
-    // preserve ordering
+    // 同一来源已有更早请求在等 map，即使当前请求的 map 已满足，也必须排在它后面，避免后到请求越过先到请求。
     dout(20) << __func__ << " waiting_for_map "
 	     << p->first << " not empty, queueing" << dendl;
     p->second.push_back(op);
@@ -1854,6 +1855,7 @@ void PrimaryLogPG::do_request(
     return;
   }
   if (!have_same_or_newer_map(op->min_epoch)) {
+    // PG 当前 map 早于请求要求的 min_epoch：按来源暂存请求，并通知 OSD 获取至少达到 min_epoch 的新 map。
     dout(20) << __func__ << " min " << op->min_epoch
 	     << ", queue on waiting_for_map " << op->get_source() << dendl;
     waiting_for_map[op->get_source()].push_back(op);
@@ -1862,38 +1864,45 @@ void PrimaryLogPG::do_request(
     return;
   }
 
+  // 阶段 2：依据请求 epoch、PG 历史和发送方状态丢弃已经失效的请求。
   if (can_discard_request(op)) {
     return;
   }
 
-  // pg-wide backoffs
+  // 阶段 3：处理支持 RADOS_BACKOFF 的客户端。backoff 让客户端暂时停止向
+  // 某个 PG/对象范围发送请求，避免 PG 不可服务时持续堆积操作。
   const Message *m = op->get_req();
   int msg_type = m->get_type();
   if (m->get_connection()->has_feature(CEPH_FEATURE_RADOS_BACKOFF)) {
+    // Session 保存该连接已经下发的 backoff 区间及确认状态。
     auto session = ceph::ref_cast<Session>(m->get_connection()->get_priv());
     if (!session)
       return;  // drop it.
     if (msg_type == CEPH_MSG_OSD_OP) {
+      // 请求命中此前已发送的 backoff 范围时，由 Session 处理并停止本次分派。
       if (session->check_backoff(cct, info.pgid,
 				 info.pgid.pgid.get_hobj_start(), m)) {
 	return;
       }
 
+      // PG down/incomplete，或已经 peered 但尚未 active 时无法处理客户端 IO。
       bool backoff =
 	is_down() ||
 	is_incomplete() ||
 	(!is_active() && is_peered());
       if (g_conf()->osd_backoff_on_peering && !backoff) {
+        // 配置允许时，PG 正在 peering 也立即向客户端施加 backoff。
 	if (is_peering()) {
 	  backoff = true;
 	}
       }
       if (backoff) {
-	add_pg_backoff(session);
+        // 为整个 PG 添加 backoff；客户端收到后应等待解除，而不是持续重试。
+        add_pg_backoff(session);
 	return;
       }
     }
-    // pg backoff acks at pg-level
+    // 非空范围的 PG 级 backoff ACK 在此确认；对象级 ACK 稍后在 active 的 OSD_OP/BACKOFF 请求上下文中处理。
     if (msg_type == CEPH_MSG_OSD_BACKOFF) {
       const MOSDBackoff *ba = static_cast<const MOSDBackoff*>(m);
       if (ba->begin != ba->end) {
@@ -1903,19 +1912,25 @@ void PrimaryLogPG::do_request(
     }
   }
 
+  // 阶段 4：PG 尚未完成 peering。只有 backend 明确声明可在 inactive
+  // 状态处理的内部消息可以继续，其余请求等待 PG 达到 peered。
   if (!is_peered()) {
     // Delay unless PGBackend says it's ok
     if (pgbackend->can_handle_while_inactive(op)) {
+      // 例如某些副本/恢复协议消息不依赖 PG 已 active，由具体 backend 处理。
       bool handled = pgbackend->handle_message(op);
       ceph_assert(handled);
       return;
     } else {
+      // 保存普通请求；状态机进入 peered 后会重新唤醒这些请求。
       waiting_for_peered.push_back(op);
       op->mark_delayed("waiting for peered");
       return;
     }
   }
 
+  // peering 已完成，但上一个 interval 遗留的事务还需要 flush；
+  // 在 flush 完成前不能让新 interval 的操作越过旧事务。
   if (recovery_state.needs_flush()) {
     dout(20) << "waiting for flush on " << *op->get_req() << dendl;
     waiting_for_flush.push_back(op);
@@ -1924,12 +1939,16 @@ void PrimaryLogPG::do_request(
   }
 
   ceph_assert(is_peered() && !recovery_state.needs_flush());
+  // 先交给 PGBackend 识别副本写、EC sub-op 等内部协议消息；
+  // 返回 true 表示消息已完全处理，无需进入下面的通用消息分派。
   if (pgbackend->handle_message(op))
     return;
 
   switch (msg_type) {
   case CEPH_MSG_OSD_OP:
   case CEPH_MSG_OSD_BACKOFF:
+    // 客户端 IO 和对象级 backoff ACK 都要求 PG 已 active；
+    // 仅 peered 尚不足以对外提供读写服务，因此先进入 waiting_for_active。
     if (!is_active()) {
       dout(20) << " peered, not active, waiting for active on "
                << *op->get_req() << dendl;
@@ -1939,34 +1958,39 @@ void PrimaryLogPG::do_request(
     }
     switch (msg_type) {
     case CEPH_MSG_OSD_OP:
-      // verify client features
+      // cache tier 请求要求客户端理解 cache-pool 协议，否则明确返回不支持。
       if ((pool.info.has_tiers() || pool.info.is_tier()) &&
 	  !op->has_feature(CEPH_FEATURE_OSD_CACHEPOOL)) {
 	osd->reply_op_error(op, -EOPNOTSUPP);
 	return;
       }
+      // 普通客户端对象操作的主入口，继续解析读写命令、权限和对象状态。
       do_op(op);
       break;
     case CEPH_MSG_OSD_BACKOFF:
-      // object-level backoff acks handled in osdop context
+      // active PG 在对象操作上下文中处理对象范围的 backoff ACK。
       handle_backoff(op);
       break;
     }
     break;
 
   case MSG_OSD_PG_SCAN:
+    // backfill 前扫描对象集合/区间；可能耗时，因此向下传递 heartbeat handle。
     do_scan(op, handle);
     break;
 
   case MSG_OSD_PG_BACKFILL:
+    // 执行 backfill 数据同步请求。
     do_backfill(op);
     break;
 
   case MSG_OSD_PG_BACKFILL_REMOVE:
+    // 删除 backfill 过程中目标端不再需要的对象。
     do_backfill_remove(op);
     break;
 
   case MSG_OSD_SCRUB_RESERVE:
+    // 处理 scrub 资源预留；scrubber 尚未就绪时让发送方稍后重试。
     if (!m_scrubber) {
       osd->reply_op_error(op, -EAGAIN);
       return;
@@ -1975,22 +1999,27 @@ void PrimaryLogPG::do_request(
     break;
 
   case MSG_OSD_REP_SCRUB:
+    // 在副本端执行 primary 发来的 scrub 请求。
     replica_scrub(op, handle);
     break;
 
   case MSG_OSD_REP_SCRUBMAP:
+    // primary 接收并处理副本生成的 scrub map。
     do_replica_scrub_map(op);
     break;
 
   case MSG_OSD_PG_UPDATE_LOG_MISSING:
+    // 更新副本端 PG log/missing 集合，用于恢复期间同步缺失对象信息。
     do_update_log_missing(op);
     break;
 
   case MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY:
+    // 处理上述 log/missing 更新请求的回复。
     do_update_log_missing_reply(op);
     break;
 
   default:
+    // 到达 do_request() 的消息类型必须属于上述集合，其他类型表示分派错误。
     ceph_abort_msg("bad message type in do_request");
   }
 }
@@ -2001,11 +2030,16 @@ void PrimaryLogPG::do_request(
  */
 void PrimaryLogPG::do_op(OpRequestRef& op)
 {
+  // 客户端对象操作的核心入口。调用者已经持有 PG 锁；
+  // 本函数完成请求解码、路由/权限/状态校验、对象上下文与锁准备，最后交给 execute_ctx() 执行。
   FUNCTRACE(cct);
   // NOTE: take a non-const pointer here; we must be careful not to
   // change anything that will break other reads on m (operator<<).
+  // 后续需要清理 payload 并访问 ops，因此取可写 MOSDOp；
+  // 仍须遵守上方英文注释，不能修改会影响其他并发只读访问的消息字段。
   MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
   ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
+  // 延迟解码尚未完成时在此完成，并释放原始 payload，降低请求驻留内存。
   if (m->finish_decode()) {
     op->reset_desc();   // for TrackedOp
     m->clear_payload();
@@ -2013,8 +2047,11 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 
   dout(20) << __func__ << ": op " << *m << dendl;
 
+  // snap clone 请求也以 head 对象作为 PG 归属和多数状态检查的基准。
   const hobject_t head = m->get_hobj().get_head();
 
+  // 校验客户端计算出的对象 hash 确实属于当前 PG；
+  // 失败通常意味着客户端使用了错误/过旧映射，或上游分派存在错误，不能在错误 PG 上执行。
   if (!info.pgid.pgid.contains(
 	info.pgid.pgid.get_split_bits(pool.info.get_pg_num()), head)) {
     derr << __func__ << " " << info.pgid.pgid << " does not contain "
@@ -2026,6 +2063,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // 支持 RADOS_BACKOFF 的连接可由 OSD 对单对象施加临时反压；
+  // Session 保存当前连接上的 backoff 状态。
   bool can_backoff =
     m->get_connection()->has_feature(CEPH_FEATURE_RADOS_BACKOFF);
   ceph::ref_t<Session> session;
@@ -2036,11 +2075,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       return;
     }
 
+    // 如果该对象范围仍处于 backoff，当前请求不能继续执行。
     if (session->check_backoff(cct, info.pgid, head, m)) {
       return;
     }
   }
 
+  // 客户端请求并行执行语义尚未实现，明确拒绝，避免按普通顺序误执行。
   if (m->has_flag(CEPH_OSD_FLAG_PARALLELEXEC)) {
     // not implemented.
     dout(20) << __func__ << ": PARALLELEXEC not implemented " << *m << dendl;
@@ -2049,6 +2090,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   {
+    // 解析 m->ops，汇总请求是否读、写、缓存、需要有序执行等属性，
+    // 供下面的路由和状态检查复用；非法操作组合会直接返回错误码。
     int r = op->maybe_init_op_info(*get_osdmap());
     if (r) {
       osd->reply_op_error(op, r);
@@ -2057,6 +2100,9 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // check for op with rwordered and rebalance or localize reads
+  // write-ordered 请求不能同时要求本地化/均衡读，否则副本执行会破坏顺序。
+  // CEPH_OSD_FLAGS_DIRECT_READ 表示请求允许做“直接读”，即为了均衡负载或就近访问，可以把纯读请求发到非 primary 副本。
+  // op->rwordered() 表示该请求虽然可能包含读，但其读写必须遵守顺序，不能被调度到任意副本独立执行。通常意味着读结果依赖于前序写入的可见性。
   if (m->has_flag(CEPH_OSD_FLAGS_DIRECT_READ) && op->rwordered()) {
     dout(4) << __func__ << ": rebelance or localized reads with rwordered not allowed "
        << *m << dendl;
@@ -2064,10 +2110,14 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // 阶段 2：依据请求 flag 和读写属性确定允许在哪个 PG 副本执行。
   if (m->get_flags() & CEPH_OSD_FLAG_EC_DIRECT_READ) {
+    // EC direct read 可由 primary 或持有目标 shard 的 non-primary 提供。
     if (is_primary() || is_nonprimary()) {
       op->set_ec_direct_read();
     } else {
+      // handle_misdirected_op() 不会把请求转发到正确 OSD，也通常不会立即回复客户端。
+      // 它的主要处理方式是：丢弃当前请求，等待客户端超时后根据新 OSDMap 重发。
       osd->handle_misdirected_op(this, op);
       return;
     }
@@ -2076,36 +2126,46 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       op->may_read() &&
       !(op->may_write() || op->may_cache())) {
     // balanced reads; any replica will do
+    // 纯读且请求允许 balance/localize 时，任意合法副本都可服务。
     if (!(is_primary() || is_nonprimary())) {
+      // is_primary()      当前 OSD 是 acting primary
+      // is_nonprimary()   当前 OSD 是 acting replica
+      // 两者都不是         当前 OSD 不在该 PG 的 acting set 中
       osd->handle_misdirected_op(this, op);
       return;
     }
   } else {
     // normal case; must be primary
+    // 普通请求（尤其写和缓存操作）必须由当前 acting primary 处理。
     if (!is_primary()) {
       osd->handle_misdirected_op(this, op);
       return;
     }
   }
 
+  // 统计实际由 replica/non-primary 提供的直接读。
   if (!is_primary()) {
     osd->logger->inc(l_osd_replica_read);
   }
 
+  // laggy 检查可能延迟或拒绝请求，避免状态不稳定的 PG 对外服务。
   if (!check_laggy(op)) {
     return;
   }
 
+  // 根据连接 Session、pool、namespace、对象和操作类型验证客户端权限。
   if (!op_has_sufficient_caps(op)) {
     osd->reply_op_error(op, -EPERM);
     return;
   }
 
+  // PG 级操作（而非具体对象数据操作）走独立分派，不进入对象上下文流程。
   if (op->includes_pg_op()) {
     return do_pg_op(op);
   }
 
   // object name too long?
+  // 对象名、locator key 和 namespace 必须满足 OSD 配置及后端限制。
   if (m->get_oid().name.size() > cct->_conf->osd_max_object_name_len) {
     dout(4) << "do_op name is longer than "
 	    << cct->_conf->osd_max_object_name_len
@@ -2133,6 +2193,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // 让具体 ObjectStore（如 BlueStore）验证编码后的 hobject key 是否可存储。
   if (int r = osd->store->validate_hobject_key(head)) {
     dout(4) << "do_op object " << head << " invalid for backing store: "
 	    << r << dendl;
@@ -2141,6 +2202,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // blocklisted?
+  // 已被集群 blocklist 的客户端地址禁止继续访问，通常用于旧客户端实例隔离。
   if (get_osdmap()->is_blocklisted(m->get_source_addr())) {
     dout(10) << "do_op " << m->get_source_addr() << " is blocklisted" << dendl;
     osd->reply_op_error(op, -EBLOCKLISTED);
@@ -2148,6 +2210,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // order this op as a write?
+  // rwordered 表示即使操作包含读，也必须进入写有序路径，不能越过先前写入。
   bool write_ordered = op->rwordered();
 
   // discard due to cluster full transition?  (we discard any op that
@@ -2158,6 +2221,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   // bypass all full checks anyway.  If this op isn't write or
   // read-ordered, we skip.
   // FIXME: we exclude mds writes for now.
+  // 请求基于集群标记 full 之前的旧 map 发出时直接丢弃，
+  // 让客户端基于最新 map 重发；FULL_TRY/FULL_FORCE 明确要求绕过该检查。
   if (write_ordered && !(m->get_source().is_mds() ||
 			 m->has_flag(CEPH_OSD_FLAG_FULL_TRY) ||
 			 m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) &&
@@ -2169,18 +2234,22 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   // mds should have stopped writing before this point.
   // We can't allow OSD to become non-startable even if mds
   // could be writing as part of file removals.
+  // 本地存储达到 fail-safe full 是最后保护线，避免继续写到 OSD 无法启动。
   if (write_ordered && osd->check_failsafe_full(get_dpp()) &&
       !m->has_flag(CEPH_OSD_FLAG_FULL_TRY)) {
     dout(10) << __func__ << " fail-safe full check failed, dropping request." << dendl;
     return;
   }
   int64_t poolid = get_pgid().pool();
+  // 再次从当前 OSDMap 获取 pool；pool 已删除时请求已失去处理目标。
   const pg_pool_t *pi = get_osdmap()->get_pg_pool(poolid);
   if (!pi) {
     return;
   }
   if (pi->has_flag(pg_pool_t::FLAG_EIO)) {
     // drop op on the floor; the client will handle returning EIO
+    // pool 被标记 EIO 后停止正常 IO。支持 pool EIO 协议的客户端自行完成错误处理；
+    // 旧客户端需要 OSD 显式回复 -EIO。
     if (m->has_flag(CEPH_OSD_FLAG_SUPPORTSPOOLEIO)) {
       dout(10) << __func__ << " discarding op due to pool EIO flag" << dendl;
     } else {
@@ -2190,6 +2259,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
   if (op->may_write()) {
+    // 写请求还需满足：只能写 head，且单次数据量不能超过配置上限。
 
     // invalid?
     if (m->get_snapid() != CEPH_NOSNAP) {
@@ -2220,7 +2290,10 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 
 
   // missing object?
+  // 阶段 3：确保目标对象当前可读。对象缺失、unfound 或恢复中时，
+  // 选择向客户端施加单对象 backoff，或把请求挂到等待队列直到 recovery 完成。
   if (is_unreadable_object(head)) {
+    // replica 可能缺少请求所需的 clone，无法可靠判断时让客户端转回 primary。
     if (!is_primary() && is_missing_any_head_or_clone_of(head)) {
       dout(10) << __func__ <<  "possibly missing clone object " << head
                << " on this replica, bouncing to primary" << dendl;
@@ -2233,8 +2306,10 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 	 (g_conf()->osd_backoff_on_unfound &&
 	  recovery_state.get_missing_loc().is_unfound(head)))) {
       add_backoff(session, head, head);
+      // 主动推动该对象恢复，争取尽快解除 backoff。
       maybe_kick_recovery(head);
     } else {
+      // 不使用 backoff 时由 OSD 保存请求，待对象恢复可读后重新入队。
       wait_for_unreadable_object(head, op);
     }
     return;
@@ -2242,6 +2317,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 
   if (write_ordered) {
     // degraded object?
+    // 有序写不能覆盖正在 degraded/backfill 的对象，否则可能破坏副本恢复顺序。
     if (is_degraded_or_backfilling_object(head)) {
       if (can_backoff && g_conf()->osd_backoff_on_degraded) {
         add_backoff(session, head, head);
@@ -2252,16 +2328,19 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       return;
     }
 
+    // scrub 正在检查该对象时暂停写入，避免校验过程中数据发生变化。
     if (m_scrubber->is_scrub_active() && m_scrubber->write_blocked_by_scrub(head)) {
       dout(20) << __func__ << ": waiting for scrub" << dendl;
       waiting_for_scrub.push_back(op);
       op->mark_delayed("waiting for scrub");
       return;
     }
+    // 再次检查 laggy 状态；写路径可能被重新排队，等待副本状态稳定。
     if (!check_laggy_requeue(op)) {
       return;
     }
 
+    // 准备写 head 时，发现它依赖的某个快照 clone 当前不可读而阻塞，因此先暂停写请求。
     if (auto blocked_iter = objects_blocked_on_unreadable_snap.find(head);
 	blocked_iter != std::end(objects_blocked_on_unreadable_snap)) {
       hobject_t to_wait_on(head);
@@ -2271,6 +2350,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     }
 
     // blocked on snap?
+    // 历史 snap clone 处于因为 degraded/backfill 阻塞时，同样阻塞 head 写入。
     if (auto blocked_iter = objects_blocked_on_degraded_snap.find(head);
 	blocked_iter != std::end(objects_blocked_on_degraded_snap)) {
       hobject_t to_wait_on(head);
@@ -2278,11 +2358,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       wait_for_degraded_object(to_wait_on, op);
       return;
     }
+    // cache tier 正在把回滚所需的 snap clone 从底层池 promote 到缓存池
     if (auto blocked_snap_promote_iter = objects_blocked_on_snap_promotion.find(head);
 	blocked_snap_promote_iter != std::end(objects_blocked_on_snap_promotion)) {
       wait_for_blocked_object(blocked_snap_promote_iter->second->obs.oi.soid, op);
       return;
     }
+    // cache tier 已满且该对象写被阻塞时，挂起直到 agent 释放空间。
     if (objects_blocked_on_cache_full.count(head)) {
       block_write_on_full_cache(head, op);
       return;
@@ -2290,6 +2372,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // dup/resent?
+  // 阶段 4：对写/缓存请求按 reqid 去重，保证客户端重发不会重复修改对象。
   if (op->may_write() || op->may_cache()) {
     // warning: we will get back *a* request for this reqid, but not
     // necessarily the most recent.  this happens with flush and
@@ -2306,10 +2389,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       dout(3) << __func__ << " dup " << m->get_reqid()
 	      << " version " << version << dendl;
       if (already_complete(version)) {
+	// 原请求已经提交，说明是因为网络等问题，导致客户端没有收到写入成功回答。
+  // 直接把之前记录的返回码、版本和各子操作结果返回给客户端。
 	osd->reply_op_error(op, return_code, version, user_version, op_returns);
       } else {
 	dout(10) << " waiting for " << version << " to commit" << dendl;
         // always queue ondisk waiters, so that we can requeue if needed
+	// 原请求仍在提交中；重复请求等待同一版本落盘，不能再次执行。
 	waiting_for_ondisk[version].emplace_back(op, user_version, return_code,
 						 op_returns);
 	op->mark_delayed("waiting for ondisk");
@@ -2328,15 +2414,19 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // 阶段 5：定位或按需创建对象上下文 OBC。OBC 缓存对象元数据、snapset、锁状态等，是后续执行 OSDOp 的内存载体。
   ObjectContextRef obc;
+  // 只有写请求允许 find_object_context() 为不存在的对象建立新上下文。
   bool can_create = op->may_write();
   hobject_t missing_oid;
 
   // kludge around the fact that LIST_SNAPS sets CEPH_SNAPDIR for LIST_SNAPS
+  // LIST_SNAPS 使用特殊 snapdir 标识，但对象上下文仍从 head 对象取得。
   const hobject_t& oid =
     m->get_snapid() == CEPH_SNAPDIR ? head : m->get_hobj();
 
   // make sure LIST_SNAPS is on CEPH_SNAPDIR and nothing else
+  // 严格约束 snapdir：只有 LIST_SNAPS 可使用 CEPH_SNAPDIR，其他操作禁止。
   for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
     OSDOp& osd_op = *p;
 
@@ -2356,12 +2446,16 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // io blocked on obc?
+  // 对象 head 正被 promote/flush/copy 等异步操作占用时，普通 IO 先等待；
+  // FLUSH 自身必须继续，避免等待自己造成死锁。
   if (!m->has_flag(CEPH_OSD_FLAG_FLUSH) &&
       maybe_await_blocked_head(oid, op)) {
     return;
   }
 
   if (!is_primary()) {
+    // replica direct-read 还必须确认该对象没有与未稳定写入冲突；
+    // 否则让客户端返回 primary 重试，避免读到旧数据。
     if (!recovery_state.can_serve_read(oid)) {
       std::string_view storage_object = "replica";
       if (pool.info.is_erasure()) {
@@ -2380,12 +2474,15 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     osd->logger->inc(l_osd_replica_read_served);
   }
 
+  // 查找具体 head/clone 的对象上下文；
+  // 返回值区分成功、不存在、需要等待恢复及其他错误，missing_oid 给出真正缺失的对象。
   int r = find_object_context(
     oid, &obc, can_create,
     m->has_flag(CEPH_OSD_FLAG_MAP_SNAP_CLONE),
     &missing_oid);
 
   // LIST_SNAPS needs the ssc too
+  // LIST_SNAPS 需要完整 SnapSetContext 才能枚举对象的 clone 信息。
   if (obc &&
       m->get_snapid() == CEPH_SNAPDIR &&
       !obc->ssc) {
@@ -2397,11 +2494,14 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     // we have to wait for the object.
     if (is_primary()) {
       // missing the specific snap we need; requeue and wait.
+      // primary 保存请求等待缺失 clone 恢复；replica 保留 -EAGAIN，稍后统一回复。
       ceph_assert(!op->may_write()); // only happens on a read/cache
       wait_for_unreadable_object(missing_oid, op);
       return;
     }
   } else if (r == 0) {
+    // 找到了 clone OBC 后还要单独检查 clone 自身的可读和 degraded 状态；
+    // 前面的检查只覆盖 head。
     if (is_unreadable_object(obc->obs.oi.soid)) {
       dout(10) << __func__ << ": clone " << obc->obs.oi.soid
 	       << " is unreadable, waiting" << dendl;
@@ -2410,6 +2510,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     }
 
     // degraded object?  (the check above was for head; this could be a clone)
+    // obc                   ObjectContext，对象内存上下文
+    // obc->obs              ObjectState，对象当前状态
+    // obc->obs.oi           object_info_t，对象元数据
+    // obc->obs.oi.soid      hobject_t，实际存储对象的标识
+    // obc->obs.oi.soid.snap != CEPH_NOSNAP 代表这不是 head，是某个历史 snap clone
+    // 当前请求依赖历史 clone 且要求写级别的顺序保护时，
+    // 如果该 clone 正处于 degraded/backfill，则等待其恢复。
     if (write_ordered &&
 	obc->obs.oi.soid.snap != CEPH_NOSNAP &&
 	is_degraded_or_backfilling_object(obc->obs.oi.soid)) {
@@ -2420,6 +2527,12 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     }
   }
 
+  // cache tier 的 hit set 记录近期访问，用于 agent 判断对象是否值得 promote。
+  // hit_set 是 PG 级别 的，每个 primary PG 的 PrimaryLogPG 对象维护一个当前 hit_set。
+  // 因此一个 HitSet 记录的是，在当前统计周期内，这个 PG 中访问过哪些对象。
+  // pool：定义 HitSet 策略和参数
+  // PG：创建、维护并持久化自己的 HitSet
+  // 对象：作为访问记录被插入 PG 的 HitSet
   bool in_hit_set = false;
   if (hit_set) {
     if (obc.get()) {
@@ -2434,26 +2547,33 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       op->hitset_inserted = true;
       if (hit_set->is_full() ||
           hit_set_start_stamp + pool.info.hit_set_period <= m->get_recv_stamp()) {
+        // 当前 hit set 已满或超过周期，持久化到底层存储，供 agent 后续分析,并创建新的 HitSet。
         hit_set_persist();
       }
     }
   }
 
   if (agent_state) {
+    // cache tier agent 可能因空间压力切换模式并接管/延迟当前请求。
     if (agent_choose_mode(false, op))
       return;
   }
 
   if (obc.get() && obc->obs.exists) {
+    // 如果相邻 snap clone 之间存在依赖关系，且当前请求需要访问的 clone 还未恢复，则先恢复相邻 clone。
     if (recover_adjacent_clones(obc, op)) {
       return;
     }
+    // manifest 对象需要走 redirect/chunked 专用路径。返回 true 表示请求
+    // 已被代理、异步处理或加入等待队列，不能再按普通对象继续执行。
     if (maybe_handle_manifest(op,
 			       write_ordered,
 			       obc))
     return;
   }
 
+  // cache tier 根据命中、模式和 promote 条件决定本地处理、代理到底层池，或先提升对象；
+  // 返回 true 表示请求已被接管，当前路径结束。
   if (maybe_handle_cache(op,
 			 write_ordered,
 			 obc,
@@ -2463,6 +2583,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 			 in_hit_set))
     return;
 
+  // 对象上下文查找失败且无法继续时，按写/读语义记录可去重的写错误或直接回复客户端；
+  // COPY_GET 的 ENOENT 需要填充专用返回结构。
   if (r && (r != -ENOENT || !obc)) {
     // copy the reqids for copy get on ENOENT
     if (r == -ENOENT &&
@@ -2481,6 +2603,14 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // make sure locator is consistent
+  /**
+   * 客户端 locator 是随对象请求发送的“对象放置信息”，用于在多副本/多池环境中定位对象；
+   * pool        对象属于哪个存储池
+   * key         用于 CRUSH/PG 映射的 locator key
+   * namespace   对象所在的 namespace
+   * */ 
+  // 客户端 locator 与对象实际 locator 不一致时记录告警；
+  // 对象已经通过 hash 路由到本 PG，因此这里只告警，不立即终止请求。
   object_locator_t oloc(obc->obs.oi.soid);
   if (m->get_object_locator() != oloc) {
     dout(10) << " provided locator " << m->get_object_locator()
@@ -2491,6 +2621,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // io blocked on obc?
+  // 获取 OBC 后再次检查对象级阻塞状态，防止查找期间异步操作占用对象。
   if (obc->is_blocked() &&
       !m->has_flag(CEPH_OSD_FLAG_FLUSH)) {
     wait_for_blocked_object(obc->obs.oi.soid, op);
@@ -2499,11 +2630,14 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 
   dout(25) << __func__ << " oi " << obc->obs.oi << dendl;
 
+  // 阶段 6：创建本次操作上下文，集中保存 OSDOp 列表、OBC、事务、返回值以及稍后复制/提交所需的状态。
   OpContext *ctx = new OpContext(op, m->get_reqid(), &m->ops, obc, this);
 
   if (m->has_flag(CEPH_OSD_FLAG_SKIPRWLOCKS)) {
+    // 内部受控请求可显式跳过对象读写锁；普通客户端不会使用此路径。
     dout(20) << __func__ << ": skipping rw locks" << dendl;
   } else if (m->get_flags() & CEPH_OSD_FLAG_FLUSH) {
+    // flush 子操作忽略普通写锁，但必须确认该对象确实存在对应 flush 状态。
     dout(20) << __func__ << ": part of flush, will ignore write lock" << dendl;
 
     // verify there is in fact a flush in progress
@@ -2515,6 +2649,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       return;
     }
   } else if (!get_rw_locks(write_ordered, ctx)) {
+    // 锁暂不可用时，get_rw_locks() 已将上下文挂入对象锁等待队列；
+    // 关闭当前 ctx 的活动部分，待锁可用后请求会重新执行。
     dout(20) << __func__ << " waiting for rw locks " << dendl;
     op->mark_delayed("waiting for rw locks");
     close_op_ctx(ctx);
@@ -2522,6 +2658,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
   dout(20) << __func__ << " obc " << *obc << dendl;
 
+  // find_object_context() 的延迟错误可能在 cache/锁处理后仍需返回；
+  // 写错误进入 PG log，保证同一 reqid 重试时得到一致结果。
   if (r) {
     dout(20) << __func__ << " returned an error: " << r << dendl;
     if (op->may_write() &&
@@ -2535,12 +2673,14 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // 客户端要求绕过 cache tier 时，把该意图保存到执行上下文。
   if (m->has_flag(CEPH_OSD_FLAG_IGNORE_CACHE)) {
     ctx->ignore_cache = true;
   }
 
   if ((op->may_read()) && (obc->obs.oi.is_lost())) {
     // This object is lost. Reading from it returns an error.
+    // lost 表示集群已确认无法恢复，读请求不能再等待 recovery。
     dout(20) << __func__ << ": object " << obc->obs.oi.soid
 	     << " is lost" << dendl;
     reply_ctx(ctx, -ENFILE);
@@ -2551,6 +2691,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       (!obc->obs.exists ||
        ((m->get_snapid() != CEPH_SNAPDIR) &&
 	obc->obs.oi.is_whiteout()))) {
+    // 纯读/非缓存操作遇到不存在或 whiteout 对象，按 ENOENT 返回。
     // copy the reqids for copy get on ENOENT
     if (m->ops[0].op.op == CEPH_OSD_OP_COPY_GET) {
       fill_in_copy_get_noent(op, oid, m->ops[0]);
@@ -2561,9 +2702,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // 请求已通过所有前置门槛，更新慢请求跟踪状态为 started。
   op->mark_started();
 
+  // 真正执行 m->ops：读取对象或构造写事务、PG log 和副本操作。
+  // 写请求的持久化通常在 execute_ctx() 启动的后续异步流程中完成。
   execute_ctx(ctx);
+  // 统计请求从工作队列出队到完成执行准备的耗时，并按读/写类型分类。
   utime_t prepare_latency = ceph_clock_now();
   prepare_latency -= op->get_dequeued_time();
   osd->logger->tinc(l_osd_op_prepare_lat, prepare_latency);
@@ -2576,6 +2721,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   // force recovery of the oldest missing object if too many logs
+  // PG log 过多时主动恢复最老缺失对象，帮助推进日志裁剪。
   maybe_force_recovery();
 }
 
@@ -4218,21 +4364,26 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
 
 void PrimaryLogPG::execute_ctx(OpContext *ctx)
 {
+  // 执行已经完成对象定位和加锁的 OSDOp。读操作在本函数内完成；写操作先构造
+  // PGTransaction，再交给 RepGather 复制到副本并等待提交。
   FUNCTRACE(cct);
   dout(10) << __func__ << " " << ctx << dendl;
+  // copy-from 等异步子操作完成后可能重入本函数，先从 OBC 恢复初始对象状态，
+  // 避免上一次尚未提交的执行结果残留在 ctx 中。
   ctx->reset_obs(ctx->obc);
-  ctx->update_log_only = false; // reset in case finish_copyfrom() is re-running execute_ctx
+  ctx->update_log_only = false; // finish_copyfrom() 重入时重新计算该标志
   OpRequestRef op = ctx->op;
   auto m = op->get_req<MOSDOp>();
   ObjectContextRef obc = ctx->obc;
   const hobject_t& soid = obc->obs.oi.soid;
 
-  // this method must be idempotent since we may call it several times
-  // before we finally apply the resulting transaction.
+  // 本函数在事务真正 apply 前可能执行多次，因此必须保持幂等；每次重建事务，
+  // 丢弃前一次未提交的操作，不能在旧 PGTransaction 上重复追加。
   ctx->op_t.reset(new PGTransaction);
 
   if (op->may_write() || op->may_cache()) {
-    // snap
+    // 阶段 1：确定写操作使用的快照上下文。pool snap 模式默认采用服务端
+    // snapc；ENFORCE_SNAPC 或 self-managed snap 模式采用客户端携带的 snapc。
     if (!(m->has_flag(CEPH_OSD_FLAG_ENFORCE_SNAPC)) &&
 	pool.info.is_pool_snaps_mode()) {
       // use pool's snapc
@@ -4241,8 +4392,11 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
       // client specified snapc
       ctx->snapc.seq = m->get_snap_seq();
       ctx->snapc.snaps = m->get_snaps();
+      // 去掉当前 PG/pool 已不再有效的快照，避免为无效 snap 创建 clone。
       filter_snapc(ctx->snapc.snaps);
     }
+    // ORDERSNAP 要求请求的 snap 序列不早于对象当前 SnapSet；否则执行该写入
+    // 可能基于过期快照视图生成错误的 clone。
     if ((m->has_flag(CEPH_OSD_FLAG_ORDERSNAP)) &&
 	ctx->snapc.seq < obc->ssc->snapset.seq) {
       dout(10) << " ORDERSNAP flag set and snapc seq " << ctx->snapc.seq
@@ -4252,7 +4406,7 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
       return;
     }
 
-    // version
+    // 为本次修改预分配 PG log 版本，并保留客户端指定的 mtime。
     ctx->at_version = get_next_version();
     ctx->mtime = m->get_mtime();
 
@@ -4267,6 +4421,7 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 	     << dendl;
   }
 
+  // copy-from 重入时可能已经设置 user_at_version，因此只在首次执行时继承对象版本。
   if (!ctx->user_at_version)
     ctx->user_at_version = obc->obs.oi.user_version;
   dout(30) << __func__ << " user_at_version " << ctx->user_at_version << dendl;
@@ -4278,8 +4433,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     tracepoint(osd, prepare_tx_enter, reqid.name._type,
         reqid.name._num, reqid.tid, reqid.inc);
   }
-
-
+  // 阶段 2：逐个执行 OSDOp。读操作填充返回数据；写操作只在 op_t 中构造
+  // 事务和 PG log 变更，此时尚未写入 ObjectStore。
   int result = prepare_transaction(ctx);
 
   {
@@ -4292,9 +4447,11 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 
   bool pending_async_reads = !ctx->pending_async_reads.empty();
   if (result == -EINPROGRESS || pending_async_reads) {
-    // come back later.
+    // copy-from 等子操作尚未完成，或 EC overwrite 需要先异步读取旧 shard。
+    // ctx 必须保留，完成回调会重新进入后续执行流程。
     if (pending_async_reads) {
       ceph_assert(pool.info.is_erasure());
+      // 队列同时持有请求和 ctx，确保异步读完成前二者都不会被释放。
       in_progress_async_reads.push_back(make_pair(op, ctx));
       ctx->start_async_reads(this);
     }
@@ -4302,7 +4459,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   }
 
   if (result == -EAGAIN) {
-    // clean up after the ctx
+    // prepare_transaction() 已经安排请求稍后重试；本次上下文不再使用，
+    // 释放对象锁及临时事务，但不在这里回复客户端。
     close_op_ctx(ctx);
     return;
   }
@@ -4311,7 +4469,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   if (!ctx->op_t->empty() &&
       op->may_write() &&
       result >= 0) {
-    // successful update
+    // 写事务已成功构造。支持 returnvec 的新客户端可接收每个子操作的返回值，
+    // 但仍需限制单个返回缓冲区，防止写回复占用无界内存。
     if (ctx->op->allows_returnvec()) {
       // enforce reasonable bound on the return buffer sizes
       for (auto& i : *ctx->ops) {
@@ -4323,21 +4482,23 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 	}
       }
     } else {
-      // legacy behavior -- zero result and return data etc.
+      // 旧客户端不理解 write returnvec：保持历史行为，只返回整体成功并忽略数据。
       ignore_out_data = true;
       result = 0;
     }
   }
 
-  // prepare the reply
+  // 阶段 3：先创建统一回复。读路径会立即发送；写路径将其保存在 ctx 中，
+  // 等事务提交后再补充 ACK/ONDISK 标志并发送。
   ctx->reply = new MOSDOpReply(m, result, get_osdmap_epoch(), 0,
 			       ignore_out_data);
   dout(20) << __func__ << " alloc reply " << ctx->reply
 	   << " result " << result << dendl;
 
-  // read or error?
+  // 没有待提交事务的是纯读/无修改操作；执行失败也不能提交已构造的事务。
+  // update_log_only 是例外：它虽无对象修改，仍要把错误写入 PG log 用于去重。
   if ((ctx->op_t->empty() || result < 0) && !ctx->update_log_only) {
-    // finish side-effects
+    // 成功读的 watch/notify 等副作用在回复前完成；失败操作不执行副作用。
     if (result >= 0)
       do_osd_op_effects(ctx, m->get_connection());
 
@@ -4349,10 +4510,11 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 
   ceph_assert(op->may_write() || op->may_cache());
 
-  // trim log?
+  // 写入新 PG log 条目前，依据副本状态推进可裁剪位置。
   recovery_state.update_trim_to();
 
-  // verify that we are doing this in order?
+  // 可选调试检查：同一客户端对同一对象的 tid 不得倒退。仅用于发现顺序错误，
+  // tier 场景可能合法地改变请求路径，因此不参与该断言。
   if (cct->_conf->osd_debug_op_order && m->get_source().is_client() &&
       !pool.info.is_tier() && !pool.info.has_tiers()) {
     map<client_t,ceph_tid_t>& cm = debug_op_order[obc->obs.oi.soid];
@@ -4373,11 +4535,13 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   }
 
   if (ctx->update_log_only) {
+    // 某些确定性的写错误不修改对象，只追加 PG log。这样客户端以相同 reqid
+    // 重试时可以返回与首次执行完全一致的错误及 returnvec。
     if (result >= 0)
       do_osd_op_effects(ctx, m->get_connection());
 
     dout(20) << __func__ << " update_log_only -- result=" << result << dendl;
-    // save just what we need from ctx
+    // reply 的所有权转交给去重记录；置空指针，避免 close_op_ctx() 重复释放。
     MOSDOpReply *reply = ctx->reply;
     ctx->reply = nullptr;
     reply->get_header().data_off = (ctx->data_off ? *ctx->data_off : 0);
@@ -4387,9 +4551,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 				       info.last_user_version);
     }
     reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
-    // append to pg log for dup detection - don't save buffers for now
-    // store op's returnvec unconditionally-on-errors to ensure coherency
-    // with the original request handling (see `ignore_out_data` above).
+    // 将错误追加到 PG log 用于重复请求检测。错误路径无条件保存 returnvec，
+    // 以便重试回复与首次处理保持一致（参见上面的 ignore_out_data）。
     record_write_error(
       op, soid, reply, result,
       (ctx->op->allows_returnvec() || result < 0) ? ctx : nullptr);
@@ -4397,10 +4560,11 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     return;
   }
 
-  // no need to capture PG ref, repop cancel will handle that
-  // Can capture the ctx by pointer, it's owned by the repop
+  // 阶段 4：注册复制事务的生命周期回调。此后 ctx 由 RepGather 持有；
+  // repop 取消会处理 PG 生命周期，因此 lambda 无需额外捕获 PG 引用。
   ctx->register_on_commit(
     [m, ctx, this](){
+      // primary 和所需副本达到提交条件后统计 IO，并且只回复客户端一次。
       if (ctx->op)
 	log_op_stats(*ctx->op, ctx->bytes_written, ctx->bytes_read);
 
@@ -4416,6 +4580,7 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     });
   ctx->register_on_success(
     [ctx, this]() {
+      // 事务成功应用后再执行 watch/notify 等依赖写入成功的副作用。
       do_osd_op_effects(
 	ctx,
 	ctx->op ? ctx->op->get_req()->get_connection() :
@@ -4423,16 +4588,19 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     });
   ctx->register_on_finish(
     [ctx]() {
+      // RepGather 的所有完成/取消路径最终都通过该回调释放 ctx。
       delete ctx;
     });
 
-  // issue replica writes
+  // 为本次副本操作分配唯一 tid，创建 RepGather 汇总本地及各副本的完成状态。
   ceph_tid_t rep_tid = osd->get_tid();
 
   RepGather *repop = new_repop(ctx, rep_tid);
 
+  // 向 acting 副本发出写入并立即评估当前状态；例如无需等待副本时可能当场完成。
   issue_repop(repop, ctx);
   eval_repop(repop);
+  // 释放调用者持有的初始引用，后续由未完成的本地/副本回调继续持有 repop。
   repop->put();
 }
 
