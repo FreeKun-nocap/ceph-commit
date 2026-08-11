@@ -4364,12 +4364,12 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
 
 void PrimaryLogPG::execute_ctx(OpContext *ctx)
 {
-  // 执行已经完成对象定位和加锁的 OSDOp。读操作在本函数内完成；写操作先构造
-  // PGTransaction，再交给 RepGather 复制到副本并等待提交。
+  // 执行已经完成对象定位和加锁的 OSDOp。读操作在本函数内完成；
+  // 写操作先构造 PGTransaction，再交给 RepGather 复制到副本并等待提交。
   FUNCTRACE(cct);
   dout(10) << __func__ << " " << ctx << dendl;
-  // copy-from 等异步子操作完成后可能重入本函数，先从 OBC 恢复初始对象状态，
-  // 避免上一次尚未提交的执行结果残留在 ctx 中。
+  // COPY_FROM 等异步操作完成后会使用同一个 ctx 重新执行本函数。
+  // 丢弃上一次未提交的对象状态草稿，从 OBC 当前状态重新构造本次事务。
   ctx->reset_obs(ctx->obc);
   ctx->update_log_only = false; // finish_copyfrom() 重入时重新计算该标志
   OpRequestRef op = ctx->op;
@@ -4377,26 +4377,29 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   ObjectContextRef obc = ctx->obc;
   const hobject_t& soid = obc->obs.oi.soid;
 
-  // 本函数在事务真正 apply 前可能执行多次，因此必须保持幂等；每次重建事务，
-  // 丢弃前一次未提交的操作，不能在旧 PGTransaction 上重复追加。
+  // 本函数在事务真正 apply 前可能执行多次，因此必须保持幂等；
+  // 每次重建事务，丢弃前一次未提交的操作，不能在旧 PGTransaction 上重复追加。
   ctx->op_t.reset(new PGTransaction);
 
   if (op->may_write() || op->may_cache()) {
-    // 阶段 1：确定写操作使用的快照上下文。pool snap 模式默认采用服务端
-    // snapc；ENFORCE_SNAPC 或 self-managed snap 模式采用客户端携带的 snapc。
+    // snapc 是 Snapshot Context（快照上下文），描述一次写操作发生时，哪些快照仍然存在。
+    // 阶段 1：确定写操作使用的快照上下文。pool snap 模式默认采用服务端 snapc；
+    // 当客户端修改对象时，OSD 根据 snapc 判断是否需要先保留旧数据
     if (!(m->has_flag(CEPH_OSD_FLAG_ENFORCE_SNAPC)) &&
 	pool.info.is_pool_snaps_mode()) {
+      // ENFORCE_SNAPC：即使处于 pool snapshot 模式，也强制使用客户端提交的 snapc。
       // use pool's snapc
       ctx->snapc = pool.snapc;
     } else {
+      // Self-managed snapshot 模式：使用客户端请求携带的快照序列和快照列表。
       // client specified snapc
       ctx->snapc.seq = m->get_snap_seq();
       ctx->snapc.snaps = m->get_snaps();
       // 去掉当前 PG/pool 已不再有效的快照，避免为无效 snap 创建 clone。
       filter_snapc(ctx->snapc.snaps);
     }
-    // ORDERSNAP 要求请求的 snap 序列不早于对象当前 SnapSet；否则执行该写入
-    // 可能基于过期快照视图生成错误的 clone。
+    // 表示客户端的 snapc 比对象当前的 SnapSet 还旧。
+    // 继续写可能错误地创建 clone，因此返回 -EOLDSNAPC，要求客户端使用更新的快照上下文重试。
     if ((m->has_flag(CEPH_OSD_FLAG_ORDERSNAP)) &&
 	ctx->snapc.seq < obc->ssc->snapset.seq) {
       dout(10) << " ORDERSNAP flag set and snapc seq " << ctx->snapc.seq
@@ -4433,8 +4436,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     tracepoint(osd, prepare_tx_enter, reqid.name._type,
         reqid.name._num, reqid.tid, reqid.inc);
   }
-  // 阶段 2：逐个执行 OSDOp。读操作填充返回数据；写操作只在 op_t 中构造
-  // 事务和 PG log 变更，此时尚未写入 ObjectStore。
+  // 阶段 2：逐个执行 OSDOp。读操作填充返回数据；
+  // 写操作只在 op_t 中构造事务和 PG log 变更，此时尚未写入 ObjectStore。
   int result = prepare_transaction(ctx);
 
   {
@@ -4459,8 +4462,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   }
 
   if (result == -EAGAIN) {
-    // prepare_transaction() 已经安排请求稍后重试；本次上下文不再使用，
-    // 释放对象锁及临时事务，但不在这里回复客户端。
+    // prepare_transaction() 已经安排请求稍后重试；
+    // 本次上下文不再使用，释放对象锁及临时事务，但不在这里回复客户端。
     close_op_ctx(ctx);
     return;
   }
@@ -4488,8 +4491,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     }
   }
 
-  // 阶段 3：先创建统一回复。读路径会立即发送；写路径将其保存在 ctx 中，
-  // 等事务提交后再补充 ACK/ONDISK 标志并发送。
+  // 阶段 3：先创建统一回复。读路径会立即发送；
+  // 写路径将其保存在 ctx 中，等事务提交后再补充 ACK/ONDISK 标志并发送。
   ctx->reply = new MOSDOpReply(m, result, get_osdmap_epoch(), 0,
 			       ignore_out_data);
   dout(20) << __func__ << " alloc reply " << ctx->reply
@@ -4510,11 +4513,11 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 
   ceph_assert(op->may_write() || op->may_cache());
 
-  // 写入新 PG log 条目前，依据副本状态推进可裁剪位置。
+  // 在提交这次写事务前，重新计算 PG Log 最多可以安全裁剪到哪个版本，然后把这个裁剪位置随本次副本写一起发送给各副本。
   recovery_state.update_trim_to();
 
-  // 可选调试检查：同一客户端对同一对象的 tid 不得倒退。仅用于发现顺序错误，
-  // tier 场景可能合法地改变请求路径，因此不参与该断言。
+  // 可选调试检查：同一客户端对同一对象的 tid 不得倒退。
+  // 仅用于发现顺序错误，tier 场景可能合法地改变请求路径，因此不参与该断言。
   if (cct->_conf->osd_debug_op_order && m->get_source().is_client() &&
       !pool.info.is_tier() && !pool.info.has_tiers()) {
     map<client_t,ceph_tid_t>& cm = debug_op_order[obc->obs.oi.soid];
@@ -4535,8 +4538,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   }
 
   if (ctx->update_log_only) {
-    // 某些确定性的写错误不修改对象，只追加 PG log。这样客户端以相同 reqid
-    // 重试时可以返回与首次执行完全一致的错误及 returnvec。
+    // 某些确定性的写错误不修改对象，只追加 PG log。
+    // 这样客户端以相同 reqid 重试时可以返回与首次执行完全一致的错误及 returnvec。
     if (result >= 0)
       do_osd_op_effects(ctx, m->get_connection());
 
@@ -4544,15 +4547,21 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     // reply 的所有权转交给去重记录；置空指针，避免 close_op_ctx() 重复释放。
     MOSDOpReply *reply = ctx->reply;
     ctx->reply = nullptr;
+    // data_off：执行读操作时，它通常取自请求的读取起点
+    // 它主要是给 Messenger/客户端提供数据缓冲区的对齐信息。
+    // 提前准备具有相同页内偏移的接收缓冲区，从而减少数据复制。
+    // 这里的作用是：使客户端第一次收到的回复，与通过 PG Log 去重后重新生成的回复，在消息头信息上保持一致。
     reply->get_header().data_off = (ctx->data_off ? *ctx->data_off : 0);
 
     if (result == -ENOENT) {
+      // -ENOENT 表示目标对象不存在。
+      // 虽然没有对象可以提供自身版本，但客户端仍然需要一个版本基准，特别是为了处理请求重放和后续写入。
       reply->set_enoent_reply_versions(info.last_update,
 				       info.last_user_version);
     }
     reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
-    // 将错误追加到 PG log 用于重复请求检测。错误路径无条件保存 returnvec，
-    // 以便重试回复与首次处理保持一致（参见上面的 ignore_out_data）。
+    // 将错误追加到 PG log 用于重复请求检测。
+    // 错误路径无条件保存 returnvec，以便重试回复与首次处理保持一致（参见上面的 ignore_out_data）。
     record_write_error(
       op, soid, reply, result,
       (ctx->op->allows_returnvec() || result < 0) ? ctx : nullptr);
@@ -4561,10 +4570,10 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   }
 
   // 阶段 4：注册复制事务的生命周期回调。此后 ctx 由 RepGather 持有；
-  // repop 取消会处理 PG 生命周期，因此 lambda 无需额外捕获 PG 引用。
+
+  // on_commit：主 OSD和所需副本都满足提交条件后，统计 IO 并回复客户端。
   ctx->register_on_commit(
     [m, ctx, this](){
-      // primary 和所需副本达到提交条件后统计 IO，并且只回复客户端一次。
       if (ctx->op)
 	log_op_stats(*ctx->op, ctx->bytes_written, ctx->bytes_read);
 
@@ -4578,14 +4587,16 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 	ctx->op->mark_commit_sent();
       }
     });
+  // on_success：按 repop_queue 顺序完成成功处理，执行 watch/notify 等副作用。
+  // OSDOp 除了修改 ObjectStore 中的数据和元数据之外，还需要改变内存状态、连接状态或发送通知的动作。
   ctx->register_on_success(
     [ctx, this]() {
-      // 事务成功应用后再执行 watch/notify 等依赖写入成功的副作用。
       do_osd_op_effects(
 	ctx,
 	ctx->op ? ctx->op->get_req()->get_connection() :
 	ConnectionRef());
     });
+  // on_finish：整个 RepGather 生命周期结束后释放 ctx。
   ctx->register_on_finish(
     [ctx]() {
       // RepGather 的所有完成/取消路径最终都通过该回调释放 ctx。
@@ -4597,7 +4608,7 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 
   RepGather *repop = new_repop(ctx, rep_tid);
 
-  // 向 acting 副本发出写入并立即评估当前状态；例如无需等待副本时可能当场完成。
+  // 向 acting 副本发出写入并把主 OSD 的 PG Log 合入本地事务提交给 ObjectStore；
   issue_repop(repop, ctx);
   eval_repop(repop);
   // 释放调用者持有的初始引用，后续由未完成的本地/副本回调继续持有 repop。
@@ -9179,30 +9190,38 @@ hobject_t PrimaryLogPG::get_temp_recovery_object(
 
 int PrimaryLogPG::prepare_transaction(OpContext *ctx)
 {
+  // 将一个客户端请求中的 OSDOp 转换为读结果或待提交的 PGTransaction。
+  // 本函数只准备修改及 PG Log，真正写入主 OSD 和副本发生在 issue_repop()。
   ceph_assert(!ctx->ops->empty());
 
-  // valid snap context?
+  // snapc 描述本次写入需要保护的快照集合；无效的序列/列表组合不能用于
+  // 创建 snap clone，因此在执行任何子操作前直接拒绝。
   if (!ctx->snapc.is_valid()) {
     dout(10) << " invalid snapc " << ctx->snapc << dendl;
     return -EINVAL;
   }
 
-  // prepare the actual mutation
+  // 依次执行请求中的所有子操作。读操作填充 outdata；
+  // 写操作修改 new_obs，并向 ctx->op_t 追加操作，但此时尚未写入 ObjectStore。
   int result = do_osd_ops(ctx, *ctx->ops);
   if (result < 0) {
+    // 写请求已经得到确定错误时，仍需把 reqid 和错误码写入 PG Log。
+    // 客户端重试相同 reqid 时即可返回原结果，而不会因对象状态变化重新执行。
     if (ctx->op->may_write() &&
 	get_osdmap()->require_osd_release >= ceph_release_t::kraken) {
-      // need to save the error code in the pg log, to detect dup ops,
-      // but do nothing else
       ctx->update_log_only = true;
     }
+    // execute_ctx() 根据 update_log_only 决定记录 ERROR 条目，或按普通失败回复。
     return result;
   }
 
-  // read-op?  write-op noop? done?
+  // 没有事务动作且未被强制标记为修改，说明这是纯读，或者写操作最终是 no-op。
   if (ctx->op_t->empty() && !ctx->modify) {
+    // 异步读尚未结束时统计值还不完整，完成回调重入后再累计。
     if (ctx->pending_async_reads.empty())
       unstable_stats.add(ctx->delta_stats);
+    // no-op 写也要记录成功结果用于 reqid 去重；纯读虽然进入该分支，
+    // 但 may_write() 为 false，不会设置 update_log_only。
     if (ctx->op->may_write() &&
 	get_osdmap()->require_osd_release >= ceph_release_t::kraken) {
       ctx->update_log_only = true;
@@ -9210,31 +9229,38 @@ int PrimaryLogPG::prepare_transaction(OpContext *ctx)
     return result;
   }
 
-  // check for full
+  // 只有本次事务会增加对象数或数据字节数时才检查 pool full；覆盖等不增长
+  // 空间的修改允许继续。key/omap 的空间增量尚未纳入该判断。
   if ((ctx->delta_stats.num_bytes > 0 ||
        ctx->delta_stats.num_objects > 0) &&  // FIXME: keys?
       pool.info.has_flag(pg_pool_t::FLAG_FULL)) {
     auto m = ctx->op->get_req<MOSDOp>();
+    // MDS 写和显式 FULL_FORCE 请求允许绕过 full，用于受控的元数据操作或清理。
     if (ctx->reqid.name.is_mds() ||   // FIXME: ignore MDS for now
 	m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) {
       dout(20) << __func__ << " full, but proceeding due to FULL_FORCE or MDS"
 	       << dendl;
     } else if (m->has_flag(CEPH_OSD_FLAG_FULL_TRY)) {
-      // they tried, they failed.
+      // FULL_TRY 表示客户端接受明确失败：配额导致 full 返回 EDQUOT，
+      // 其余容量不足返回 ENOSPC。
       dout(20) << __func__ << " full, replying to FULL_TRY op" << dendl;
       return pool.info.has_flag(pg_pool_t::FLAG_FULL_QUOTA) ? -EDQUOT : -ENOSPC;
     } else {
-      // drop request
+      // 普通客户端理论上应在 OSDMap 的 full 标志处停止写入。这里返回 EAGAIN，
+      // execute_ctx() 会释放当前 ctx 而不回复，让请求稍后基于新状态重试。
       dout(20) << __func__ << " full, dropping request (bad client)" << dendl;
       return -EAGAIN;
     }
   }
 
   const hobject_t& soid = ctx->obs->oi.soid;
-  // clone, if necessary
+  // 写 head 对象前，根据 snapc/SnapSet 判断是否需要先把旧版本保存为 clone。
+  // 对已有 snap clone 的直接操作不走该步骤。
   if (soid.snap == CEPH_NOSNAP)
     make_writeable(ctx);
 
+  // 完成对象元数据、统计和 PG Log 条目：操作后对象仍存在记 MODIFY，
+  // 已被删除则记 DELETE；这些内容随后与对象事务一起复制和提交。
   finish_ctx(ctx,
 	     ctx->new_obs.exists ? pg_log_entry_t::MODIFY :
 	     pg_log_entry_t::DELETE,
