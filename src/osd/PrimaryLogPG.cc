@@ -6420,6 +6420,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
+    // CEPH_OSD_OP_SPARSE_READ 是稀疏读取：只返回指定范围中实际有数据的区间，并跳过空洞。
     /* map extents */
     case CEPH_OSD_OP_SPARSE_READ:
       tracepoint(osd, do_osd_op_pre_sparse_read, soid.oid.name.c_str(),
@@ -6433,6 +6434,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
+    // CEPH_OSD_OP_CALL 用于调用 Ceph 的 Object Class（对象类，简称 cls）方法。
+    // 对这个对象调用：类名.方法名(输入参数)
     case CEPH_OSD_OP_CALL:
       {
 	string cname, mname;
