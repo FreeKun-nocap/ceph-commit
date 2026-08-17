@@ -591,16 +591,22 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
+  // 有新写入到来时，取消空闲期间用于更新 PCT 的定时任务。
   cancel_pct_update();
 
+  // 先把本次操作造成的统计增量投影到主 PG 的内存状态中。
+  // 这些统计信息稍后会和对象修改、PGLog 一起进入本地事务。
   parent->apply_stats(
     soid,
     delta_stats);
 
+  // PrimaryLogPG 构造的是与存储后端无关的 PGTransaction。
   vector<pg_log_entry_t> log_entries(_log_entries);
   ObjectStore::Transaction op_t;
   PGTransactionUPtr t(std::move(_t));
   set<hobject_t> added, removed;
+  // generate_transaction() 将它翻译成可交给 ObjectStore 的事务 op_t，
+  // 同时收集本次新建/删除的临时对象，供主副本同步维护临时对象集合。
   generate_transaction(
     t,
     coll,
@@ -612,6 +618,8 @@ void ReplicatedBackend::submit_transaction(
   ceph_assert(added.size() <= 1);
   ceph_assert(removed.size() <= 1);
 
+  // 为这次复制写建立跟踪对象。tid 唯一标识本次复制事务；
+  // on_all_commit 最终会回到 PrimaryLogPG，使对应 RepGather 进入 committed。
   auto insert_res = in_progress_ops.insert(
     make_pair(
       tid,
@@ -623,11 +631,15 @@ void ReplicatedBackend::submit_transaction(
   ceph_assert(insert_res.second);
   InProgressOp &op = *insert_res.first->second;
 
-
+  // 初始时认为 acting、recovery/backfill 集合里的所有 shard 都尚未提交。
+  // 本地主 OSD commit 和各副本的 commit reply 会分别从集合中删除自己；
+  // 集合清空后，才触发 on_all_commit。
   op.waiting_for_commit.insert(
     parent->get_acting_recovery_backfill_shards().begin(),
     parent->get_acting_recovery_backfill_shards().end());
 
+  // 把 op_t、PGLog 条目及版本信息封装成 MOSDRepOp，发送给除自己外的所有目标 shard。
+  // 这里只发送副本请求；主 OSD 的本地事务在后面入队。
   issue_op(
     soid,
     at_version,
@@ -642,9 +654,13 @@ void ReplicatedBackend::submit_transaction(
     &op,
     op_t);
 
+  // 更新主 PG 内存中记录的临时对象集合。实际对象的创建/删除已经包含在 op_t 中；
+  // 这里维护的是 PG 对临时对象生命周期的跟踪信息。
   add_temp_objs(added);
   clear_temp_objs(removed);
 
+  // 将 PGLog、PG 元数据、trim 等修改追加到主 OSD 的 op_t。
+  // issue_op() 已经把副本所需的事务和日志编码进消息，因此这里追加的是 primary 自己落盘所需的本地 PG 状态更新。
   parent->log_operation(
     std::move(log_entries),
     hset_history,
@@ -654,14 +670,20 @@ void ReplicatedBackend::submit_transaction(
     true,
     op_t);
 
+  // ObjectStore 承诺本地 op_t 已持久化后执行该回调：
+  // op_commit() 会把主 OSD 自己从 waiting_for_commit 中移除，并重新检查是否全部提交。
   op_t.register_on_commit(
     parent->bless_context(
       new C_OSD_OnOpCommit(this, &op)));
 
+  // 将完整的本地事务交给 ObjectStore。
+  // 对象数据/元数据和本地 PGLog 位于同一事务中，因此它们以 ObjectStore 的事务语义原子提交。
   vector<ObjectStore::Transaction> tls;
   tls.push_back(std::move(op_t));
 
   parent->queue_transactions(tls, op.op);
+  // 事务已经成功排入本地 ObjectStore 后，推进 PG 的 applied 版本。
+  // 这不代表已经持久化；持久化完成由上面的 on_commit 回调表示。
   if (at_version != eversion_t()) {
     parent->op_applied(at_version);
   }
@@ -692,6 +714,19 @@ void ReplicatedBackend::op_commit(const ceph::ref_t<InProgressOp>& op)
   maybe_kick_pct_update();
 }
 
+/**
+ * 副本 OSD
+ * repop_commit()
+  -> send_message_osd_cluster(MOSDRepOpReply)
+                       |
+                       v
+primary OSD
+PrimaryLogPG::do_request()
+  -> PGBackend::handle_message()
+  -> ReplicatedBackend::_handle_message()
+  -> MSG_OSD_REPOPREPLY
+  -> do_repop_reply()
+ */
 void ReplicatedBackend::do_repop_reply(OpRequestRef op)
 {
   static_cast<MOSDRepOpReply*>(op->get_nonconst_req())->finish_decode();
@@ -1151,8 +1186,14 @@ Message * ReplicatedBackend::generate_subop(
   pg_shard_t peer,
   const pg_info_t &pinfo)
 {
+  // 要求副本报告“已应用”和“已持久化”。
+  // 当前复制提交路径最终以 ONDISK/commit reply 为准，从而推进主 OSD 的 waiting_for_commit。
   int acks_wanted = CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
-  // forward the write/update/whatever
+
+  // 构造发往指定 peer shard 的副本写消息。
+  // 消息头携带客户端请求 ID、primary shard、目标 PG shard、对象、复制事务 tid 和本次 PG 版本；
+  // map epoch/min epoch 用于接收端确认消息仍属于有效的 peering interval。
+  // MOSDRepOp 构造函数的初始化列表中设置 MSG_OSD_REPOP 消息类型
   MOSDRepOp *wr = new MOSDRepOp(
     reqid, parent->whoami_shard(),
     spg_t(get_info().pgid.pgid, peer.shard),
@@ -1161,35 +1202,48 @@ Message * ReplicatedBackend::generate_subop(
     parent->get_last_peering_reset_epoch(),
     tid, at_version);
 
-  // ship resulting transaction, log entries, and pg_stats
   if (!parent->should_send_op(peer, soid)) {
+    // backfill/recovery 期间，某些目标副本尚不应接收这个对象的实际修改。
+    // 此时仍发送 MOSDRepOp，但装入空事务，使副本可以同步 PGLog、版本和 PG 状态，
+    // 而该对象的数据随后由 recovery/backfill 流程补齐。
     ObjectStore::Transaction t;
     encode(t, wr->get_data());
   } else {
+    // 将主 OSD 已生成的 ObjectStore 事务序列化进消息。
+    // p 是事务操作及元数据描述，d 是单独拆出的数据负载；副本 do_repop() 会重新合并解码。
     bufferlist p, d;
     op_t.encode(p, d, get_parent()->min_peer_features());
     if (d.length() != 0) {
+      // 新格式把事务描述放在 message middle，把大块数据放在 data，
+      // 避免把两类内容重新拼接成一个连续 bufferlist。
       wr->set_txn_payload(p);
       wr->set_data(d);
     } else {
-      // Pre-tentacle format - everything in data
+      // 没有独立数据段时沿用兼容格式：全部编码内容都放入 data。
       wr->set_data(p);
     }
   }
 
+  // 对象事务之外，副本还必须写入相同的 PGLog 条目。
   wr->logbl = log_entries;
 
+  // backfill 未完成的副本有自己的进度统计，不能直接覆盖为 primary 的完整统计；
+  // 正常副本则随本次复制接收 primary 的最新 PG 统计。
   if (pinfo.is_incomplete())
     wr->pg_stats = pinfo.stats;  // reflects backfill progress
   else
     wr->pg_stats = get_info().stats;
 
+  // 告诉副本本次可以裁剪到哪个 PGLog 版本。
   wr->pg_trim_to = pg_trim_to;
 
   // this feature is from 2019 (6f12bf27cb91), assume present
   ceph_assert(HAVE_FEATURE(parent->min_peer_features(), OSD_REPOP_MLCOD));
+  // primary 当前确认的全 PG committed 边界；
+  // 副本用它维护自身的持久化/可读状态，而不是把本次 at_version 当作已全局提交。
   wr->pg_committed_to = pg_committed_to;
 
+  // 同步临时对象生命周期和 hit-set 历史等附属 PG 状态。
   wr->new_temp_oid = new_temp_oid;
   wr->discard_temp_oid = discard_temp_oid;
   wr->updated_hit_set_history = hset_hist;
@@ -1210,7 +1264,11 @@ void ReplicatedBackend::issue_op(
   InProgressOp *op,
   ObjectStore::Transaction &op_t)
 {
+  // 集合只有主 OSD 自己时（例如 size=1 的副本池），没有副本消息需要发送。
+  // 主 OSD 的本地事务仍会由 submit_transaction() 在 issue_op() 返回后提交。
   if (parent->get_acting_recovery_backfill_shards().size() > 1) {
+    // 以下代码只记录跟踪信息，不参与复制正确性。
+    // replicas 中排除主 shard，便于在请求 trace 中展示本次写正在等待哪些副本子操作。
     if (op->op) {
       op->op->pg_trace.event("issue replication ops");
       ostringstream ss;
@@ -1220,33 +1278,46 @@ void ReplicatedBackend::issue_op(
       op->op->mark_sub_op_sent(ss.str());
     }
 
-    // avoid doing the same work in generate_subop
+    // 所有副本收到的 PGLog 条目相同，提前编码一次，避免 generate_subop() 在遍历每个副本时重复执行 encode。
     bufferlist logs;
     encode(log_entries, logs);
 
+    // acting、recovery/backfill 集合是这次操作要求参与提交的全部 shard；
+    // submit_transaction() 也用同一个集合初始化了 waiting_for_commit。
     for (const auto& shard : get_parent()->get_acting_recovery_backfill_shards()) {
+      // 主 OSD 不需要给自己发送 MOSDRepOp；它走本地 queue_transactions()。
       if (shard == parent->whoami_shard()) continue;
+
+      // 每个副本的 pg_info 可能不同，尤其是 backfill 尚未完成时；
+      // generate_subop() 会据此选择随消息发送的 PG 统计信息。
       const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
 
+      // 为当前目标副本构造 MOSDRepOp。消息中包含对象事务 op_t、PGLog、
+      // 版本/trim 信息以及临时对象变化；副本收到后由 do_repop() 处理。
       Message *wr;
       wr = generate_subop(
-	  soid,
-	  at_version,
-	  tid,
-	  reqid,
-	  pg_trim_to,
-	  pg_committed_to,
-	  new_temp_oid,
-	  discard_temp_oid,
-	  logs,
-	  hset_hist,
-	  op_t,
-	  shard,
-	  pinfo);
+        soid,
+        at_version,
+        tid,
+        reqid,
+        pg_trim_to,
+        pg_committed_to,
+        new_temp_oid,
+        discard_temp_oid,
+        logs,
+        hset_hist,
+        op_t,
+        shard,
+        pinfo);
+
+      // 将副本子操作接到原客户端请求的 trace 上，便于跨 OSD 跟踪延迟。
       if (op->op && op->op->pg_trace)
 	wr->trace.init("replicated op", nullptr, &op->op->pg_trace);
+
+      // 通过 OSD cluster 网络把消息发给目标 OSD。这里传入当前 OSDMap epoch，
+      // 接收端会用消息携带的 epoch 校验它是否仍属于有效 interval。
       get_parent()->send_message_osd_cluster(
-	  shard.osd, wr, get_osdmap_epoch());
+        shard.osd, wr, get_osdmap_epoch());
     }
   }
 }
@@ -1254,6 +1325,8 @@ void ReplicatedBackend::issue_op(
 // sub op modify
 void ReplicatedBackend::do_repop(OpRequestRef op)
 {
+  // MOSDRepOp 的事务数据可能分布在 middle 和 data 两段；先完成延迟解码，
+  // 再取得带有完整字段的消息对象，并确认本入口只处理副本写消息。
   static_cast<MOSDRepOp*>(op->get_nonconst_req())->finish_decode();
   auto m = op->get_req<MOSDRepOp>();
   int msg_type = m->get_type();
@@ -1268,16 +1341,22 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
 	   << dendl;
 
 
-  // sanity checks
+  // 消息必须来自当前 peering interval 或之后；
+  // 旧 interval 的复制事务不能应用到当前 PG 状态中。
   ceph_assert(m->map_epoch >= get_info().history.same_interval_since);
 
   dout(30) << __func__ << " missing before " << get_parent()->get_log().get_missing().get_items() << dendl;
+  // 如果副本正在 scrub 同一个对象，新写入可能使当前检查结果失效，
+  // 因此先通知 scrub 流程尝试抢占/中止该对象的检查。
   parent->maybe_preempt_replica_scrub(soid);
 
+  // 消息来源就是稍后需要接收 commit reply 的 primary OSD。
   int ackerosd = m->get_source().num();
 
   op->mark_started();
 
+  // RepModify 保存这次副本写从接收直到持久化回包所需的状态：
+  // opt 是 primary 发来的对象事务，localt 是副本本地生成的 PGLog/PG 元数据事务。
   RepModifyRef rm(std::make_shared<RepModify>(get_parent()->min_peer_features()));
   rm->op = op;
   rm->ackerosd = ackerosd;
@@ -1285,20 +1364,27 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
   rm->epoch_started = get_osdmap_epoch();
 
   ceph_assert(m->logbl.length());
-  // shipped transaction and log entries
+  // 解码 primary 随消息发送的 PGLog 条目。
   vector<pg_log_entry_t> log;
 
+  // 新消息格式从 middle 读取事务描述、从 data 读取写入数据；
+  // 兼容格式没有 middle，事务描述和数据都从 data 中解码。结果写入 rm->opt。
   auto p = const_cast<bufferlist&>(m->get_middle()).cbegin();
   auto d = const_cast<bufferlist&>(m->get_data()).cbegin();
   rm->opt.decode(m->get_middle().length() != 0 ?  p : d, d);
 
+  // 同步 primary 对临时对象生命周期的跟踪。
   if (m->new_temp_oid != hobject_t()) {
+    // new_temp_oid 表示：开始跟踪的临时对象是这次复制请求需要完成的一部分。
     dout(20) << __func__ << " start tracking temp " << m->new_temp_oid << dendl;
     add_temp_obj(m->new_temp_oid);
   }
   if (m->discard_temp_oid != hobject_t()) {
+    // discard_temp_oid 表示：删除某个临时对象是这次复制请求需要完成的一部分。
     dout(20) << __func__ << " stop tracking temp " << m->discard_temp_oid << dendl;
     if (rm->opt.empty()) {
+      // backfill/recovery 边界可能让 primary 只发送空对象事务。
+      // 此时若要求丢弃临时对象，副本仍需在自己的 localt 中显式删除它。
       dout(10) << __func__ << ": removing object " << m->discard_temp_oid
 	       << " since we won't get the transaction" << dendl;
       rm->localt.remove(coll, ghobject_t(m->discard_temp_oid));
@@ -1308,18 +1394,19 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
 
   p = const_cast<bufferlist&>(m->logbl).begin();
   decode(log, p);
+  // 副本写入的数据近期通常不会再次使用，提示 ObjectStore 避免长期缓存。
   rm->opt.set_fadvise_flag(CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
 
   bool update_snaps = false;
   if (!rm->opt.empty()) {
-    // If the opt is non-empty, we infer we are before
-    // last_backfill (according to the primary, not our
-    // not-quite-accurate value), and should update the
-    // collections now.  Otherwise, we do it later on push.
+    // 非空 opt 说明按 primary 的判断，该对象位于已经 backfill 到的范围内，
+    // 此次可以随正常复制立即更新 snap collection。
+    // 若 opt 为空，则对象内容和相应 collection 将在后续 recovery/backfill push 时处理。
     update_snaps = true;
   }
 
-  // flag set to true during async recovery
+  // async recovery 期间，本副本可能仍把 soid 标记为 missing。
+  // 此时先把收到的日志事件加入 local next events，避免增量写与后续恢复结果失序。
   bool async = false;
   pg_missing_tracker_t pmissing = get_parent()->get_local_missing();
   if (pmissing.is_missing(soid)) {
@@ -1332,6 +1419,8 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
     }
   }
 
+  // 采用 primary 随消息发送的 PG 统计，然后把 PGLog、trim、committed
+  // 边界及相关 PG 元数据修改写入副本自己的 localt。
   parent->update_stats(m->pg_stats);
   parent->log_operation(
     std::move(log),
@@ -1343,44 +1432,78 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
     rm->localt,
     async);
 
+  // 当副本的 ObjectStore 事务达到持久化点后，C_OSD_RepModifyCommit 调用 repop_commit()，
+  // 向 primary 发送带 ONDISK 标志的 MOSDRepOpReply。
   rm->opt.register_on_commit(
     parent->bless_context(
       new C_OSD_RepModifyCommit(this, rm)));
+
+  // localt 负责副本 PGLog/PG 元数据，opt 负责对象数据和对象元数据。
+  // 按此顺序作为同一批次交给副本 ObjectStore；commit 回调挂在最后的 opt 上。
   vector<ObjectStore::Transaction> tls;
   tls.reserve(2);
   tls.push_back(std::move(rm->localt));
   tls.push_back(std::move(rm->opt));
   parent->queue_transactions(tls, op);
-  // op is cleaned up by oncommit/onapply when both are executed
+  // 此处仅完成入队；OpRequest 的清理由 ObjectStore 的完成/提交回调负责。
   dout(30) << __func__ << " missing after" << get_parent()->get_log().get_missing().get_items() << dendl;
 }
 
+/**
+ * 副本事务持久化完成后的调用路径：
+ * do_repop()
+ *  -> rm->opt.register_on_commit(C_OSD_RepModifyCommit)
+ *  -> PrimaryLogPG::queue_transactions()
+ *  -> BlueStore::queue_transactions() 收集 on_commit Context
+ *  -> BlueStore::_txc_committed_kv() 将 Context 放入 OSD shard context_queue
+ *  -> OSD::ShardedOpWQ::handle_oncommits() 调用 Context::complete(0)
+ *  -> C_OSD_RepModifyCommit::finish()
+ *  -> ReplicatedBackend::repop_commit()
+ * 到达这里说明副本 ObjectStore 已达到持久化点；
+ * 本函数随后向 primary 发送带 CEPH_OSD_FLAG_ONDISK 的 MOSDRepOpReply。
+ */
 void ReplicatedBackend::repop_commit(RepModifyRef rm)
 {
+  // 记录副本子操作已经走到 commit 回包阶段，仅用于请求跟踪和诊断。
+  // rm->committed 是 RepModify 的内存状态，不是触发持久化的动作；进入本函数前 ObjectStore 已经完成 commit。
   rm->op->mark_commit_sent();
   rm->op->pg_trace.event("sup_op_commit");
   rm->committed = true;
 
-  // send commit.
+  // 取回最初由 primary 发来的 MOSDRepOp。
+  // 构造 reply 时需要复用其中的 tid、reqid、PG、primary shard 和 peering interval 等关联信息。
   auto m = rm->op->get_req<MOSDRepOp>();
   ceph_assert(m->get_type() == MSG_OSD_REPOP);
   dout(10) << __func__ << " on op " << *m
-	   << ", sending commit to osd." << rm->ackerosd
-	   << dendl;
+		   << ", sending commit to osd." << rm->ackerosd
+		   << dendl;
+  // ackerosd 在 do_repop() 中取自请求的网络来源，正常情况下就是 primary；
+  // 回复前要求它在当前 OSDMap 中仍处于 up 状态。
   ceph_assert(get_osdmap()->is_up(rm->ackerosd));
 
+  // rm->last_complete 是接收该副本写时保存的 PG complete 水位。
+  // 现在相关事务已经持久化，可以推进本副本记录的 last_complete_ondisk。
   get_parent()->update_last_complete_ondisk(rm->last_complete);
 
+  // 构造 MSG_OSD_REPOPREPLY：from 是当前副本 shard，result=0 表示成功，
+  // ONDISK 表示副本 ObjectStore 已达到持久化点，而不只是接收或应用事务。
   MOSDRepOpReply *reply = new MOSDRepOpReply(
     m,
     get_parent()->whoami_shard(),
     0, get_osdmap_epoch(), m->get_min_epoch(), CEPH_OSD_FLAG_ONDISK);
+  // 将副本的持久化完成水位带回 primary，供其维护 peer 的 ondisk 状态。
   reply->set_last_complete_ondisk(rm->last_complete);
+  // commit ACK 会解除 primary 对整个客户端写请求的等待，因此使用高优先级，
+  // 避免它被普通集群流量长时间阻塞。
   reply->set_priority(CEPH_MSG_PRIO_HIGH); // this better match ack priority!
+  // 延续原副本写消息的分布式 trace，便于把发包、落盘和回包关联起来。
   reply->trace = rm->op->pg_trace;
+  // 通过 OSD cluster 网络把持久化确认发回 primary；primary 收到后进入
+  // do_repop_reply()，并从 waiting_for_commit 中删除当前副本 shard。
   get_parent()->send_message_osd_cluster(
     rm->ackerosd, reply, get_osdmap_epoch());
 
+  // 更新副本写子操作的数量、字节数和延迟统计，不参与提交正确性。
   log_subop_stats(get_parent()->get_logger(), rm->op, l_osd_sop_w);
 }
 

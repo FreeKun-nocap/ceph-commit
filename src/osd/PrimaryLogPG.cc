@@ -1075,7 +1075,7 @@ void PrimaryLogPG::do_command(
     f->close_section();
   }
   else if (prefix == "log") {
-    
+
     f->open_object_section("op_log");
     f->open_object_section("pg_log_t");
     recovery_state.get_pg_log().get_log().dump(f.get());
@@ -3615,7 +3615,7 @@ struct C_SetDedupChunks : public Context {
   epoch_t last_peering_reset;
   ceph_tid_t tid;
   uint64_t offset;
-  
+
   C_SetDedupChunks(PrimaryLogPG *p, hobject_t o, epoch_t lpr, uint64_t offset)
     : pg(p), oid(o), last_peering_reset(lpr),
       tid(0), offset(offset)
@@ -6976,14 +6976,17 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
         // 向 op_t 添加 write，并同步更新对象大小、统计、摘要和脏区间。
         __u32 seq = oi.truncate_seq;
 	tracepoint(osd, do_osd_op_pre_write, soid.oid.name.c_str(), soid.snap.val, oi.size, seq, op.extent.offset, op.extent.length, op.extent.truncate_size, op.extent.truncate_seq);
+  // 检查请求声明的写入长度，是否等于实际携带的数据长度
 	if (op.extent.length != osd_op.indata.length()) {
 	  result = -EINVAL;
 	  break;
 	}
 
+  // 如果 pool 配置了 write_fadvise_dontneed，则告诉底层存储：本次写入的数据预计近期不会再次访问，不必积极保留在缓存中。
 	if (pool.info.has_flag(pg_pool_t::FLAG_WRITE_FADVISE_DONTNEED))
 	  op.flags = op.flags | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
 
+  // 检查写入起始偏移是否满足 EC pool 的条带对齐要求
 	if (pool.info.requires_aligned_append() &&
 	    (op.extent.offset % pool.info.required_alignment() != 0)) {
 	  result = -EOPNOTSUPP;
@@ -6991,16 +6994,24 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	}
 
 	if (!obs.exists) {
+    // 新对象只能从 offset 0 开始
 	  if (pool.info.requires_aligned_append() && op.extent.offset) {
 	    result = -EOPNOTSUPP;
 	    break;
 	  }
 	} else if (op.extent.offset != oi.size &&
 		   pool.info.requires_aligned_append()) {
+    // 已存在对象只能从当前末尾继续写
 	  result = -EOPNOTSUPP;
 	  break;
 	}
 
+    // truncate 是调整对象逻辑大小的操作，类似 Linux 的：truncate("file", new_size);
+    // 这段处理的是：旧写请求在较新的 truncate 之后才到达 OSD，防止旧写重新扩展已经截短的对象。
+    // seq                            // 对象当前记录的 truncate_seq
+    // op.extent.truncate_seq         // 写请求携带的 truncate_seq
+    // oi.size                        // 对象当前大小
+    // op.extent.offset/length        // 本次写入范围
         if (seq && (seq > op.extent.truncate_seq) &&
             (op.extent.offset + op.extent.length > oi.size)) {
 	  // old write, arrived after trimtrunc
@@ -7008,6 +7019,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  dout(10) << " old truncate_seq " << op.extent.truncate_seq << " < current " << seq
 		   << ", adjusting write length to " << op.extent.length << dendl;
 	  bufferlist t;
+    // 裁剪 length 和 indata 用于保留仍然有效的写入部分。
 	  t.substr_of(osd_op.indata, 0, op.extent.length);
 	  osd_op.indata.swap(t);
         }
@@ -7021,18 +7033,26 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	    oi.truncate_seq = op.extent.truncate_seq;
 	    oi.truncate_size = op.extent.truncate_size;
 	    if (oi.size > op.extent.truncate_size) {
+	      // 对象被缩短时，[truncate_size, old_size) 是本次删除的尾部范围。
+	      // 将其记入 modified_ranges，供后续恢复/副本处理识别实际变化区间。
 	      interval_set<uint64_t> trim;
 	      trim.insert(op.extent.truncate_size,
-	        oi.size - op.extent.truncate_size);
+		          oi.size - op.extent.truncate_size);
 	      ctx->modified_ranges.union_of(trim);
-	      ctx->clean_regions.mark_data_region_dirty(op.extent.truncate_size, oi.size - op.extent.truncate_size);
+	      // 该尾部范围不再与操作前数据一致，不能继续作为 clean region 使用。
+	      ctx->clean_regions.mark_data_region_dirty(
+		op.extent.truncate_size, oi.size - op.extent.truncate_size);
+	      // 全对象摘要基于旧长度和旧内容计算；截短后已经失效，必须清除。
 	      oi.clear_data_digest();
 	    }
 	    if (op.extent.truncate_size != oi.size) {
-              truncate_update_size_and_usage(ctx->delta_stats,
-                                             oi,
-                                             op.extent.truncate_size);
-	      //truncate modify oi.size, need clear old data_digest and DIGEST flag
+	      // 同时更新 new_obs 中的逻辑大小和 delta_stats.num_bytes；
+	      // 这里只修改事务草稿，真正持久化仍在后续提交阶段完成。
+	      truncate_update_size_and_usage(ctx->delta_stats,
+		                             oi,
+		                             op.extent.truncate_size);
+	      // 扩展对象同样改变了长度，因此即使上面的“缩短”分支未执行，
+	      // 旧的全对象摘要也不能保留。
 	      oi.clear_data_digest();
 	    }
 	  } else {
@@ -7048,6 +7068,13 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	if (result < 0)
 	  break;
 
+  /**
+   * 用于确保本次 WRITE 的目标对象在事务草稿中处于“存在”状态。
+   * RADOS 的 WRITE 具有隐式创建语义：
+   * 对象存在     → 写入已有对象
+   * 对象不存在   → 创建对象后再写入
+   * 对象是白化项 → 恢复为普通对象后再写入
+   */
 	maybe_create_new_object(ctx);
 
 	if (op.extent.length == 0) {
@@ -7064,14 +7091,15 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	      oi.clear_data_digest();
 	    }
 	  } else {
+      // nop 是 No Operation，即“不修改对象内容的事务操作”。
 	    t->nop(soid);
 	  }
 	} else {
-	  // 这里只把数据写动作加入事务，ObjectStore 尚未执行它。
 	  t->write(
 	    soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
 	}
 
+  // data_digest 是对象完整数据内容的校验摘要。在这段代码中，它通常是 CRC32C。
 	if (op.extent.offset == 0 && op.extent.length >= oi.size
             && !skip_data_digest) {
 	  obs.oi.set_data_digest(osd_op.indata.crc32c(-1));
@@ -7084,8 +7112,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	} else {
 	  obs.oi.clear_data_digest();
         }
-	// 同步维护 finish_ctx()/recovery 后续需要的三类草稿状态：对象大小和
-	// 统计增量、实际修改范围，以及不能再视为 clean 的数据区域。
+	// 同步维护 finish_ctx()/recovery 后续需要的三类草稿状态：
+	// 对象大小和统计增量、实际修改范围，以及不能再视为 clean 的数据区域。
 	write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
 				    op.extent.offset, op.extent.length);
 	ctx->clean_regions.mark_data_region_dirty(op.extent.offset, op.extent.length);
@@ -7093,7 +7121,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
-    case CEPH_OSD_OP_WRITEFULL:
+    case CEPH_OSD_OP_WRITEFULL:  // 用请求携带的数据完整替换整个对象。
       ++ctx->num_write;
       result = 0;
       { // write full object
@@ -7134,7 +7162,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
-    case CEPH_OSD_OP_WRITESAME:
+    case CEPH_OSD_OP_WRITESAME:  // 将一小段输入数据重复多次，写满指定的对象范围。
       ++ctx->num_write;
       tracepoint(osd, do_osd_op_pre_writesame, soid.oid.name.c_str(), soid.snap.val, oi.size, op.writesame.offset, op.writesame.length, op.writesame.data_length);
       result = do_writesame(ctx, osd_op);
@@ -7271,6 +7299,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
+    // CEPH_OSD_OP_WATCH 用来让客户端在某个 RADOS 对象上注册、重连或取消 watcher。
+    // 建立 watch 后，其他客户端可以对该对象发送 NOTIFY，OSD 会把通知转发给所有 watcher。
     case CEPH_OSD_OP_WATCH:
       ++ctx->num_write;
       result = 0;
@@ -8200,6 +8230,25 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
+      /**
+       * OMAP 是 Object Map，即附属于一个 RADOS 对象的持久化键值表。
+       * 一个 RADOS 对象可以同时拥有：
+       * 对象
+       * ├── data        普通字节数据
+       * ├── xattrs      少量扩展属性
+       * └── omap
+       *     ├── header
+       *     └── key → value
+       *
+       * OMAP 常用于：
+       *   RGW bucket index；
+       *   RBD 元数据；
+       *   CephFS 元数据对象；
+       *   对象类的键值状态；
+       *   队列和日志索引；
+       *   分布式锁、版本信息。
+       */
+
       // -- OMAP 写操作 --
       // 除向 op_t 添加 omap 动作外，还要标记 omap dirty、更新统计并清除旧摘要。
     case CEPH_OSD_OP_OMAPSETVALS:
@@ -8455,8 +8504,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
     }
 
   fail:
-    // 无论成功失败，都先保存该子操作的原始返回值，供 RETURNVEC 回复或
-    // PG Log 去重记录使用。
+    // 无论成功失败，都先保存该子操作的原始返回值，供 RETURNVEC 回复或 PG Log 去重记录使用。
     osd_op.rval = result;
     tracepoint(osd, do_osd_op_post, soid.oid.name.c_str(), soid.snap.val, op.op, ceph_osd_op_name(op.op), op.flags, result);
     if (result < 0 && (op.flags & CEPH_OSD_OP_FLAG_FAILOK) &&
@@ -11742,24 +11790,32 @@ void PrimaryLogPG::op_applied(const eversion_t &applied_version)
   }
 }
 
+// 评估一次复制写是否可以完成客户端回复和有序收尾。
+// 该函数既会在首次 issue 后调用，也会在 backend 汇总完 primary/副本提交结果后再次调用。
 void PrimaryLogPG::eval_repop(RepGather *repop)
 {
   dout(10) << "eval_repop " << *repop
     << (repop->op && repop->op->get_req<MOSDOp>() ? "" : " (no op)") << dendl;
 
-  // ondisk?
+  // 只有 backend 确认所有要求参与的 OSD 均已提交，才能宣告 ONDISK。
+  // 首次 issue_repop() 后通常尚未满足条件，本函数会直接返回等待回调。
   if (repop->all_committed) {
     dout(10) << " commit: " << *repop << dendl;
+    // 执行提交阶段回调。
+    // 普通客户端写在这里统计 IO、添加 ACK|ONDISK，并发送最终回复；逐个删除可保证回调不会被重复执行。
     for (auto p = repop->on_committed.begin();
 	 p != repop->on_committed.end();
 	 repop->on_committed.erase(p++)) {
       (*p)();
     }
-    // send dup commits, in order
+    // 相同 reqid 的重复请求若在原写尚未落盘时到达，会挂在 waiting_for_ondisk[v]。
+    // 现在复用原操作的版本和结果统一回复它们。
     auto it = waiting_for_ondisk.find(repop->v);
     if (it != waiting_for_ondisk.end()) {
+      // 重复写回复也必须按版本推进；当前完成版本应是等待表中最早的一项。
       ceph_assert(waiting_for_ondisk.begin()->first == repop->v);
       for (auto& i : it->second) {
+        // repop 自身失败时返回该失败；否则使用首次请求记录的返回码，保证重复请求得到与原请求相同的结果。
         int return_code = repop->r;
         if (return_code >= 0) {
           return_code = std::get<2>(i);
@@ -11770,27 +11826,37 @@ void PrimaryLogPG::eval_repop(RepGather *repop)
       waiting_for_ondisk.erase(it);
     }
 
+    // 提交已稳定，可以把最新 PG 统计发布给 OSD service/monitor 上报路径。
     publish_stats_to_osd();
 
     dout(10) << " removing " << *repop << dendl;
     ceph_assert(!repop_queue.empty());
     dout(20) << "   q front is " << *repop_queue.front() << dendl;
+    // repop 的物理提交可能乱序完成，但 on_success、锁释放和上下文销毁必须保持 PG 写入顺序。
+    // 非队头完成时只标记 all_committed，暂不移除。
     if (repop_queue.front() == repop) {
       RepGather *to_remove = nullptr;
+      // 从队头连续处理所有已经提交的 repop；遇到第一个未提交项立即停止，
+      // 即使其后的写已经完成，也不能越过它执行成功副作用。
       while (!repop_queue.empty() &&
-	     (to_remove = repop_queue.front())->all_committed) {
+		     (to_remove = repop_queue.front())->all_committed) {
 	repop_queue.pop_front();
+	// on_success 包括 watch/notify 等依赖事务成功且要求有序的内存/网络动作。
 	for (auto p = to_remove->on_success.begin();
 	     p != to_remove->on_success.end();
 	     to_remove->on_success.erase(p++)) {
 	  (*p)();
 	}
+	// 执行 on_finish、释放对象锁和队列引用，最终结束该 RepGather 生命周期。
 	remove_repop(to_remove);
       }
     }
   }
 }
 
+// 将 execute_ctx()/finish_ctx() 准备好的事务交给 PGBackend：
+// backend 会提交 primary 本地 ObjectStore 事务，并把等价修改发送给 acting 副本。
+// RepGather 负责在 primary 上保存这次写的身份、顺序、锁和完成回调，直到所需 OSD 全部提交。
 void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
 {
   FUNCTRACE(cct);
@@ -11798,10 +11864,12 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
   dout(7) << "issue_repop rep_tid " << repop->rep_tid
           << " o " << soid
           << dendl;
-
-
+  // RepGather 以本次 PG Log 版本标识这次复制写，后续提交完成、重复请求
+  // 等待队列及 last_complete 推进都使用该版本。
   repop->v = ctx->at_version;
 
+  // 把事务涉及的 OBC 关联到 PGTransaction。除目标对象外，快照写可能同时
+  // 创建 clone 或更新 head/SnapSet，这些上下文需要一起受事务生命周期保护。
   ctx->op_t->add_obc(ctx->obc);
   if (ctx->clone_obc) {
     ctx->op_t->add_obc(ctx->clone_obc);
@@ -11810,7 +11878,12 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
     ctx->op_t->add_obc(ctx->head_obc);
   }
 
+  // backend 在 primary 和所需副本均提交后执行该回调，
+  // 最终进入 repop_all_committed()，再由 eval_repop() 触发客户端提交回复。
   Context *on_all_commit = new C_OSD_RepopCommit(this, repop);
+
+  // projected_last_update/projected_log 表示已经发出但可能尚未落盘的写入。
+  // 后续请求和 peering 逻辑必须看到这些投影，不能只依据稳定 PG Log。
   if (!(ctx->log.empty())) {
     ceph_assert(ctx->at_version >= projected_last_update);
     projected_last_update = ctx->at_version;
@@ -11819,23 +11892,28 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
     projected_log.add(entry);
   }
 
+  // 在真正提交前通知 PeeringState：预先推进各 peer 的投影版本，
+  // 并为异步恢复目标更新 peer_missing/missing_loc，避免恢复判断落后于在途写入。
   recovery_state.pre_submit_op(
     soid,
     ctx->log,
     ctx->at_version);
+  // 所有权在此转交给具体 backend。
+  // ReplicatedBackend 会生成本地 ObjectStore::Transaction 并向副本发送 MOSDRepOp；
+  // ECBackend 则负责编码和 shard 写入。数据、对象元数据和 PG Log 作为同一事务提交。
   pgbackend->submit_transaction(
     soid,
     ctx->delta_stats,
     ctx->at_version,
-    std::move(ctx->op_t),
+    std::move(ctx->op_t),  // 转交对象数据/属性修改事务
     recovery_state.get_pg_trim_to(),
     recovery_state.get_pg_committed_to(),
-    std::move(ctx->log),
+    std::move(ctx->log),   // 转交本次 PG Log 条目
     ctx->updated_hset_history,
-    on_all_commit,
-    repop->rep_tid,
-    ctx->reqid,
-    ctx->op);
+    on_all_commit,         // 所有参与 OSD 提交后的聚合回调
+    repop->rep_tid,        // primary 与副本匹配本次复制操作的内部 tid
+    ctx->reqid,            // 客户端请求 ID，用于日志和重复请求检测
+    ctx->op);              // 保留原请求引用，供跟踪、统计及完成处理
 }
 
 PrimaryLogPG::RepGather *PrimaryLogPG::new_repop(
