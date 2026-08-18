@@ -689,13 +689,21 @@ void ReplicatedBackend::submit_transaction(
   }
 }
 
+/**
+ * 主 OSD 本地事务持久化
+ *   -> C_OSD_OnOpCommit::finish()
+ *   -> op_commit()
+ *   -> waiting_for_commit 删除 primary
+ */
 void ReplicatedBackend::op_commit(const ceph::ref_t<InProgressOp>& op)
 {
+  // PG 状态变化或取消流程可能已经撤销 on_commit。
+  // 此时虽然旧的 ObjectStore 回调仍然到达，也不能再完成原 RepGather，直接忽略即可。
   if (op->on_commit == nullptr) {
-    // aborted
     return;
   }
 
+  // 以下只记录 primary 本地事务达到 commit 的时间点，便于性能跟踪。
   FUNCTRACE(cct);
   OID_EVENT_TRACE_WITH_MSG((op && op->op) ? op->op->get_req() : NULL, "OP_COMMIT_BEGIN", true);
   dout(10) << __func__ << ": " << op->tid << dendl;
@@ -704,44 +712,59 @@ void ReplicatedBackend::op_commit(const ceph::ref_t<InProgressOp>& op)
     op->op->pg_trace.event("op commit");
   }
 
+  // waiting_for_commit 初始包含 primary 和所有要求参与的副本 shard。
+  // 本函数由 primary 本地 ObjectStore 的 on_commit 触发，因此删除自己；
+  // 各副本则由 do_repop_reply() 收到 ONDISK 回复后分别删除。
   op->waiting_for_commit.erase(get_parent()->whoami_shard());
 
+  // 如果此时集合为空，说明 primary 本地事务和全部副本事务均已持久化。
+  // on_commit 就是 submit_transaction() 收到的 on_all_commit，
+  // 它连接回 PrimaryLogPG 的 RepGather committed 回调。
   if (op->waiting_for_commit.empty()) {
     op->on_commit->complete(0);
+    // complete() 会消费/释放 Context；置空避免取消或迟到路径重复执行。
     op->on_commit = 0;
+    // backend 已无需继续按复制 tid 跟踪这次写入。
     in_progress_ops.erase(op->tid);
   }
+  // 若已经没有复制写在途，可按配置启动 PCT 更新定时任务。
   maybe_kick_pct_update();
 }
 
 /**
  * 副本 OSD
  * repop_commit()
-  -> send_message_osd_cluster(MOSDRepOpReply)
-                       |
-                       v
-primary OSD
-PrimaryLogPG::do_request()
-  -> PGBackend::handle_message()
-  -> ReplicatedBackend::_handle_message()
-  -> MSG_OSD_REPOPREPLY
-  -> do_repop_reply()
+ *   -> send_message_osd_cluster(MOSDRepOpReply)
+ *      |
+ *      v
+ * primary OSD
+ * PrimaryLogPG::do_request()
+ *   -> PGBackend::handle_message()
+ *   -> ReplicatedBackend::_handle_message()
+ *   -> MSG_OSD_REPOPREPLY
+ *   -> do_repop_reply()
  */
 void ReplicatedBackend::do_repop_reply(OpRequestRef op)
 {
+  // 完成 MOSDRepOpReply 的延迟解码，并确认消息类型。
+  // 该 reply 是副本在 repop_commit() 中达到持久化点后发回 primary 的确认。
   static_cast<MOSDRepOpReply*>(op->get_nonconst_req())->finish_decode();
   auto r = op->get_req<MOSDRepOpReply>();
   ceph_assert(r->get_header().type == MSG_OSD_REPOPREPLY);
 
   op->mark_started();
 
-  // must be replication.
+  // tid 标识 primary 当初发出的复制事务，用来查找对应 InProgressOp；
+  // from 是发送确认的副本 shard，用来删除 waiting_for_commit 中的成员。
   ceph_tid_t rep_tid = r->get_tid();
   pg_shard_t from = r->from;
 
+  // InProgressOp 可能已经因 PG 状态变化而取消，或者该 reply 重复/迟到；
+  // 找不到时不再修改旧事务状态，直接忽略这条确认。
   auto iter = in_progress_ops.find(rep_tid);
   if (iter != in_progress_ops.end()) {
     InProgressOp &ip_op = *iter->second;
+    // 部分内部操作没有原始客户端 MOSDOp；这里取 m 只为输出更完整的日志。
     const MOSDOp *m = nullptr;
     if (ip_op.op)
       m = ip_op.op->get_req<MOSDOp>();
@@ -757,30 +780,40 @@ void ReplicatedBackend::do_repop_reply(OpRequestRef op)
 	      << " from " << from
 	      << dendl;
 
-    // oh, good.
-
+    // ONDISK 表示该副本已把对象事务和本地 PGLog/PG 元数据事务持久化。
+    // 每个副本只能确认一次，因此先断言它仍在等待集合中，再将其删除。
     if (r->ack_type & CEPH_OSD_FLAG_ONDISK) {
       ceph_assert(ip_op.waiting_for_commit.count(from));
       ip_op.waiting_for_commit.erase(from);
+      // 仅记录副本 commit reply 的接收时点，用于请求 trace 和性能诊断。
       if (ip_op.op) {
 	ip_op.op->mark_event("sub_op_commit_rec");
 	ip_op.op->pg_trace.event("sub_op_commit_rec");
       }
     } else {
-      // legacy peer; ignore
+      // 旧协议可能发送不带 ONDISK 的 ACK；当前路径只以持久化确认推进
+      // waiting_for_commit，因此忽略这种普通 ACK。
     }
 
+    // 同步 primary 维护的该 peer 持久化完成水位，供 peering、恢复和
+    // PGLog 管理判断副本已经可靠保存到哪个 complete 位置。
     parent->update_peer_last_complete_ondisk(
       from,
       r->get_last_complete_ondisk());
 
+    // 主 OSD 本地 commit 和所有副本 ONDISK reply 都会从同一个集合中删除对应 shard。
+    // 集合清空表示全部要求参与的 OSD 均已持久化。
     if (ip_op.waiting_for_commit.empty() &&
         ip_op.on_commit) {
+      // on_commit 实际连接到 PrimaryLogPG 的 RepGather：complete(0) 会
+      // 标记这次 repop committed，并继续触发 eval_repop() 完成客户端请求。
       ip_op.on_commit->complete(0);
       ip_op.on_commit = 0;
+      // 全部提交后不再需要按 tid 跟踪本次 backend 复制操作。
       in_progress_ops.erase(iter);
     }
   }
+  // 如果当前已经没有复制写在途，可按配置启动 PCT 更新定时任务。
   maybe_kick_pct_update();
 }
 

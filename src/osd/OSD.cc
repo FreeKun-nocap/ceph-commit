@@ -8366,6 +8366,8 @@ struct C_OnMapCommit : public Context {
   MOSDMap *msg;
   C_OnMapCommit(OSD *o, epoch_t f, epoch_t l, MOSDMap *m)
     : osd(o), first(f), last(l), msg(m) {}
+  // handle_osd_map() 提交的 OSDMap/superblock 事务达到 commit 后，
+  // 推进 OSD 当前地图，并让各个 PG 开始消费已经持久化的新 OSDMap。
   void finish(int r) override {
     osd->_committed_osd_maps(first, last, msg);
     msg->put();
@@ -8840,6 +8842,7 @@ void OSD::handle_osd_map(MOSDMap *m)
   // == 阶段 6: 提交事务 ==
   // 写入 superblock、注册提交回调、将事务入队到 ObjectStore
   // superblock and commit
+  // 等事务达到 commit 后，ObjectStore 执行 C_OnMapCommit::finish()
   write_superblock(cct, superblock, t);
   t.register_on_commit(new C_OnMapCommit(this, start, last, m));
   store->queue_transaction(
@@ -8959,7 +8962,10 @@ void OSD::_track_pools_and_pg_num_changes(
 
 void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 {
+  // handle_osd_map() 写入的 [first, last] OSDMap 和 superblock 已达到 ObjectStore commit 点。
+  // 现在才把这些地图依次设为 OSD 的当前地图，处理本 OSD/peer 的状态变化，并让各个 PG 消费新地图。
   dout(10) << __func__ << " " << first << ".." << last << dendl;
+  // 获取 osd_lock 前后各检查一次，防止等待锁期间 OSD 已进入停止流程。
   if (is_stopping()) {
     dout(10) << __func__ << " bailing, we are shutting down" << dendl;
     return;
@@ -8969,15 +8975,20 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
     dout(10) << __func__ << " bailing, we are shutting down" << dendl;
     return;
   }
+  // 串行保护当前 OSDMap 的切换；函数尾部在 consume_map() 前释放。
   map_lock.lock();
 
   ceph_assert(first <= last);
 
+  // 先记录最终动作，避免持有 map_lock 时直接执行异步停机/重启流程。
+  // do_shutdown：当前地图要求本进程退出；do_restart：重新执行启动注册；
+  // network_error：重绑 cluster messenger 失败，停机前还需取消故障报告。
   bool do_shutdown = false;
   bool do_restart = false;
   bool network_error = false;
   OSDMapRef osdmap = get_osdmap();
 
+  // 必须按 epoch 顺序推进，不能直接跳到 last；peer 的 up/down、NOUP 等中间状态变化也需要逐张处理。
   // advance through the new maps
   for (epoch_t cur = first; cur <= last; cur++) {
     dout(10) << " advance to epoch " << cur
@@ -8988,9 +8999,13 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
     OSDMapRef newmap = get_map(cur);
     ceph_assert(newmap);  // we just cached it above!
 
+    // 先预发布新地图，使并发发送路径开始按新地图阻止向已 down 的 peer 发消息；
+    // set_osdmap() 在处理完旧/新地图差异后才正式切换当前地图。
     // start blocklisting messages sent to peers that go down.
     service.pre_publish_map(newmap);
 
+    // 比较相邻地图：peer 由 up 变 down 时关闭旧连接并清理心跳状态；
+    // 由 down 变 up 时标记需要刷新 heartbeat peers。
     // kill connections to newly down osds
     bool waited_for_reservations = false;
     set<int> old;
@@ -9016,6 +9031,8 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
       dout(10) << __func__ << " NOUP flag changed in " << newmap->get_epoch()
 	       << dendl;
       if (is_booting()) {
+        // boot 请求可能在 NOUP 生效期间被 Monitor 丢弃；
+        // NOUP 改变后，重新发起 boot，确保 Monitor 有机会把本 OSD 标记为 up。
 	// this captures the case where we sent the boot message while
 	// NOUP was being set on the mon and our boot request was
 	// dropped, and then later it is cleared.  it imperfectly
@@ -9026,6 +9043,7 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
       }
     }
 
+    // 当前 epoch 的差异已经处理完，正式把它安装为 OSD 当前地图。
     osdmap = std::move(newmap);
     set_osdmap(osdmap);
     epoch_t up_epoch;
@@ -9034,6 +9052,8 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
     if (!up_epoch &&
 	osdmap->is_up(whoami) &&
 	osdmap->get_addrs(whoami) == client_messenger->get_myaddrs()) {
+      // 第一次看到地图以本进程当前地址把自己标成 up，记录本次实例的
+      // up_epoch/boot_epoch，后续可据此区分 OSD 的不同启动实例。
       up_epoch = osdmap->get_epoch();
       dout(10) << "up_epoch is " << up_epoch << dendl;
       if (!boot_epoch) {
@@ -9051,6 +9071,7 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
       _bind_epoch < osdmap->get_up_from(whoami)) {
 
     if (is_booting()) {
+      // Monitor 已在新地图中确认当前实例及地址，OSD 完成 booting -> active。
       dout(1) << "state: booting -> active" << dendl;
       set_state(STATE_ACTIVE);
       do_restart = false;
@@ -9058,12 +9079,15 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
       // set incarnation so that osd_reqid_t's we generate for our
       // objecter requests are unique across restarts.
       service.objecter->set_client_incarnation(osdmap->get_epoch());
+      // 本 OSD 已成功激活，取消启动期间积累、现在已经不再适用的 peer failure 报告。
       cancel_pending_failures();
     }
   }
 
   if (osdmap->get_epoch() > 0 &&
       is_active()) {
+    // active OSD 必须仍存在、处于 up、且各类地址与本进程实际绑定地址一致。
+    // 不满足时不能继续以旧身份服务，需要停机或重新 boot/绑定。
     if (!osdmap->exists(whoami)) {
       derr << "map says i do not exist.  shutting down." << dendl;
       do_shutdown = true;   // don't call shutdown() while we have
@@ -9126,6 +9150,7 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
       }
 
       if (!service.is_stopping()) {
+        // 清空 up_epoch 并更新 bind_epoch，使下一次 boot 被视为新的实例。
         epoch_t up_epoch = 0;
         epoch_t bind_epoch = osdmap->get_epoch();
         service.set_epochs(NULL,&up_epoch, &bind_epoch);
@@ -9135,6 +9160,7 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 	utime_t now = ceph_clock_now();
 	utime_t grace = utime_t(cct->_conf->osd_max_markdown_period, 0);
 	osd_markdown_log.push_back(now);
+  // 短时间反复被标记 down -> 怀疑网络、地址或配置持续异常 -> 停止自动重试并关闭进程
 	if ((int)osd_markdown_log.size() > cct->_conf->osd_max_markdown_count) {
 	  derr << __func__ << " marked down "
 	       << osd_markdown_log.size()
@@ -9146,6 +9172,7 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 	  do_shutdown = true;
 	}
 
+	// 重绑网络前暂停正常工作，等待新的连接和心跳状态恢复健康。
 	start_waiting_for_healthy();
 
 	set<int> avoid_ports;
@@ -9170,6 +9197,7 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 	hb_front_client_messenger->mark_down_all();
 	hb_back_client_messenger->mark_down_all();
 
+	// 旧地址对应的连接已经失效，断开并重新选择心跳 peer。
 	reset_heartbeat_peers(true);
       }
     }
@@ -9180,18 +9208,25 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 
   map_lock.unlock();
 
+  // 根据新地图调整各 Messenger 要求的协议 feature。
   check_osdmap_features();
 
+  // 将已安装的新地图发布给各 OSDShard，并触发 PG split/merge、地图推进及后续 peering 工作。
+  // 这才是 OSDMap 进入 PG 层的入口。
   // yay!
   consume_map();
 
+  // 地图可能改变 OSD 的 acting peers，刷新 heartbeat peer 集合。
   if (is_active() || is_waiting_for_healthy())
     maybe_update_heartbeat_peers();
 
   if (is_active()) {
+    // 唤醒等待新地图的请求，并执行 active OSD 的地图激活收尾。
     activate_map();
   }
 
+  // 前面只计算最终动作；地图锁释放且消费完成后才真正停机、补拉地图
+  // 或重新发起 boot，避免在地图切换的临界区内执行这些流程。
   if (do_shutdown) {
     if (network_error) {
       cancel_pending_failures();
@@ -9201,17 +9236,20 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
     queue_async_signal(SIGINT);
   }
   else if (m->newest_map && m->newest_map > last) {
+    // 本消息只携带到 last，但发送方知道还有更新 epoch，向 Monitor 订阅缺口。
     dout(10) << " msg say newest map is " << m->newest_map
 	     << ", requesting more" << dendl;
     osdmap_subscribe(osdmap->get_epoch()+1, false);
   }
   else if (is_preboot()) {
+    // preboot 阶段用最新地图判断能否启动；Monitor 消息还携带地图裁剪下界。
     if (m->get_source().is_mon())
       _preboot(m->cluster_osdmap_trim_lower_bound, m->newest_map);
     else
       start_boot();
   }
   else if (do_restart)
+    // 地址、自身 up 状态或 NOUP 变化要求重新向 Monitor 注册当前实例。
     start_boot();
 
 }
