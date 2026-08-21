@@ -2106,15 +2106,20 @@ bool PG::can_discard_request(OpRequestRef& op)
 
 void PG::do_peering_event(PGPeeringEventRef evt, PeeringCtx &rctx)
 {
+  // OSD::dequeue_peering_evt() 在 PG 已追赶地图后调用这里，
+  // 将一个 peering 事件交给 PG 的 RecoveryState 状态机处理。
   dout(10) << __func__ << ": " << evt->get_desc() << dendl;
+  // 事件发送时所依据的地图不能新于当前 PG 已消费的地图。
   ceph_assert(have_same_or_newer_map(evt->get_epoch_sent()));
   if (old_peering_evt(evt)) {
+    // 事件可能在等待期间已经过时；丢弃它，避免旧状态机事件回退 PG 状态。
     dout(10) << "discard old " << evt->get_desc() << dendl;
   } else {
+    // 有效事件驱动 RecoveryState 状态转换，并把产生的事务、消息和回调
+    // 收集到调用者提供的 PeeringCtx 中。
     recovery_state.handle_event(evt, &rctx);
   }
-  // write_if_dirty regardless of path above to ensure we capture any work
-  // done by OSD::advance_pg().
+  // 如果 PG 的持久化状态被修改，就把这些 PG 元数据写入当前事务；如果没有修改，则什么也不做。
   write_if_dirty(rctx.transaction);
 }
 

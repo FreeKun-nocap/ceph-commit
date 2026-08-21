@@ -8109,7 +8109,7 @@ bool OSD::ms_handle_fast_authentication(Connection *con)
 
 /**
  * @brief _dispatch 由 ms_dispatch() 在持有 osd_lock 时调用。
- * 
+ *
  * 按消息类型分发给对应的 handler。
  *
  * 注意：只有"慢路径"消息在此处理。
@@ -9393,10 +9393,13 @@ bool OSD::advance_pg(
   ThreadPool::TPHandle &handle,
   PeeringCtx &rctx)
 {
+  // peering 事件携带的地图 epoch 如果不超过 PG 当前 epoch，PG 已经追上，
+  // 无需重复推进，调用者可以直接处理事件。
   if (osd_epoch <= pg->get_osdmap_epoch()) {
     return true;
   }
   ceph_assert(pg->is_locked());
+  // PG 锁由调用者持有；下面逐个消费 PG 尚未处理的 OSDMap epoch。
   OSDMapRef lastmap = pg->get_osdmap();
   set<PGRef> new_pgs;  // any split children
   bool ret = true;
@@ -9409,6 +9412,7 @@ bool OSD::advance_pg(
        ++next_epoch) {
     OSDMapRef nextmap = service.try_get_map(next_epoch);
     if (!nextmap) {
+      // 地图可能尚未缓存到本地；本轮跳过，后续收到地图后再继续推进。
       dout(20) << __func__ << " missing map " << next_epoch << dendl;
       continue;
     }
@@ -9424,18 +9428,19 @@ bool OSD::advance_pg(
 	      old_pg_num,
 	      new_pg_num,
 	      &parent)) {
-	  // we are merge source
+	  // 当前 PG 是 merge source：先持久化自身状态并从 slot 脱离，等待目标 PG 收集它。
 	  PGRef spg = pg; // carry a ref
 	  dout(1) << __func__ << " " << pg->pg_id
 		  << " is merge source, target is " << parent
 		   << dendl;
-	  pg->write_if_dirty(rctx);
+	  pg->write_if_dirty(rctx);  // 把 source PG 当前有变化的状态加入本轮事务。
 	  if (!new_pgs.empty()) {
+      // 如果之前还有 split 子 PG 等待 materialize，就把回调挂到事务的 on_applied 阶段，确保事务生效后再创建这些子 PG。
 	    rctx.transaction.register_on_applied(new C_FinishSplits(this,
 								    new_pgs));
 	    new_pgs.clear();
 	  }
-	  dispatch_context(rctx, pg, pg->get_osdmap(), &handle);
+	  dispatch_context(rctx, pg, pg->get_osdmap(), &handle);  // 派发尚未提交的事务/回调
 	  pg->ch->flush();
 	  // release backoffs explicitly, since the on_shutdown path
 	  // aggressively tears down backoff state.
@@ -9460,9 +9465,11 @@ bool OSD::advance_pg(
 	  }
 	  pg->unlock();
 
-	  set<spg_t> children;
+	  set<spg_t> children;  // children 表示目标 PG 需要等待哪些 source PG
 	  parent.is_split(new_pg_num, old_pg_num, &children);
+    // 当 target 收集齐所有 source 后，add_merge_waiter() 返回 true
 	  if (add_merge_waiter(nextmap, parent, pg, children.size())) {
+	    // 所有 merge source 都到齐后，给目标 PG 入队 NullEvt，触发真正的合并。
 	    enqueue_peering_evt(
 	      parent,
 	      PGPeeringEventRef(
@@ -9471,10 +9478,11 @@ bool OSD::advance_pg(
 		  nextmap->get_epoch(),
 		  NullEvt())));
 	  }
-	  ret = false;
+	  ret = false;  // 当前 peering 事件不能继续按普通路径处理，因为当前 PG 已经变成 merge source，后续要由 target PG 完成合并。
+	  // source 已完成本轮准备；目标 PG 尚未完成 merge，本次事件到此结束。
 	  goto out;
 	} else if (pg->pg_id.is_merge_target(old_pg_num, new_pg_num)) {
-	  // we are merge target
+	  // 当前 PG 是 merge target：等待所有 source PG 把状态交付过来。
 	  set<spg_t> children;
 	  pg->pg_id.is_split(new_pg_num, old_pg_num, &children);
 	  dout(20) << __func__ << " " << pg->pg_id
@@ -9496,6 +9504,7 @@ bool OSD::advance_pg(
 	    }
 	  }
 	  if (!sources.empty()) {
+	    // source 数量满足要求，合并它们的 PG 状态并解除 merge 等待标记。
 	    unsigned new_pg_num = nextmap->get_pg_num(pg->pg_id.pool());
 	    unsigned split_bits = pg->pg_id.get_split_bits(new_pg_num);
 	    dout(1) << __func__ << " merging " << pg->pg_id << dendl;
@@ -9505,6 +9514,7 @@ bool OSD::advance_pg(
 		pg->pg_id.pool())->last_pg_merge_meta);
 	    pg->pg_slot->waiting_for_merge_epoch = 0;
 	  } else {
+	    // source 尚未全部准备好：先保存 target 当前状态，再唤醒各 source 继续推进。
 	    dout(20) << __func__ << " not ready to merge yet" << dendl;
 	    pg->write_if_dirty(rctx);
 	    if (!new_pgs.empty()) {
@@ -9526,6 +9536,7 @@ bool OSD::advance_pg(
 		    NullEvt())));
 	    }
 	    ret = false;
+	    // 本次不能继续消费后续地图，等待 source 完成后重新处理。
 	    goto out;
 	  }
 	}
@@ -9538,14 +9549,17 @@ bool OSD::advance_pg(
       pg->pg_id.pgid,
       &newup, &up_primary,
       &newacting, &acting_primary);
+    // 根据新地图计算 PG 的 up/acting 集合及其 primary，并交给 PG 更新 peering 状态。
     pg->handle_advance_map(
       nextmap, lastmap, newup, up_primary,
       newacting, acting_primary, rctx);
 
     auto oldpool = lastmap->get_pools().find(pg->pg_id.pool());
     auto newpool = nextmap->get_pools().find(pg->pg_id.pool());
+    // 这段是在比较 同一个 pool 在旧 OSDMap 和新 OSDMap 中的 pool 配置。
     if (oldpool != lastmap->get_pools().end()
         && newpool != nextmap->get_pools().end()) {
+      // 只有旧、新地图都还存在这个 pool，才继续
       dout(20) << __func__
 	       << " new pool opts " << newpool->second.opts
 	       << " old pool opts " << oldpool->second.opts
@@ -9561,7 +9575,8 @@ bool OSD::advance_pg(
     }
 
     if (new_pg_num && old_pg_num != new_pg_num) {
-      // check for split
+      // pg_num 增大时检查当前 PG 是否需要 split；
+      // split 子 PG 会先登记到 new_pgs，待事务 applied 后再 materialize。
       set<spg_t> children;
       if (pg->pg_id.is_split(
 	    old_pg_num,
@@ -9577,11 +9592,13 @@ bool OSD::advance_pg(
     old_pg_num = new_pg_num;
     handle.reset_tp_timeout();
   }
+  // 所有可用地图都已推进，通知 PG 完成地图激活阶段。
   pg->handle_activate_map(rctx, first_new_epoch);
 
   ret = true;
  out:
   if (!new_pgs.empty()) {
+    // split 子 PG 的创建依赖本轮事务 applied；把 materialize 回调挂到事务上。
     rctx.transaction.register_on_applied(new C_FinishSplits(this, new_pgs));
   }
   return ret;
@@ -10372,6 +10389,17 @@ void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
   }
 }
 
+/**
+ * 它有很多调用者，因为各种 PG 状态机事件最终都要通过它进入调度队列。
+ * 例如：
+ *    收到其他 OSD 的 PG_LOG/PG_NOTIFY/PG_QUERY 等 peering 消息
+ *    Monitor 要求创建 PG
+ *    PG split/merge
+ *    强制 recovery/backfill
+ *    scrub 请求
+ *
+ * 后续消费在 OSD::ShardedOpWQ::_process() 线程中进行，PGPeeringItem::run() 最终会调用 OSD::dequeue_peering_evt() 处理事件。
+ */
 void OSD::enqueue_peering_evt(spg_t pgid, PGPeeringEventRef evt)
 {
   dout(15) << __func__ << " " << pgid << " " << evt->get_desc() << dendl;
@@ -10437,10 +10465,14 @@ void OSD::dequeue_peering_evt(
   PGPeeringEventRef evt,
   ThreadPool::TPHandle& handle)
 {
+  // PGPeeringItem::run() 的执行入口：worker 已经从 scheduler 取出一个 peering 事件，
+  // 现在在目标 PG 上推进地图并执行该事件。
   auto curmap = sdata->get_osdmap();
+  // 事件处理结束后，把 PG 请求的 up_thru 和 pg_temp 更新延迟到 PG 锁释放之后处理。
   bool need_up_thru = false;
   epoch_t same_interval_since = 0;
   if (!pg) {
+    // 少数查询事件不要求 PG 已经 materialize；除此之外的无 PG 事件属于协议错误。
     if (const MQuery *q = dynamic_cast<const MQuery*>(evt->evt.get())) {
       handle_pg_query_nopg(*q);
     } else {
@@ -10449,11 +10481,15 @@ void OSD::dequeue_peering_evt(
     }
   } else if (PeeringCtx rctx;
 	     advance_pg(curmap->get_epoch(), pg, handle, rctx)) {
+    // advance_pg() 先让 PG 追赶到 shard 当前地图，并准备 peering 所需的上下文。
+    // 只有成功取得 PG 锁且满足地图条件时，才真正消费本次事件。
     pg->do_peering_event(evt, rctx);
     if (pg->is_deleted()) {
+      // 事件可能触发 PG 删除；删除后的 PG 不能再访问其状态或派发上下文。
       pg->unlock();
       return;
     }
+    // 将 peering 事件产生的事务、消息和回调交给统一的上下文派发路径。
     dispatch_context(rctx, pg, curmap, &handle);
     need_up_thru = pg->get_need_up_thru();
     same_interval_since = pg->get_same_interval_since();
@@ -10461,9 +10497,11 @@ void OSD::dequeue_peering_evt(
   }
 
   if (need_up_thru) {
+    // PG 已推进到需要向 Monitor/OSDMap 证明的 up_thru，锁外排队更新请求。
     queue_want_up_thru(same_interval_since);
   }
 
+  // 发布本轮 PG 状态变化产生的 pg_temp，通知集群新的临时 PG 映射。
   service.send_pg_temp();
 }
 
@@ -11154,10 +11192,13 @@ void OSDShard::consume_map(
   const OSDMapRef& new_osdmap,
   unsigned *pushes_to_free)
 {
+  // OSD::_committed_osd_maps() 在地图事务 commit 后调用这里。
+  // 本函数把新地图发布到 shard，并重新检查所有 PG 槽位中等待地图的工作项。
   std::lock_guard l(shard_lock);
   OSDMapRef old_osdmap;
   {
-    std::lock_guard l(osdmap_lock);
+    // shard_osdmap 供本 shard 的 PG/请求路径读取；先保存旧地图仅用于日志。
+    std::lock_guard l(osdmap_lock);  // 一个 OSD 通常有多个 shard，每个 shard 都有自己的 osdmap_lock
     old_osdmap = std::move(shard_osdmap);
     shard_osdmap = new_osdmap;
   }
@@ -11166,6 +11207,7 @@ void OSDShard::consume_map(
 	   << dendl;
   int queued = 0;
 
+  // 逐个检查本 shard 的 PG 槽位，决定哪些等待项可以重新入队、丢弃或清理。
   // check slots
   auto p = pg_slots.begin();
   while (p != pg_slots.end()) {
@@ -11173,12 +11215,14 @@ void OSDShard::consume_map(
     const spg_t& pgid = p->first;
     dout(20) << __func__ << " " << pgid << dendl;
     if (!slot->waiting_for_split.empty()) {
+      // split 尚未完成时，PG 的正常地图推进不能越过 split 阶段。
       dout(20) << __func__ << "  " << pgid
 	       << " waiting for split " << slot->waiting_for_split << dendl;
       ++p;
       continue;
     }
     if (slot->waiting_for_merge_epoch > new_osdmap->get_epoch()) {
+      // merge 要求至少等到指定 epoch；新地图还没追上时继续等待。
       dout(20) << __func__ << "  " << pgid
 	       << " waiting for merge by epoch " << slot->waiting_for_merge_epoch
 	       << dendl;
@@ -11186,6 +11230,8 @@ void OSDShard::consume_map(
       continue;
     }
     if (!slot->waiting_peering.empty()) {
+      // peering 事件按地图 epoch 排队；地图已经追上首个事件时唤醒 PG 槽位，
+      // 由后续 dequeue_peering_evt() / advance_pg() 真正处理 peering。
       epoch_t first = slot->waiting_peering.begin()->first;
       if (first <= new_osdmap->get_epoch()) {
 	dout(20) << __func__ << "  " << pgid
@@ -11198,11 +11244,13 @@ void OSDShard::consume_map(
     }
     if (!slot->waiting.empty()) {
       if (new_osdmap->is_up_acting_osd_shard(pgid, osd->get_nodeid())) {
+        // 如果新地图仍然把这个 PG 映射到当前 OSD，就保留等待请求。
 	dout(20) << __func__ << "  " << pgid << " maps to us, keeping"
 		 << dendl;
 	++p;
 	continue;
-      }
+      }  // 但如果条件为假，说明：新地图中，这个 PG 已经不再由当前 OSD 承担
+      // 检查等待队列头部请求的地图 epoch，丢弃所有过期或误导的请求。
       while (!slot->waiting.empty() &&
 	     slot->waiting.front().get_map_epoch() <= new_osdmap->get_epoch()) {
 	auto& qi = slot->waiting.front();
@@ -11223,6 +11271,7 @@ void OSDShard::consume_map(
 	slot->waiting_for_split.empty() &&
 	!slot->pg) {
       dout(20) << __func__ << "  " << pgid << " empty, pruning" << dendl;
+      // 槽位没有待处理请求、运行中的操作或 split，且 PG 实例不存在，可以删除空的槽位记录。
       p = pg_slots.erase(p);
       continue;
     }
@@ -11230,6 +11279,7 @@ void OSDShard::consume_map(
     ++p;
   }
   if (queued) {
+    // 一个事件只唤醒一个线程，多个事件则允许广播唤醒。
     std::lock_guard l{sdata_wait_lock};
     if (queued == 1)
       sdata_cond.notify_one();
@@ -11242,6 +11292,9 @@ int OSDShard::_wake_pg_slot(
   spg_t pgid,
   OSDShardPGSlot *slot)
 {
+  // 某个等待条件已经满足，把之前该 PG slot 中暂存的工作重新交给 scheduler。
+  // 使用 enqueue_front()，让被唤醒的旧工作尽快执行，避免被后来进入的新请求越过。
+  // 调用者持有 shard_lock，因此这里可以直接搬运各队列中的工作项。
   int count = 0;
   dout(20) << __func__ << " " << pgid
 	   << " to_process " << slot->to_process
@@ -11250,6 +11303,7 @@ int OSDShard::_wake_pg_slot(
   for (auto i = slot->to_process.rbegin();
        i != slot->to_process.rend();
        ++i) {
+    // 反向遍历再插入队头，保持 to_process 原有的 FIFO 顺序。
     scheduler->enqueue_front(std::move(*i));
     count++;
   }
@@ -11257,6 +11311,7 @@ int OSDShard::_wake_pg_slot(
   for (auto i = slot->waiting.rbegin();
        i != slot->waiting.rend();
        ++i) {
+    // waiting 中的普通请求也重新入队；后面的 peering 项会进一步插到它们前面。
     scheduler->enqueue_front(std::move(*i));
     count++;
   }
@@ -11266,13 +11321,16 @@ int OSDShard::_wake_pg_slot(
        ++i) {
     // this is overkill; we requeue everything, even if some of these
     // items are waiting for maps we don't have yet.  FIXME, maybe,
-    // someday, if we decide this inefficiency matters
-    for (auto j = i->second.rbegin(); j != i->second.rend(); ++j) {
-      scheduler->enqueue_front(std::move(*j));
+	    // someday, if we decide this inefficiency matters
+	    for (auto j = i->second.rbegin(); j != i->second.rend(); ++j) {
+	      // 即使部分事件仍需更高版本的地图，也先统一交给调度器，后续处理会再次检查条件并重新挂起。
+	      scheduler->enqueue_front(std::move(*j));
       count++;
     }
   }
   slot->waiting_peering.clear();
+  // _process() 可能正在处理旧的 slot 状态；
+  // 递增序号让它检测到竞争后主动退出，避免同一工作项在旧路径和新路径上重复处理。
   ++slot->requeue_seq;
   return count;
 }
@@ -11902,6 +11960,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, hea
 
   // 阶段 6：多态执行任务。普通 PGOpItem 会进入 OSD::dequeue_op()，
   // 其他 Queueable 类型则分别进入 recovery、peering 或 PG 管理路径。
+  // qi 是抽象的 Queueable，run() 是多态的虚函数，实际执行的逻辑取决于 qi 的具体类型。
   qi.run(osd, sdata, pg, tp_handle);
 
   {

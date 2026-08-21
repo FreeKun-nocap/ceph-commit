@@ -151,15 +151,20 @@ PeeringState::PeeringState(
 }
 
 void PeeringState::start_handle(PeeringCtx *new_ctx) {
+  // 开始处理一个状态机事件，建立本轮事件使用的上下文。
+  // rctx 和 orig_ctx 必须为空，表示上一轮事件已经完成并清理。
   ceph_assert(!rctx);
   ceph_assert(!orig_ctx);
   orig_ctx = new_ctx;
   if (new_ctx) {
+    // 如果当前存在被暂缓发送的出站消息，让新的 RecoveryCtx 继续使用该消息缓冲区；
+    // 否则直接基于调用者提供的上下文创建本轮 RecoveryCtx。
     if (messages_pending_flush) {
       rctx.emplace(*messages_pending_flush, *new_ctx);
     } else {
       rctx.emplace(*new_ctx);
     }
+    // 记录本轮状态机处理的起始时间，用于 peering/recovery 延迟统计。
     rctx->start_time = ceph_clock_now();
   }
 }
@@ -190,11 +195,15 @@ void PeeringState::end_block_outgoing() {
 
 void PeeringState::end_handle() {
   if (rctx) {
+    // 只有调用者提供了 PeeringCtx，start_handle() 才会创建 rctx；
+    // 这里累计本轮状态机事件的处理耗时。
     utime_t dur = ceph_clock_now() - rctx->start_time;
     machine.event_time += dur;
   }
 
+  // 无论事件是否携带上下文，每次 process_event() 完成后都增加处理计数。
   machine.event_count++;
+  // 与 start_handle() 配对，清除本轮临时上下文，使下一事件可以重新建立上下文。
   rctx = std::nullopt;
   orig_ctx = NULL;
 }
@@ -8278,5 +8287,3 @@ std::vector<pg_shard_t> PeeringState::get_replica_recovery_order() const
   }
   return ret;
 }
-
-
