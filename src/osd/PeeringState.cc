@@ -240,15 +240,26 @@ void PeeringState::check_recovery_sources(const OSDMapRef& osdmap)
 void PeeringState::update_history(const pg_history_t& new_history)
 {
   auto mnow = pl->get_mnow();
+
+  // history 中持久化的是旧 interval 读 lease 的剩余时长；
+  // 先按当前单调时间刷新它，过期则清零，未过期则以当前时刻为基准重新记录剩余时间。
   info.history.refresh_prior_readable_until_ub(mnow, prior_readable_until_ub);
+
+  // 合并副本上报的 history，只在本地 history 确实被推进时才标记为需要持久化。
   if (info.history.merge(new_history)) {
     psdout(20) << "advanced history from " << new_history << dendl;
     dirty_info = true;
+
+    // 若已知 PG 在当前 interval 开始之后达到 clean，则此前的副本映射历史不再影响
+    // 权威日志选择或缺失对象定位；可以裁剪 PastIntervals，并持久化这一较大元数据变更。
     if (info.history.last_epoch_clean >= info.history.same_interval_since) {
       psdout(20) << "clearing past_intervals" << dendl;
       past_intervals.clear();
       dirty_big_info = true;
     }
+
+    // history 合并可能带来更晚的旧 lease 剩余时长；将其恢复为运行时使用的绝对上界，
+    // 后续 activation 可据此等待旧 interval 的读许可完全失效。
     prior_readable_until_ub = info.history.get_prior_readable_until_ub(mnow);
     if (prior_readable_until_ub != ceph::signedspan::zero()) {
       dout(20) << "prior_readable_until_ub " << prior_readable_until_ub
@@ -459,9 +470,13 @@ void PeeringState::update_peer_info(const pg_shard_t &from,
 
 bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t &notify)
 {
+  // notify 中的 pg_info 是发送副本对自身 PGLog、缺失对象和 history 的本地摘要；
+  // epoch_sent 用于确认该消息没有跨越发送者的 down/up 实例边界。
   const pg_info_t &oinfo = notify.info;
   const epoch_t send_epoch = notify.epoch_sent;
 
+  // 同一 peer 的 last_update 未前进，说明其可用于 peering 的日志进度没有变化；
+  // 不重复更新 peer_info，并返回 false 表示没有收到新的输入。
   auto p = peer_info.find(from);
   if (p != peer_info.end() && p->second.last_update == oinfo.last_update) {
     psdout(10) << " got dup osd." << from << " info "
@@ -469,6 +484,8 @@ bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t
     return false;
   }
 
+  // 若该 OSD 自消息发送 epoch 起曾 down 过，则该 notify 可能来自旧 OSD 实例，
+  // 不能用它更新当前 peering 的副本视图。
   if (!get_osdmap()->has_been_up_since(from.osd, send_epoch)) {
     psdout(10) << " got info " << oinfo << " from down osd." << from
 	     << " discarding" << dendl;
@@ -477,13 +494,20 @@ bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t
 
   psdout(10) << " got osd." << from << " " << oinfo << dendl;
   ceph_assert(is_primary());
+
+  // 只有 primary 汇总其他副本的信息：保存该副本的摘要，并更新由 pg_info 派生的 peer 状态。
   peer_info[from] = oinfo;
-  update_peer_info(from, oinfo);
+  update_peer_info(from, oinfo);  // 主要处理 EC 的 partial_writes_last_complete，属于部分写入完成边界的修正，暂时跳过
+
+  // 该 OSD 报告过自身信息，保守地认为它可能持有尚未定位的对象；
+  // 后续 peering/recovery 会据此决定是否还需要向它查询。
   might_have_unfound.insert(from);
 
+  // 将副本 history 合并到本地 PG history，推进如 last_epoch_clean 等集群一致性边界。
   update_history(oinfo.history);
 
-  // stray?
+  // 不在当前 up/acting 集合却仍持有此 PG 数据的是 stray；若 PG 已 clean，
+  // 可以立刻发起清理，否则先保留其信息，避免过早丢弃可能有用的副本内容。
   if (!is_up(from) && !is_acting(from)) {
     psdout(10) << " osd." << from << " has stray content: " << oinfo << dendl;
     stray_set.insert(from);
@@ -492,14 +516,17 @@ bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t
     }
   }
 
+  // 只有当前 acting 成员会参与本轮服务协议；
+  // 取其 feature 交集，使 primary 后续发送的 PG 消息只使用所有 acting 副本都支持的能力。
   if (is_acting(from)) {
     pg_acting_features &= notify.pg_features;
   }
 
-  // was this a new info?  if so, update peers!
+  // 第一次得知这个 peer 时，心跳集合可能需要纳入它。
   if (p == peer_info.end())
     update_heartbeat_peers();
 
+  // 返回 true 表示本次 notify 未被当作重复或旧实例消息丢弃。
   return true;
 }
 
@@ -584,22 +611,31 @@ void PeeringState::advance_map(
   vector<int>& newacting, int acting_primary,
   PeeringCtx &rctx)
 {
+  // 调用者按 epoch 顺序推进 PG；lastmap 必须是本状态机当前持有的地图，
+  // 避免跳过或乱序比较 OSDMap。
   ceph_assert(lastmap == osdmap_ref);
   psdout(10) << "handle_advance_map "
 	    << newup << "/" << newacting
 	    << " -- " << up_primary << "/" << acting_primary
 	    << dendl;
 
+  // 先切换状态机使用的 OSDMap 和 pool 配置，
+  // 使 AdvMap 的状态处理逻辑读取到的是新地图；lastmap 仍作为事件参数保留旧值供比较。
   update_osdmap_ref(osdmap);
   pool.update(osdmap);
 
+  // 将新旧地图及新 up/acting 映射包装成 AdvMap 事件，
+  // 交由当前状态（如 Reset、Primary、Active）决定是否重置、重新 peering 或保持状态。
   AdvMap evt(
     osdmap, lastmap, newup, up_primary,
     newacting, acting_primary);
   handle_event(evt, &rctx);
   if (pool.info.last_change == osdmap_ref->get_epoch()) {
+    // pool 配置恰好在本 epoch 改变，通知 PG 外层更新依赖 pool 配置的行为。
     pl->on_pool_change();
   }
+  // 这两个值不由状态机事件直接维护：根据最新 pool/OSDMap 刷新可读间隔，
+  // 并记录当前地图要求的最低 OSD release，供后续功能兼容性判断使用。
   readable_interval = pool.get_readable_interval(cct->_conf);
   last_require_osd_release = osdmap->require_osd_release;
 }
@@ -710,14 +746,19 @@ void PeeringState::start_peering_interval(
   const vector<int>& newacting, int new_acting_primary,
   ObjectStore::Transaction &t)
 {
+  // 新 interval 的统一初始化入口：安装新 up/acting 映射，
+  // 失效旧角色、 peer 状态和 lease，并把需要持久化的 PG 状态写入调用者事务。
   const OSDMapRef osdmap = get_osdmap();
 
+  // 记录本次 reset，并按 collection flush 是否完成决定是否暂缓发送 recovery 消息。
   set_last_peering_reset();
 
+  // 保存旧映射和旧角色，后续用于计算 PastIntervals、日志和角色变化处理。
   vector<int> oldacting, oldup;
   int oldrole = get_role();
 
   if (is_primary()) {
+    // 原 primary 上的 merge 准备只对旧 interval 有效，进入新 interval 前清除。
     pl->clear_ready_to_merge();
   }
 
@@ -727,6 +768,7 @@ void PeeringState::start_peering_interval(
   bool was_old_primary = is_primary();
   bool was_old_nonprimary = is_nonprimary();
 
+  // 将现有 up/acting 移出状态机，再安装新地图计算出的映射和 primary。
   acting.swap(oldacting);
   up.swap(oldup);
   init_primary_up_acting(
@@ -739,6 +781,7 @@ void PeeringState::start_peering_interval(
       info.stats.acting != acting ||
       info.stats.up_primary != new_up_primary ||
       info.stats.acting_primary != new_acting_primary) {
+    // PG 统计中保存当前映射快照，供状态上报和诊断使用。
     info.stats.up = up;
     info.stats.up_primary = new_up_primary;
     info.stats.acting = acting;
@@ -750,16 +793,20 @@ void PeeringState::start_peering_interval(
 
   // This will now be remapped during a backfill in cases
   // that it would not have been before.
+  // up 与 acting 不同时，CRUSH 期望位置与当前实际副本集不同，标记 REMAPPED；
   if (up != acting)
     state_set(PG_STATE_REMAPPED);
   else
     state_clear(PG_STATE_REMAPPED);
 
+  // 用新 acting 集合重算当前 OSD 是 primary、replica 还是 stray。
   int role = osdmap->calc_pg_role(pg_whoami, acting);
   set_role(role);
 
+  // 根据旧/新映射判断是否形成新 interval，并维护历史边界与 PastIntervals。
   // did acting, up, primary|acker change?
   if (!lastmap) {
+    // 新建 PG 没有可比较的旧地图；当前 epoch 即为第一个 interval 的起点。
     psdout(10) << " no lastmap" << dendl;
     dirty_info = true;
     dirty_big_info = true;
@@ -785,9 +832,12 @@ void PeeringState::start_peering_interval(
     psdout(10) << ": check_new_interval output: "
 	       << debug.str() << dendl;
     if (new_interval) {
+      // PastIntervals 已记录前一个 interval 中可能持有更新的 OSD；
+      // 它是后续 peering 选择权威日志、查询缺失对象时的历史依据。
       if (osdmap->get_epoch() == pl->cluster_osdmap_trim_lower_bound() &&
 	  info.history.last_epoch_clean < osdmap->get_epoch()) {
 	psdout(10) << " map gap, clearing past_intervals and faking" << dendl;
+	// OSDMap 已被裁剪且本 PG 不够新，无法可靠重建历史 interval，只能丢弃。
 	// our information is incomplete and useless; someone else was clean
 	// after everything we know if osdmaps were trimmed.
 	past_intervals.clear();
@@ -797,6 +847,7 @@ void PeeringState::start_peering_interval(
       dirty_info = true;
       dirty_big_info = true;
       info.history.same_interval_since = osdmap->get_epoch();
+      // pg_num 增大导致的 PG split 也作为历史边界记录。
       if (osdmap->have_pg_pool(info.pgid.pgid.pool()) &&
 	  info.pgid.pgid.is_split(lastmap->get_pg_num(info.pgid.pgid.pool()),
 				  osdmap->get_pg_num(info.pgid.pgid.pool()),
@@ -808,13 +859,16 @@ void PeeringState::start_peering_interval(
 
   if (old_up_primary != up_primary ||
       oldup != up) {
+    // up 映射或其 primary 改变，记录新的 same_up_since 起点。
     info.history.same_up_since = osdmap->get_epoch();
   }
   // this comparison includes primary rank via pg_shard_t
   if (old_acting_primary != get_primary()) {
+    // acting primary 改变，记录新的 same_primary_since 起点。
     info.history.same_primary_since = osdmap->get_epoch();
   }
 
+  // 重置 feature 交集、missing-delete 语义、心跳时间戳和读 lease 边界。
   on_new_interval();
 
   psdout(1) << "up " << oldup << " -> " << up
@@ -827,6 +881,8 @@ void PeeringState::start_peering_interval(
 	    << " upacting " << upacting_features
 	    << dendl;
 
+  // 旧 interval 的 Active/Peered/Recovery 标志不再成立；
+  // 新的 peering 必须重新证明其一致性后才会恢复这些状态。
   // deactivate.
   state_clear(PG_STATE_ACTIVE);
   state_clear(PG_STATE_PEERED);
@@ -836,27 +892,32 @@ void PeeringState::start_peering_interval(
   state_clear(PG_STATE_RECOVERY_TOOFULL);
   state_clear(PG_STATE_RECOVERING);
 
+  // 与旧 acting 集合绑定的 peer 进度和 recovery/backfill 目标全部失效。
   peer_purged.clear();
   acting_recovery_backfill.clear();
   acting_recovery_backfill_shard_id_set.clear();
 
+  // pg_temp 意图属于旧角色/旧映射，清除后由新的 primary/replica 流程重新决定。
   // reset primary/replica state?
   if (was_old_primary || is_primary()) {
     pl->clear_want_pg_temp();
   } else if (was_old_nonprimary || is_nonprimary()) {
     pl->clear_want_pg_temp();
   }
+  // 清空 primary 专属的 peering 临时状态，再通知 PG 外层当前映射已变化。
   clear_primary_state();
 
   pl->on_change(t);
 
   ceph_assert(!deleting);
 
+  // 非 primary 需要在 ActMap 阶段向新 primary 发送 notify；primary 不需要通知自己。
   // should we tell the primary we are here?
   send_notify = !is_primary();
 
   if (role != oldrole ||
       was_old_primary != is_primary()) {
+    // 当前 OSD 的角色发生改变，原有 clean 结论与上层角色资源都不能继续沿用。
     // did primary change?
     if (was_old_primary != is_primary()) {
       state_clear(PG_STATE_CLEAN);
@@ -883,6 +944,8 @@ void PeeringState::start_peering_interval(
     }
   }
 
+  // 特殊映射：当前 OSD 是 up primary，但暂时没有 acting；
+  // 请求清除遗留 pg_temp，让 Monitor 重新依据当前映射计算 acting。
   if (acting.empty() && !up.empty() && up_primary == pg_whoami) {
     psdout(10) << " acting empty, but i am up[0], clearing pg_temp" << dendl;
     pl->queue_want_pg_temp(acting);
@@ -891,9 +954,12 @@ void PeeringState::start_peering_interval(
 
 void PeeringState::on_new_interval()
 {
+  // 此处只重置“依赖 interval”的派生运行状态；
+  // up/acting 和 role 已由 start_peering_interval() 安装完毕。
   dout(20) << dendl;
   const OSDMapRef osdmap = get_osdmap();
 
+  // 计算新 up/acting 成员共同支持的 feature；后续 PG 消息与行为只能使用交集。
   // initialize features
   acting_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
   upacting_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
@@ -919,14 +985,19 @@ void PeeringState::on_new_interval()
 
   if (!pg_log.get_missing().may_include_deletes &&
       !perform_deletes_during_peering()) {
+    // 当前流程不会在 peering 中处理删除时，重建 missing 集合以纳入历史删除记录。
     pl->rebuild_missing_set_with_deletes(pg_log);
   }
   ceph_assert(
     pg_log.get_missing().may_include_deletes ==
     !perform_deletes_during_peering());
 
+  // 新 interval 的 peer 集合已变更，重新初始化 heartbeat 时间戳。
   init_hb_stamps();
 
+  // 处理旧 interval 遗留的读 lease
+  // readable_until_ub       当前 interval 中，旧 acting 副本可能仍允许读到的最晚时间
+  // prior_readable_until_ub 更早 interval 留下的、尚未过期的最晚时间
   // update lease bounds for a new interval
   auto mnow = pl->get_mnow();
   prior_readable_until_ub = std::max(prior_readable_until_ub,
@@ -945,9 +1016,11 @@ void PeeringState::on_new_interval()
 
   acting_readable_until_ub.clear();
   if (is_primary()) {
+    // 仅 primary 收集各 acting 副本的 readable_until 上界。
     acting_readable_until_ub.resize(acting.size(), ceph::signedspan::zero());
   }
 
+  // 让 PG 外层同步 interval 变化后的请求、恢复与统计相关状态。
   pl->on_new_interval();
 }
 
@@ -5246,8 +5319,11 @@ PeeringState::Started::react(const IntervalFlush&)
 
 boost::statechart::result PeeringState::Started::react(const AdvMap& advmap)
 {
+  // Active/Peering 等子状态对 AdvMap 返回 forward_event() 后，事件会传播到 Started；
+  // 这里统一决定这次地图变化是否必须重新开始 peering。
   DECLARE_LOCALS;
   psdout(10) << "Started advmap" << dendl;
+  // pool 的 FULL 标志变化不一定改变 PG interval，但需要更新 PG 的 full 状态。
   ps->check_full_transition(advmap.lastmap, advmap.osdmap);
   if (ps->should_restart_peering(
 	advmap.up_primary,
@@ -5258,10 +5334,14 @@ boost::statechart::result PeeringState::Started::react(const AdvMap& advmap)
 	advmap.osdmap)) {
     psdout(10) << "should_restart_peering, transitioning to Reset"
 		       << dendl;
+    // 先把同一个 AdvMap 重新投递；transit<Reset>() 完成状态切换后，
+    // Reset::react(AdvMap) 会用新状态重新建立 peering interval。
     post_event(advmap);
     return transit< Reset >();
   }
+  // 映射未改变 interval，不必重置；丢弃已经失效的 down peer 信息即可。
   ps->remove_down_peer_info(advmap.osdmap);
+  // 当前事件结束，状态不变，回到调用栈
   return discard_event();
 }
 
@@ -5313,11 +5393,16 @@ PeeringState::Reset::react(const IntervalFlush&)
 
 boost::statechart::result PeeringState::Reset::react(const AdvMap& advmap)
 {
+  // Started 在转入 Reset 前重新投递的 AdvMap 会到达这里；
+  // Reset 期间后续 OSDMap 更新也复用同一处理路径。
   DECLARE_LOCALS;
   psdout(10) << "Reset advmap" << dendl;
 
+  // FULL 标志变化独立于 interval，先同步 PG 的 full 状态。
   ps->check_full_transition(advmap.lastmap, advmap.osdmap);
 
+  // 只有新 up/acting 映射确实开启新的 peering interval 时，
+  // 才重新初始化 PG 的角色、映射、past_intervals 等 interval 相关状态。
   if (ps->should_restart_peering(
 	advmap.up_primary,
 	advmap.acting_primary,
@@ -5327,12 +5412,16 @@ boost::statechart::result PeeringState::Reset::react(const AdvMap& advmap)
 	advmap.osdmap)) {
     psdout(10) << "should restart peering, calling start_peering_interval again"
 		       << dendl;
+    // 传入状态机本轮上下文持有的事务；interval 初始化产生的持久化修改
+    // 会与本次 peering 事件的其他输出一并由 PeeringCtx 派发。
     ps->start_peering_interval(
       advmap.lastmap,
       advmap.newup, advmap.up_primary,
       advmap.newacting, advmap.acting_primary,
       context< PeeringMachine >().get_cur_transaction());
   }
+  // 无论是否开启新 interval，都删除新地图中已 down 的 peer 信息，
+  // 并校验 past_intervals 的边界仍与 PG history 一致。
   ps->remove_down_peer_info(advmap.osdmap);
   ps->check_past_interval_bounds();
   return discard_event();
@@ -5341,10 +5430,19 @@ boost::statechart::result PeeringState::Reset::react(const AdvMap& advmap)
 boost::statechart::result PeeringState::Reset::react(const ActMap&)
 {
   DECLARE_LOCALS;
+
+  // start_peering_interval() 已根据新角色设置 send_notify：只有非 primary 的本地副本
+  // 需要把自己的 peering 信息告诉当前 acting primary；primary 不需要向自己发送。
   if (ps->should_send_notify() && ps->get_primary().osd >= 0) {
+    // 将旧 interval 尚未过期的读 lease 上界换算/保存到 info.history；
+    // 这样 primary 收到 notify 后也能知道旧副本可能仍可读到何时。
     ps->info.history.refresh_prior_readable_until_ub(
       pl->get_mnow(),
       ps->prior_readable_until_ub);
+
+    // notify 携带目标 primary/local replica 的 shard、当前 map epoch、本地 pg_info、
+    // PastIntervals 以及本地支持的 PG feature；primary 用它建立本轮 peering 的 peer 视图。
+    // 消息类型：MOSDPGNotify2
     context< PeeringMachine >().send_notify(
       ps->get_primary().osd,
       pg_notify_t(
@@ -5356,8 +5454,11 @@ boost::statechart::result PeeringState::Reset::react(const ActMap&)
 	ps->local_pg_acting_features));
   }
 
+  // acting 角色和副本集已按新 map 安装，更新心跳监测对象。
   ps->update_heartbeat_peers();
 
+  // ActMap 是本批 map 推进后的激活边界；Reset 的工作至此完成，回到 Started
+  // 等待后续 Notify、Query 等 peering 事件驱动下一阶段。
   return transit< Started >();
 }
 
@@ -5390,13 +5491,20 @@ PeeringState::Start::Start(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Start")
 {
+  // context<PeeringMachine>() 取当前 Start 所属的状态机对象；log_enter(state_name) 记录“进入 Start 状态”。
   context< PeeringMachine >().log_enter(state_name);
 
   DECLARE_LOCALS;
+  // Start 是 Started 的初始子状态，只负责按当前 PG 角色选择分支。
+  // post_event() 将内部事件交给 statechart 随后分发；
+  // 它并不在这里直接调用 Primary 或 Stray 的构造函数。
   if (ps->is_primary()) {
+    // Start::reactions 中 MakePrimary -> Primary；
     psdout(1) << "transitioning to Primary" << dendl;
     post_event(MakePrimary());
-  } else { //is_stray
+  } else { // is_stray
+    // Start::reactions 中 MakeStray -> Stray。
+    // 此 OSD 不再担任当前 acting 集的 primary，转入副本/stray 路径。
     psdout(1) << "transitioning to Stray" << dendl;
     post_event(MakeStray());
   }
@@ -5413,18 +5521,28 @@ void PeeringState::Start::exit()
 /*---------Primary--------*/
 PeeringState::Primary::Primary(my_context ctx)
   : my_base(ctx),
+    // state_history 用于记录状态层级，供 PG 状态查询和调试观察。
     NamedState(context< PeeringMachine >().state_history, "Started/Primary")
 {
   context< PeeringMachine >().log_enter(state_name);
   DECLARE_LOCALS;
+
+  // 新 interval 已在 Reset 中清除上一次 primary 尝试的候选 acting 集。
+  // 进入 Primary 时必须从空集合开始，后续 peering 才能重新选择权威副本集。
   ceph_assert(ps->want_acting.empty());
 
-  // set CREATING bit until we have peered for the first time.
+  // last_epoch_started 为 0 表示这个 PG 尚未成功开始过任何一次 peering，
+  // 即新建 PG 的首次 primary peering。
   if (ps->info.history.last_epoch_started == 0) {
+    // 在首次 peering 成功前保持 CREATING 状态；离开 Primary 或完成 activation 后会清除。
     ps->state_set(PG_STATE_CREATING);
-    // use the history timestamp, which ultimately comes from the
-    // monitor in the create case.
+
+    // 新建 PG 尚无实际的状态转换时刻，使用创建时由 Monitor 最终写入 history 的
+    // 时间戳作为统计基线，避免 last_active、last_clean 等字段为未初始化时间。
     utime_t t = ps->info.history.last_scrub_stamp;
+
+    // 这些是 PG 状态与 scrub 统计的时间戳，不表示 PG 已 fresh、active 或 clean；
+    // 它们仅以创建时间初始化，后续相应状态转换会写入真实发生时间。
     ps->info.stats.last_fresh = t;
     ps->info.stats.last_active = t;
     ps->info.stats.last_change = t;
@@ -5442,8 +5560,15 @@ PeeringState::Primary::Primary(my_context ctx)
 boost::statechart::result PeeringState::Primary::react(const MNotifyRec& notevt)
 {
   DECLARE_LOCALS;
+
+  // MOSDPGNotify2 已被接收线程转换为 MNotifyRec 并投递到本 PG；
+  // 状态机确认当前角色为 Primary 后，才由这个状态处理副本上报。
   psdout(7) << "handle_pg_notify from osd." << notevt.from << dendl;
+
+  // 实际处理包括去重、校验发送者仍有效，以及更新 peer_info、历史和 feature 交集。
   ps->proc_replica_notify(notevt.from, notevt.notify);
+
+  // notify 已消费；Primary 状态本身不因单条 notify 直接发生状态迁移。
   return discard_event();
 }
 
@@ -5512,15 +5637,22 @@ void PeeringState::Primary::exit()
 /*---------Peering--------*/
 PeeringState::Peering::Peering(my_context ctx)
   : my_base(ctx),
+    // Peering 是 Primary 的子状态；完整名称用于状态历史和诊断输出。
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Peering"),
+    // 后续 choose_acting() 若发现 history.last_epoch_started 限制了可选副本，
+    // 会置此标记并在状态查询中说明 peering 的阻塞原因。
     history_les_bound(false)
 {
   context< PeeringMachine >().log_enter(state_name);
   DECLARE_LOCALS;
 
+  // Peering 只能由尚未完成 peering 的 primary 进入。
+  // 若旧状态仍是 peered/peering，说明状态切换或 interval 重置没有正确清理，直接终止以避免状态混用。
   ceph_assert(!ps->is_peered());
   ceph_assert(!ps->is_peering());
   ceph_assert(ps->is_primary());
+
+  // 对外发布 PG 正处于 peering；具体的副本信息收集由默认子状态 GetInfo 开始。
   ps->state_set(PG_STATE_PEERING);
 }
 
@@ -6574,6 +6706,8 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
 {
   DECLARE_LOCALS;
 
+  // up/acting primary、成员或 interval 的关键变化会使现有 peering 结论失效。
+  // 此时 Active 不自行收尾，转发 AdvMap 给外层状态，由其进入 Reset 并重新 peering。
   if (ps->should_restart_peering(
 	advmap.up_primary,
 	advmap.acting_primary,
@@ -6586,6 +6720,7 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
   }
   psdout(10) << "Active advmap" << dendl;
 
+  // interval 未变化，PG 可以保持 Active；通知 PG 外层处理 active 期间的地图更新。
   pl->on_active_advmap(advmap.osdmap);
   if (ps->dirty_big_info) {
     // share updated purged_snaps to mgr/mon so that we (a) stop reporting
@@ -6599,6 +6734,7 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
     int osd = ps->want_acting[i];
     if (!advmap.osdmap->is_up(osd)) {
       pg_shard_t osd_with_shard(osd, shard_id_t(i));
+      // 该 OSD 已 down，且不属于当前 up/acting 集合：它只是 want_acting 中的旧候选，需要重新选择 acting
       if (!ps->is_acting(osd_with_shard) && !ps->is_up(osd_with_shard)) {
         psdout(10) << "Active stray osd." << osd << " in want_acting is down"
                    << dendl;
@@ -6616,12 +6752,14 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
     // note that we leave restrict_to_up_acting to false in order to
     // not overkill any chosen stray that is still alive.
     pg_shard_t get_log_shard;
+    // 清理其 peer 信息并重新选择 acting
     ps->remove_down_peer_info(advmap.osdmap);
     ps->choose_acting(get_log_shard, false, true);
   }
 
   /* Check for changes in pool size (if the acting set changed as a result,
    * this does not matter) */
+  // 副本数配置变化时，仅按当前 actingset 是否满足新 size 更新 UNDERSIZED 标志；
   if (advmap.lastmap->get_pg_size(ps->info.pgid.pgid) !=
       ps->get_osdmap()->get_pg_size(ps->info.pgid.pgid)) {
     if (ps->get_osdmap()->get_pg_size(ps->info.pgid.pgid) <=
@@ -6633,12 +6771,15 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
     // degraded changes will be detected by call from publish_stats_to_osd()
   }
 
+  // degraded 状态由 publish_stats_to_osd 发布 PG 统计时重新计算。
   pl->publish_stats_to_osd();
 
+  // 新地图可能使此前可读的 OSD down；需要重新判断 PG 的可读性并唤醒/阻塞读请求。
   if (ps->check_prior_readable_down_osds(advmap.osdmap)) {
     pl->recheck_readable();
   }
 
+  // Active 处理完自身逻辑后，继续向父状态传播 AdvMap，使外层状态也能处理该地图事件。
   return forward_event();
 }
 
@@ -7432,18 +7573,24 @@ void PeeringState::Deleting::exit()
 /*--------GetInfo---------*/
 PeeringState::GetInfo::GetInfo(my_context ctx)
   : my_base(ctx),
+    // GetInfo 是 Peering 的初始子状态，负责收集选择权威日志所需的副本摘要。
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Peering/GetInfo")
 {
   context< PeeringMachine >().log_enter(state_name);
 
-
   DECLARE_LOCALS;
+
+  // 校验 PastIntervals 与当前 history 的边界，并记录异常的 PGLog/缺失状态供诊断。
   ps->check_past_interval_bounds();
   ps->log_weirdness();
+
+  // prior_set： “本轮 peering 必须考虑的 OSD 集合”
   PastIntervals::PriorSet &prior_set = context< Peering >().prior_set;
 
+  // 新一轮 GetInfo 尚未发出查询或等待回复，不能遗留上一轮的阻塞 OSD。
   ceph_assert(ps->blocked_by.empty());
 
+  // 算出的“本轮 peering 必须考虑的 OSD 集合”
   prior_set = ps->build_prior();
   ps->prior_readable_down_osds = prior_set.down;
 
@@ -7452,11 +7599,18 @@ PeeringState::GetInfo::GetInfo(my_context ctx)
 	       << dendl;
   }
 
+  // 初始时只知道本地能力；收到各副本信息后会重新求 acting 副本的 feature 交集。
   ps->reset_min_peer_features();
+
+  // 对 prior_set.probe 中尚无摘要且仍 up 的副本发送 INFO 查询，
+  // 并将已发请求的副本记入 peer_info_requested。
   get_infos();
   if (prior_set.pg_down) {
+    // PriorSet 已判定本轮无法继续，转入 Down；不是单纯某一条查询尚未返回。
     post_event(IsDown());
   } else if (peer_info_requested.empty()) {
+    // 无需等待任何远端摘要（例如所需信息都已存在或只需本地信息），
+    // 投递 GotInfo 进入下一 peering 阶段；这不表示 PG 已经 peered。
     post_event(GotInfo());
   }
 }
@@ -7464,24 +7618,36 @@ PeeringState::GetInfo::GetInfo(my_context ctx)
 void PeeringState::GetInfo::get_infos()
 {
   DECLARE_LOCALS;
+  // 复用进入 GetInfo 时构建的探测集合；收到新信息后若重建 prior_set，
+  // 本函数也会再次调用以补发或保留必要的查询。
   PastIntervals::PriorSet &prior_set = context< Peering >().prior_set;
 
+  // blocked_by 只描述当前仍在等待 pg_info 的 peer，先清空后按本轮遍历重建。
   ps->blocked_by.clear();
   for (auto it = prior_set.probe.begin(); it != prior_set.probe.end(); ++it) {
     pg_shard_t peer = *it;
+
+    // 本地 pg_info 已直接可用，无需向自己发送网络查询。
     if (peer == ps->pg_whoami) {
       continue;
     }
+
+    // 之前的 notify 已经提供该副本的 pg_info，避免重复探测。
     if (ps->peer_info.count(peer)) {
       psdout(10) << " have osd." << peer << " info " << ps->peer_info[peer] << dendl;
       continue;
     }
+
     if (peer_info_requested.count(peer)) {
+      // 请求已在途：继续把该 OSD 记为阻塞者，等待其 notify 到达。
       psdout(10) << " already requested info from osd." << peer << dendl;
       ps->blocked_by.insert(peer.osd);
     } else if (!ps->get_osdmap()->is_up(peer.osd)) {
+      // down OSD 无法响应；是否因此使 PG down 由 prior_set.pg_down 决定。
       psdout(10) << " not querying info from down osd." << peer << dendl;
     } else {
+      // INFO 查询请求对端返回自身 pg_info；
+      // 请求中带目标/本地 shard、本地 history 和当前 map epoch，供对端验证并组织回复。
       psdout(10) << " querying info from osd." << peer << dendl;
       context< PeeringMachine >().send_query(
 	peer.osd,
@@ -7489,39 +7655,47 @@ void PeeringState::GetInfo::get_infos()
 		   it->shard, ps->pg_whoami.shard,
 		   ps->info.history,
 		   ps->get_osdmap_epoch()));
+
+      // 发送是异步的：记录等待项和阻塞 OSD，收到 MNotifyRec 后再移除。
       peer_info_requested.insert(peer);
       ps->blocked_by.insert(peer.osd);
     }
   }
 
+  // 更新历史副本 down 对旧 interval 读 lease 的影响，必要时调整可读性判断。
   ps->check_prior_readable_down_osds(ps->get_osdmap());
 
+  // 将新的 DOWN/PEERING 等状态和阻塞信息发布给 OSD 统计。
   pl->publish_stats_to_osd();
 }
 
 boost::statechart::result PeeringState::GetInfo::react(const MNotifyRec& infoevt)
 {
-
   DECLARE_LOCALS;
 
+  // 此 notify 可能是对本轮 INFO 查询的回复。先停止等待该 peer；
+  // 即使是主动到达的 notify（不在集合中），后面仍会尝试将其作为新的 peering 信息处理。
   auto p = peer_info_requested.find(infoevt.from);
   if (p != peer_info_requested.end()) {
     peer_info_requested.erase(p);
     ps->blocked_by.erase(infoevt.from.osd);
   }
 
+  // 处理前记录本地 last_epoch_started；
+  // 副本 history 若将它推进，历史 probe 集合的安全边界随之变化，不能继续沿用旧 prior_set。
   epoch_t old_start = ps->info.history.last_epoch_started;
   if (ps->proc_replica_notify(infoevt.from, infoevt.notify)) {
-    // we got something new ...
+    // 仅在该 notify 不是重复消息、也不来自已失效 OSD 实例时才采纳其 pg_info。
     PastIntervals::PriorSet &prior_set = context< Peering >().prior_set;
     if (old_start < ps->info.history.last_epoch_started) {
+      // 更晚的 last_epoch_started 表示可信历史区间发生变化；
+      // 重建 prior_set，使接下来的日志选择和信息探测不遗漏可能持有更新的副本。
       psdout(10) << " last_epoch_started moved forward, rebuilding prior" << dendl;
       prior_set = ps->build_prior();
       ps->prior_readable_down_osds = prior_set.down;
 
-      // filter out any osds that got dropped from the probe set from
-      // peer_info_requested.  this is less expensive than restarting
-      // peering (which would re-probe everyone).
+      // 新 prior_set 可能不再需要部分在途查询；
+      // 移除这些等待项即可，不必重启整个 peering 并重新探测所有副本。
       auto p = peer_info_requested.begin();
       while (p != peer_info_requested.end()) {
 	if (prior_set.probe.count(*p) == 0) {
@@ -7531,13 +7705,20 @@ boost::statechart::result PeeringState::GetInfo::react(const MNotifyRec& infoevt
 	  ++p;
 	}
       }
+
+      // 对重建后的 probe 集合补发尚未拥有、尚未请求的 INFO 查询。
       get_infos();
     }
+
+    // 这是消息发送方的通用 Ceph feature 位；与前面 reset 的 peer_features 求交集，
+    // 后续 PG 消息只能使用所有已采纳 peer 都支持的能力。
+    // 它不同于 notify.pg_features，后者用于计算 acting PG feature 交集。
     psdout(20) << "Adding osd: " << infoevt.from.osd << " peer features: "
-		       << hex << infoevt.features << dec << dendl;
+	       << hex << infoevt.features << dec << dendl;
     ps->apply_peer_features(infoevt.features);
 
-    // are we done getting everything?
+    // 所有必需 INFO 回复均已到达，且 prior_set 未判定 PG down 时，
+    // 才能进入 GetLog 选择权威日志。GotInfo 不表示整个 peering 已完成。
     if (peer_info_requested.empty() && !prior_set.pg_down) {
       psdout(20) << "Common peer features: " << hex << ps->get_min_peer_features() << dec << dendl;
       psdout(20) << "Common acting features: " << hex << ps->get_min_acting_features() << dec << dendl;
@@ -7546,6 +7727,8 @@ boost::statechart::result PeeringState::GetInfo::react(const MNotifyRec& infoevt
       post_event(GotInfo());
     }
   }
+
+  // 本条 notify 已消费；状态转换若有，由已投递的 GotInfo 在随后触发。
   return discard_event();
 }
 

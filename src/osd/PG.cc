@@ -2195,15 +2195,21 @@ void PG::handle_advance_map(
 
 void PG::handle_activate_map(PeeringCtx &rctx, epoch_t range_starts_at)
 {
+  // OSD::advance_pg() 已按 epoch 调用 handle_advance_map() 推进完本批 OSDMap；
+  // 这里是批次末尾的统一激活阶段，不保证每个 epoch 都单独调用一次。
   dout(10) << fmt::format("{}: epoch range: {}..{}", __func__, range_starts_at,
                           get_osdmap()->get_epoch())
            << dendl;
+
+  // 向 PeeringState 投递 ActMap。若状态机当前在 Reset，副本会 notify 新 primary，
+  // 更新 heartbeat peer，并转回 Started，准备按已安装的最终映射继续 peering。
   recovery_state.activate_map(rctx);
+
+  // 此前因等待 OSDMap 而阻塞的客户端请求现在可按最新 map 重新进入调度。
   requeue_map_waiters();
 
-  // If pool.info changed during this sequence of map updates, invoke
-  // on_scrub_schedule_input_change() as pool.info contains scrub scheduling
-  // parameters.
+  // 本批 map 中若 pool 配置改变，pool.info 内的 scrub 调度参数也可能变化，
+  // 因此在所有 map 生效后统一刷新 scrub 调度输入。
   if (pool.info.last_change >= range_starts_at) {
     on_scrub_schedule_input_change();
   }

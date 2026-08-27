@@ -7979,7 +7979,7 @@ void OSD::ms_fast_dispatch(Message *m)
       if (require_osd_peer(pm)) {
 	enqueue_peering_evt(
 	  pm->get_spg(),
-	  PGPeeringEventRef(pm->get_event()));
+	  PGPeeringEventRef(pm->get_event()));  // PGPeeringEventRef 是 PGPeeringEvent 的智能指针别，定义在 include/osd/PGPeeringEvent.h
       }
       pm->put();
       return;
@@ -11588,7 +11588,7 @@ void OSD::ShardedOpWQ::_add_slot_waiter(
 
 void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, heartbeat_handle_d *hb)
 {
-  // op_shardedwq 的消费者入口。工作线程每次调用最多从指定 shard 取出并执行一个 OpSchedulerItem；
+  // op_shardedwq 的消费者入口。工作线程每次调用最多从指定 shard 取出并执行一个 OpSchedulerItem，qi::run；
   // 任务可能是客户端 IO、recovery、peering 或 PG 管理事件，不一定都是网络消息。
   auto& sdata = osd->shards[shard_index];
   ceph_assert(sdata);
