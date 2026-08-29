@@ -2989,24 +2989,31 @@ void PeeringState::build_might_have_unfound()
   psdout(15) << ": built " << might_have_unfound << dendl;
 }
 
+/**
+ * 将本轮 peering 结果转为激活中的 PG：更新待持久化的 PGInfo/PGLog，
+ * 为本地事务提交登记 ActivateCommitted，并由 primary 按副本进度发送
+ * PGInfo 或 PGLog、建立 missing 的恢复来源；副本侧只完成本地激活收尾。
+ */
 void PeeringState::activate(
   ObjectStore::Transaction& t,
   epoch_t activation_epoch,
   PeeringCtxWrapper &ctx)
 {
+  // 只能从尚未 peered 的阶段进入；真正设置 ACTIVE 还要等所有参与方提交确认且 acting 集可写。
   ceph_assert(!is_peered());
 
-  // twiddle pg state
+  // 本轮已选出可用的 acting 集，不再以 DOWN 状态对外报告。
   state_clear(PG_STATE_DOWN);
 
   send_notify = false;
 
   if (is_primary()) {
+    // primary 将 peering 期间观察到的 partial-write 完成点定为权威值。
     // Update the epoch so that pwlc used by the primary during
     // peering becomes the definitive copy of pwlc
     info.partial_writes_last_complete_epoch = get_osdmap_epoch();
 
-    // only update primary last_epoch_started if we will go active
+    // 只有 acting 集可写，才推进本 PG primary 的 started epoch/interval。
     if (acting_set_writeable()) {
       ceph_assert(cct->_conf->osd_find_best_info_ignore_history_les ||
 	     info.last_epoch_started <= activation_epoch);
@@ -3018,6 +3025,7 @@ void PeeringState::activate(
       pg_committed_to = info.last_update;
     }
   } else if (is_acting(pg_whoami)) {
+    // acting 副本以 primary 发来的 activation_epoch 为准；不能倒退本地记录。
     /* update last_epoch_started on acting replica to whatever the primary sent
      * unless it's smaller (could happen if we are going peered rather than
      * active, see doc/dev/osd_internals/last_epoch_started.rst) */
@@ -3031,6 +3039,7 @@ void PeeringState::activate(
     }
   }
 
+  // 重新建立 activation 后的运行时恢复基线；这些值尚未表示数据已恢复。
   auto &missing = pg_log.get_missing();
 
   min_last_complete_ondisk = eversion_t(0,0);  // we don't know (yet)!
@@ -3039,10 +3048,12 @@ void PeeringState::activate(
 
   need_up_thru = false;
 
-  // write pg info, log
+  // 标记 PGInfo/大元数据将随当前事务写入 ObjectStore。
   dirty_info = true;
   dirty_big_info = true; // maybe
 
+  // 不在此处直接把 primary 计入 peer_activated：必须等 t 真正提交后，
+  // 才异步投递 ActivateCommitted 事件。
   pl->schedule_event_on_commit(
     t,
     std::make_shared<PGPeeringEvent>(
@@ -3052,7 +3063,7 @@ void PeeringState::activate(
 	get_osdmap_epoch(),
 	activation_epoch)));
 
-  // init complete pointer
+  // 根据本地 missing 初始化 complete 指针和后续 recovery 的扫描位置。
   if (missing.num_missing() == 0) {
     psdout(10) << "activate - no missing, moving last_complete " << info.last_complete
 	     << " -> " << info.last_update << dendl;
@@ -3068,7 +3079,8 @@ void PeeringState::activate(
   log_weirdness();
 
   if (is_primary()) {
-    // initialize snap_trimq
+    // 汇总 OSDMap 中待删除的快照，并排除本 PG 已记录为 purged 的部分；
+    // 激活完成后由 on_activate() 启动实际的 snap trim。
     interval_set<snapid_t> to_trim;
     auto& removed_snaps_queue = get_osdmap()->get_removed_snaps_queue();
     auto p = removed_snaps_queue.find(info.pgid.pgid.pool());
@@ -3085,6 +3097,7 @@ void PeeringState::activate(
     to_trim.subtract(purged);
 
     ceph_assert(HAVE_FEATURE(upacting_features, SERVER_OCTOPUS));
+    // 先生成新 lease，但在所有副本完成 activation 前不安排下一次续租。
     renew_lease(pl->get_mnow());
     // do not schedule until we are actually activated
 
@@ -3094,7 +3107,7 @@ void PeeringState::activate(
     // the queue.
     info.purged_snaps.swap(purged);
 
-    // start up replicas
+    // 旧可读租约不再受已下线 OSD 约束时，清除其时间上界；随后刷新历史中的上界。
     if (prior_readable_down_osds.empty()) {
       dout(10) << "no prior_readable_down_osds to wait on, clearing ub"
 	       << dendl;
@@ -3103,6 +3116,8 @@ void PeeringState::activate(
     info.history.refresh_prior_readable_until_ub(pl->get_mnow(),
 						 prior_readable_until_ub);
 
+    // 逐个初始化参与 shard。根据副本的 last_update 和 backfill 进度，
+    // 选择仅发送 PGInfo、发送追赶日志，或从头开始 backfill。
     ceph_assert(!acting_recovery_backfill.empty());
     for (auto i = acting_recovery_backfill.begin();
 	 i != acting_recovery_backfill.end();
@@ -3124,20 +3139,23 @@ void PeeringState::activate(
       ceph_assert(pm_it != peer_missing.end());
       pg_missing_t& pm = pm_it->second;
 
+      // 在修改 pi 前记录它是否不存在；新建 PG 的副本还需要完整 past_intervals。
       bool needs_past_intervals = pi.dne();
 
-      // Save num_bytes for backfill reservation request, can't be negative
+      // 保存副本当前数据量，后续申请 backfill 资源时用于空间估算，不能为负。
       peer_bytes[peer] = std::max<int64_t>(0, pi.stats.stats.sum.num_bytes);
 
       if (pi.last_update == info.last_update) {
-        // empty log
+        // 副本版本已追平 primary
 	if (!pi.last_backfill.is_max())
+    // 只是记录日志：该副本的版本已追平，但对象 backfill 尚未结束，因此 activation 后还会继续 backfill。
 	  pl->get_clog_info() << info.pgid << " continuing backfill to osd."
 				<< peer
 				<< " from (" << pi.log_tail << "," << pi.last_update
 				<< "] " << pi.last_backfill
 				<< " to " << info.last_update;
 	if (!pi.is_empty()) {
+    // pi 非空：副本已有 PG，只需发送最新 PGInfo + lease。
 	  psdout(10) << "activate peer osd." << peer
 		     << " is up to date, queueing in pending_activators" << dendl;
           if (!info.partial_writes_last_complete.empty()) {
@@ -3155,6 +3173,8 @@ void PeeringState::activate(
 	    info,
 	    get_lease());
 	} else {
+    // pi 为空：它虽然在版本号意义上“追平”（通常两边都是初始版本），但副本端连 PG 实体都还不存在。
+    // 此时必须发送 MOSDPGLog，让副本创建/初始化该 PG；不能只发 PGInfo。
 	  psdout(10) << "activate peer osd." << peer
 		     << " is up to date, but sending pg_log anyway" << dendl;
 	  m = TOPNSPC::make_message<MOSDPGLog>(
@@ -3173,7 +3193,7 @@ void PeeringState::activate(
 	 * case since the replica in question would have to be significantly
 	 * behind.
 	 */
-	// backfill
+	// 副本无法由现有连续 PGLog 追上，重置其进度并从对象 backfill 起点开始。
 	pl->get_clog_debug() << info.pgid << " starting backfill to osd." << peer
 			       << " from (" << pi.log_tail << "," << pi.last_update
 			       << "] " << pi.last_backfill
@@ -3207,7 +3227,7 @@ void PeeringState::activate(
 
 	pm.clear();
       } else {
-	// catch up
+	// 副本尚可由 primary 保留的日志连续追上，只发送 last_update 之后的条目。
 	ceph_assert(pg_log.get_tail() <= pi.last_update);
 	m = TOPNSPC::make_message<MOSDPGLog>(
 	  i->shard, pg_whoami.shard,
@@ -3217,13 +3237,14 @@ void PeeringState::activate(
 	m->log.copy_after(cct, pg_log.get_log(), pi.last_update);
       }
 
-      // share past_intervals if we are creating the pg on the replica
+      // 新建副本 PG 时附带 past_intervals，使其拥有后续 peering 所需的区间历史。
       // based on whether our info for that peer was dne() *before*
       // updating pi.history in the backfill block above.
       if (m && needs_past_intervals)
 	m->past_intervals = past_intervals;
 
-      // update local version of peer's missing list!
+      // primary 同步维护它认为该副本的 missing；这只是内存中的恢复规划，
+      // 不是副本已经完成数据同步的确认。
       if (m && pi.last_backfill != hobject_t()) {
         for (auto p = m->log.log.begin(); p != m->log.log.end(); ++p) {
 	  if (p->soid <= pi.last_backfill &&
@@ -3238,13 +3259,14 @@ void PeeringState::activate(
       }
 
       if (m) {
+	// 带上当前 lease 后异步发送；副本本地提交完成会在之后回传激活信息。
 	dout(10) << "activate peer osd." << peer << " sending " << m->log
 		 << dendl;
 	m->lease = get_lease();
 	pl->send_cluster_message(peer.osd, std::move(m), get_osdmap_epoch());
       }
 
-      // peer now has
+      // 消息携带的日志已使副本逻辑版本追至 primary；last_complete 仍取决于 missing。
       pi.last_update = info.last_update;
 
       // update our missing
@@ -3258,7 +3280,7 @@ void PeeringState::activate(
       }
     }
 
-    // Set up missing_loc
+    // 汇总 acting/recovery/backfill 各 shard 的 missing，建立“哪个 shard 可能拥有对象”的索引。
     set<pg_shard_t> complete_shards;
     for (auto i = acting_recovery_backfill.begin();
 	 i != acting_recovery_backfill.end();
@@ -3279,7 +3301,7 @@ void PeeringState::activate(
       }
     }
 
-    // If necessary, create might_have_unfound to help us find our unfound objects.
+    // 对仍缺失的对象登记可作为恢复源的 shard，并找出可能存在但尚未定位的 unfound 对象。
     // NOTE: It's important that we build might_have_unfound before trimming the
     // past intervals.
     might_have_unfound.clear();
@@ -3323,23 +3345,26 @@ void PeeringState::activate(
 
       build_might_have_unfound();
 
-      // Always call now so update_calc_stats() will be accurate
+      // 现在就查询/标记 unfound，使随后计算的 PG degraded 统计准确。
       discover_all_missing(ctx.msgs);
 
     }
 
-    // num_objects_degraded if calculated should reflect this too, unless no
-    // missing and we are about to go clean.
+    // acting 数少于 pool 期望副本数时，即使可激活也应报告 UNDERSIZED。
     if (get_osdmap()->get_pg_size(info.pgid.pgid) > actingset.size()) {
       state_set(PG_STATE_UNDERSIZED);
     }
 
+    // primary 进入“等待所有 activation 提交确认”的中间状态；
+    // Active::react(AllReplicasActivated) 再按 acting 集是否可写设置 ACTIVE 或 PEERED。
     state_set(PG_STATE_ACTIVATING);
     pl->on_activate(std::move(to_trim));
   } else {
+    // 副本直接激活自己
     pl->on_replica_activate();
   }
   if (acting_set_writeable()) {
+    // 对可写 acting 集前滚 PGLog；所需对象回滚/删除动作写入同一个事务 t。
     PGLog::LogEntryHandlerRef rollbacker{pl->get_log_handler(t)};
     pg_log.roll_forward(&info, rollbacker.get());
   }
@@ -6663,17 +6688,26 @@ set<pg_shard_t> unique_osd_shard_set(const pg_shard_t & skip, const T &in)
 }
 
 /*---------Active---------*/
+/**
+ * 进入 primary 的 Active 状态：确定本轮 recovery/backfill 需向哪些远端 OSD
+ * 申请资源预留，
+ * 发起本地及副本激活，并等待参与副本提交确认后才完成真正的 active。
+ */
 PeeringState::Active::Active(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active"),
+    // 去掉本地 shard，并按 OSD 去重。一个 OSD 即使承载多个 shard，
+    // 也只发送一次 recovery 资源预留请求。
     remote_shards_to_reserve_recovery(
       unique_osd_shard_set(
 	context< PeeringMachine >().state->pg_whoami,
 	context< PeeringMachine >().state->acting_recovery_backfill)),
+    // backfill 的远端预留集合独立计算：它只针对 backfill target，未必等于 recovery 集合。
     remote_shards_to_reserve_backfill(
       unique_osd_shard_set(
 	context< PeeringMachine >().state->pg_whoami,
 	context< PeeringMachine >().state->backfill_targets)),
+    // 只有收到所有参与副本的激活提交确认后才置为 true。
     all_replicas_activated(false)
 {
   context< PeeringMachine >().log_enter(state_name);
@@ -6681,15 +6715,23 @@ PeeringState::Active::Active(my_context ctx)
 
   DECLARE_LOCALS;
 
+  // Active 只能由 primary 进入，且此时还未持有 backfill 的本地资源预留。
   ceph_assert(!ps->backfill_reserved);
   ceph_assert(ps->is_primary());
+
+  // 将 activation 产生的 PGInfo/PGLog 修改绑定到当前事务，并登记一次 flush；
+  // 后续 activation 完成条件会等待该 flush 的持久化回调。
   psdout(10) << "In Active, about to call activate" << dendl;
   ps->start_flush(context< PeeringMachine >().get_cur_transaction());
+
+  // 建立本 interval 的已 peered/activating 运行状态，向参与副本发送激活相关消息，
+  // 并准备 missing/recovery 状态；具体状态修改由 activate() 完成。
   ps->activate(context< PeeringMachine >().get_cur_transaction(),
 	       ps->get_osdmap_epoch(),
 	       context< PeeringMachine >().get_recovery_ctx());
 
   // everyone has to commit/ack before we are truly active
+  // // 将尚未完成 activation commit 的参与方显示为 blocker
   ps->blocked_by.clear();
   for (auto p = ps->acting_recovery_backfill.begin();
        p != ps->acting_recovery_backfill.end();
@@ -6862,28 +6904,41 @@ boost::statechart::result PeeringState::Active::react(const MTrim& trim)
   return discard_event();
 }
 
+/**
+ * 处理 acting 副本返回的 PGInfo：记录其 activation 事务已经提交，更新 lease 确认和 PG 统计；
+ * 当 primary 及所有参与副本都完成提交后，触发 all_activated_and_committed()，进入真正激活的收尾流程。
+ */
 boost::statechart::result PeeringState::Active::react(const MInfoRec& infoevt)
 {
   DECLARE_LOCALS;
+  // Active 的 MInfoRec 只能由 primary 处理；副本回报会从 ReplicaActive 路径处理。
   ceph_assert(ps->is_primary());
 
+  // 没有 acting/recovery/backfill 参与者就没有可等待的 activation 回报。
   ceph_assert(!ps->acting_recovery_backfill.empty());
   if (infoevt.lease_ack) {
+    // 副本可能同时携带 lease ack；先把该确认交给 lease 管理逻辑。
     ps->proc_lease_ack(infoevt.from.osd, *infoevt.lease_ack);
   }
-  // don't update history (yet) if we are active and primary; the replica
-  // may be telling us they have activated (and committed) but we can't
-  // share that until _everyone_ does the same.
+
+  // 只有当前 acting/recovery/backfill 集中的副本才参与本轮激活确认。
+  // peer_activated 是去重集合，重复到达的 MInfoRec 不会重复计数。
   if (ps->is_acting_recovery_backfill(infoevt.from) &&
       ps->peer_activated.insert(infoevt.from).second) {
     psdout(10) << " peer osd." << infoevt.from
 	       << " activated and committed" << dendl;
+
+    // 该副本已不再阻塞 PG 激活；blocked_by 主要用于对外发布当前等待状态。
     ps->blocked_by.erase(static_cast<int>(infoevt.from.shard));
     pl->publish_stats_to_osd();
+
+    // 收到最后一个参与副本的确认后，与 primary 自己的 ActivateCommitted 汇合。
     if (ps->peer_activated.size() == ps->acting_recovery_backfill.size()) {
       all_activated_and_committed();
     }
   }
+
+  // MInfoRec 已在当前状态消费；不发生状态转换，后续事件继续由 Active 处理。
   return discard_event();
 }
 
@@ -6957,11 +7012,19 @@ boost::statechart::result PeeringState::Active::react(const QueryUnfound& q)
   return discard_event();
 }
 
+/**
+ * 处理 primary 自己的 activation 事务提交事件：将本地 primary 加入 peer_activated，
+ * 并在它与所有 acting/recovery/backfill 副本都确认后，触发 all_activated_and_committed()。
+ */
 boost::statechart::result PeeringState::Active::react(
   const ActivateCommitted &evt)
 {
   DECLARE_LOCALS;
+
+  // ActivateCommitted 由 activate() 注册在 ObjectStore 事务提交回调中，
+  // 因此此时只能把 primary 自己标记为已激活且已提交。
   auto p = ps->peer_activated.insert(ps->pg_whoami);
+  // 同一 activation 事务不应重复产生本地提交事件。
   ceph_assert(p.second);
   psdout(10) << "_activate_committed " << evt.epoch
 	     << " peer_activated now " << ps->peer_activated
@@ -6972,47 +7035,65 @@ boost::statechart::result PeeringState::Active::react(
 	     << " same_interval_since "
 	     << ps->info.history.same_interval_since
 	     << dendl;
+  // acting/recovery/backfill 至少包含 primary；它定义本轮必须完成确认的参与者总数。
   ceph_assert(!ps->acting_recovery_backfill.empty());
+  // 副本确认由 Active::react(MInfoRec) 加入 peer_activated；数量齐全后统一收尾。
   if (ps->peer_activated.size() == ps->acting_recovery_backfill.size())
     all_activated_and_committed();
+
+  // 当前 ActivateCommitted 已消费；若尚有副本未确认，继续等待后续 MInfoRec。
   return discard_event();
 }
 
+/**
+ * 处理所有参与 shard 都完成 activation 提交后的事件：结束 ACTIVATING，
+ * 根据 acting 集是否可写设置 ACTIVE/PEERED，发布最终 PGInfo，并通知 OSD 层 activation 已完成。
+ */
 boost::statechart::result PeeringState::Active::react(const AllReplicasActivated &evt)
 {
 
   DECLARE_LOCALS;
   pg_t pgid = context< PeeringMachine >().spgid.pgid;
 
+  // 该事件表示 primary 和所有参与副本都已完成 activation；后续不再等待副本确认。
   all_replicas_activated = true;
 
+  // 清理本轮 activation/创建/合并准备阶段的临时状态位。
   ps->state_clear(PG_STATE_ACTIVATING);
   ps->state_clear(PG_STATE_CREATING);
   ps->state_clear(PG_STATE_PREMERGE);
 
   bool merge_target;
   if (ps->pool.info.is_pending_merge(pgid, &merge_target)) {
+    // 合并尚未真正执行时，PG 只能先标记为 PEERED，并保留 PREMERGE。
     ps->state_set(PG_STATE_PEERED);
     ps->state_set(PG_STATE_PREMERGE);
 
+    // acting 数量不足 pool 期望的 PG size 时，通知合并逻辑暂不可继续。
     if (ps->actingset.size() != ps->get_osdmap()->get_pg_size(pgid)) {
       if (merge_target) {
+	// 当前 PG 是合并目标：记录其源 PG 尚未准备好。
 	pg_t src = pgid;
 	src.set_ps(ps->pool.info.get_pg_num_pending());
 	ceph_assert(src.get_parent() == pgid);
 	pl->set_not_ready_to_merge_target(pgid, src);
       } else {
+	// 当前 PG 是合并源：记录它尚未满足合并目标的就绪条件。
 	pl->set_not_ready_to_merge_source(pgid);
       }
     }
   } else if (!ps->acting_set_writeable()) {
+    // acting 集不足 min_size 或不满足 stretch 约束，只能 peered，不能对外写入。
     ps->state_set(PG_STATE_PEERED);
   } else {
+    // acting 集满足写入条件，本轮 PG 正式进入 ACTIVE。
     ps->state_set(PG_STATE_ACTIVE);
   }
 
   auto mnow = pl->get_mnow();
+  // prior_readable_until_ub 是旧 interval 中某些 OSD 的读 lease 最晚有效时间
   if (ps->prior_readable_until_ub > mnow) {
+    // 旧 interval 的可读租约尚未到期；先保留 WAIT，直到该时间上界后再检查可读性。
     psdout(10) << " waiting for prior_readable_until_ub "
 	       << ps->prior_readable_until_ub << " > mnow " << mnow << dendl;
     ps->state_set(PG_STATE_WAIT);
@@ -7020,20 +7101,24 @@ boost::statechart::result PeeringState::Active::react(const AllReplicasActivated
       ps->last_peering_reset,
       ps->prior_readable_until_ub - mnow);
   } else {
+    // 没有未到期的旧租约约束，可以继续提供当前状态。
     psdout(10) << " mnow " << mnow << " >= prior_readable_until_ub "
 	       << ps->prior_readable_until_ub << dendl;
   }
 
   if (ps->pool.info.has_flag(pg_pool_t::FLAG_CREATING)) {
+    // pool 仍处于 creating 流程时，向上层确认该 PG 已完成创建/激活。
     pl->send_pg_created(pgid);
   }
 
   psdout(1) << __func__ << " AllReplicasActivated Activating complete" << dendl;
 
+  // activation 提交完成后推进 history 的 started 位置，并标记 PGInfo 需要持久化。
   ps->info.history.last_epoch_started = ps->info.last_epoch_started;
   ps->info.history.last_interval_started = ps->info.last_interval_started;
   ps->dirty_info = true;
 
+  // 把最新 PGInfo/lease 分享给副本，并发布统计；最后通知 OSD 后端完成 activation。
   ps->share_pg_info();
   pl->publish_stats_to_osd();
 
@@ -7080,30 +7165,36 @@ boost::statechart::result PeeringState::Active::react(const PgCreateEvt &evt)
   return discard_event();
 }
 
-/*
- * update info.history.last_epoch_started ONLY after we and all
- * replicas have activated AND committed the activate transaction
- * (i.e. the peering results are stable on disk).
+/**
+ * 在 primary 及所有参与副本都完成 activation 并提交事务后，执行激活收尾：
+ * 重新覆盖 lease、更新 degraded 统计，并投递 AllReplicasActivated，
+ * 由该事件处理函数推进 PG_STATE_ACTIVE/PG_STATE_PEERED 等最终状态。
+ *
+ * 只有此时 peering 结果才已经稳定持久化，才能推进 info.history.last_epoch_started。
  */
 void PeeringState::Active::all_activated_and_committed()
 {
   DECLARE_LOCALS;
   psdout(10) << "all_activated_and_committed" << dendl;
+
+  // 该收尾只由 primary 执行，且 peer_activated 必须覆盖本轮所有参与 shard。
   ceph_assert(ps->is_primary());
   ceph_assert(ps->peer_activated.size() == ps->acting_recovery_backfill.size());
   ceph_assert(!ps->acting_recovery_backfill.empty());
+
+  // blocked_by 为空表示没有仍在等待 activation 提交的副本。
   ceph_assert(ps->blocked_by.empty());
 
+  // 当前版本要求所有参与 OSD 支持 lease 机制。
   ceph_assert(HAVE_FEATURE(ps->upacting_features, SERVER_OCTOPUS));
-  // this is overkill when the activation is quick, but when it is slow it
-  // is important, because the lease was renewed by the activate itself but we
-  // don't know how long ago that was, and simply scheduling now may leave
-  // a gap in lease coverage.  keep it simple and aggressively renew.
+
+  // activation 期间可能耗时较长；activate() 生成的旧 lease 可能即将过期，
+  // 因此此处立即续租、发送给副本，并重新安排后续续租，避免可读性保护出现空洞。
   ps->renew_lease(pl->get_mnow());
   ps->send_lease();
   ps->schedule_renew_lease();
 
-  // Degraded?
+  // 按当前 missing/recovery 结果重新计算统计，并同步 PG_STATE_DEGRADED。
   ps->update_calc_stats();
   if (ps->info.stats.stats.sum.num_objects_degraded) {
     ps->state_set(PG_STATE_DEGRADED);
@@ -7111,6 +7202,8 @@ void PeeringState::Active::all_activated_and_committed()
     ps->state_clear(PG_STATE_DEGRADED);
   }
 
+  // 将“所有参与者已激活并提交”转换为状态机事件；
+  // 真正设置 ACTIVE/PEERED 的逻辑在 Active::react(AllReplicasActivated) 中执行。
   post_event(PeeringState::AllReplicasActivated());
 }
 
@@ -7776,6 +7869,7 @@ void PeeringState::GetInfo::exit()
 }
 
 /*------GetLog------------*/
+// GetLog 是 Peering 的子状态：在已有 pg_info 摘要后，选择日志源并取得实际 PGLog。
 PeeringState::GetLog::GetLog(my_context ctx)
   : my_base(ctx),
     NamedState(
@@ -7787,29 +7881,38 @@ PeeringState::GetLog::GetLog(my_context ctx)
 
   DECLARE_LOCALS;
 
+  // 输出 PGLog/missing 的异常诊断，便于识别无法形成连续日志的情况。
   ps->log_weirdness();
 
-  // adjust acting?
+  // 基于 GetInfo 收集的 pg_info 选择可恢复的 acting 候选，并给出应取得日志的 auth_log_shard。
+  // auth_log_shard，这次 primary 实际向其发送 LOG 查询、取得日志的副本 shard
   if (!ps->choose_acting(auth_log_shard, false, false,
 			 &context< Peering >().history_les_bound,
                          &repeat_getlog)) {
     if (!ps->want_acting.empty()) {
+      // want_acting 非空表示需要请求新的 acting 映射
+      // 转入 WaitActingChange，等待 OSDMap/pg_temp 接纳候选集。
       post_event(NeedActingChange());
     } else {
+      // 没有可恢复的组合，只能进入 Incomplete，不能安全地继续本轮 peering
       post_event(IsIncomplete());
     }
     return;
   }
 
-  // am i the best?
+  // 当前 primary 自己就是所选日志源时，本地已有全部需要的日志，无需网络请求。
   if (auth_log_shard == ps->pg_whoami) {
     post_event(GotLog());
     return;
   }
 
+  // 远端日志源的摘要已在 GetInfo 阶段写入 peer_info。
   const pg_info_t& best = ps->peer_info[auth_log_shard];
 
-  // am i broken?
+  // ps->info.last_update 是本地 primary 已应用到的最新版本
+  // best.log_tail 是权威日志源仍保留的日志起点边界，早于它的日志已经被裁剪
+  // 本地 last_update 早于权威日志的 log_tail，二者之间的日志已被权威源裁剪，
+  // 无法通过日志补齐这段缺口，因此当前 PG 不能继续正常 peering。
   if (ps->info.last_update < best.log_tail) {
     psdout(10) << " not contiguous with osd." << auth_log_shard << ", down" << dendl;
     repeat_getlog = false;
@@ -7817,7 +7920,9 @@ PeeringState::GetLog::GetLog(my_context ctx)
     return;
   }
 
-  // how much log to request?
+  // 默认只需从本地最后更新之后取得日志；随后为可加入 acting_recovery_backfill 的
+  // 较旧副本将起点回退，使权威日志能够覆盖它们的日志恢复范围。
+  // acting_recovery_backfill 是本轮 peering 选出的“数据一致性参与者”集合，类型是 std::set<pg_shard_t>。
   eversion_t request_log_from = ps->info.last_update;
   ceph_assert(!ps->acting_recovery_backfill.empty());
   for (auto p = ps->acting_recovery_backfill.begin();
@@ -7830,16 +7935,17 @@ PeeringState::GetLog::GetLog(my_context ctx)
       request_log_from = ri.last_update;
   }
 
-  // how much?
+  // 向所选日志源发送异步 LOG 查询，回复以 MLogRec 到达 GetLog::react()。
   psdout(10) << " requesting log from osd." << auth_log_shard << dendl;
   context<PeeringMachine>().send_query(
     auth_log_shard.osd,
     pg_query_t(
       pg_query_t::LOG,
       auth_log_shard.shard, ps->pg_whoami.shard,
-      request_log_from, ps->info.history,
-      ps->get_osdmap_epoch()));
+	  request_log_from, ps->info.history,
+	  ps->get_osdmap_epoch()));
 
+  // GetLog 同时只等待这个权威日志源；其 down/回复会驱动后续状态处理。
   ceph_assert(ps->blocked_by.empty());
   ps->blocked_by.insert(auth_log_shard.osd);
   pl->publish_stats_to_osd();
@@ -7861,45 +7967,71 @@ boost::statechart::result PeeringState::GetLog::react(const AdvMap& advmap)
   return forward_event();
 }
 
+/**
+ * 接收本轮 LOG 查询的回复：只接受选定日志获取 shard 的 MLogRec，
+ * 暂存其 MOSDPGLog 后投递 GotLog，由统一路径合并日志并推进到 GetMissing。
+ */
 boost::statechart::result PeeringState::GetLog::react(const MLogRec& logevt)
 {
+  // GetLog 同时只接受一份有效日志回复；msg 已存在表示重复处理或状态机顺序异常。
   ceph_assert(!msg);
+
+  // 只信任本轮 choose_acting() 选定的日志获取 shard，忽略迟到或无关 OSD 的日志。
   if (logevt.from != auth_log_shard) {
     psdout(10) << "GetLog: discarding log from "
 		       << "non-auth_log_shard osd." << logevt.from << dendl;
     return discard_event();
   }
+
+  // 不在当前事件中直接合并日志：先保留消息，再由 GotLog 处理本地、远端两种
+  // 日志来源共用的后续逻辑。
   psdout(10) << "GetLog: received master log from osd."
 		     << logevt.from << dendl;
   msg = logevt.msg;
+
+  // 内部事件稍后触发 GetLog::react(GotLog)。
   post_event(GotLog());
+
+  // MLogRec 已消费；状态转换由刚投递的 GotLog 完成。
   return discard_event();
 }
 
+/**
+ * 统一完成 GetLog：远端日志到达时合并其 PGLog/missing；本地就是日志源时直接继续。
+ * 必要时处理 EC 稀疏日志的二次选择，否则登记本轮事务的 flush 并进入 GetMissing。
+ */
 boost::statechart::result PeeringState::GetLog::react(const GotLog&)
 {
-
   DECLARE_LOCALS;
   psdout(10) << "leaving GetLog" << dendl;
+
+  // msg 仅在远端 MLogRec 到达后存在；为空表示本地本身就是日志获取 shard，因而没有远端日志需要合并。
   if (msg) {
+    // 将远端 pg_info、PGLog 和 missing 合并到本地 PeeringState，
+    // 并把元数据修改记录到本轮 PeeringCtx 持有的事务中。
     psdout(10) << "processing master log" << dendl;
     ps->proc_master_log(context<PeeringMachine>().get_cur_transaction(),
 			msg->info, std::move(msg->log), std::move(msg->missing),
 			auth_log_shard);
+
     if (repeat_getlog) {
-      // Only EC pools with ec_optimizations enabled:
-      // Our log was behind that of the auth_log_shard which was a non-primary
-      // with a sparse log. We have just got a log from a primary shard to
-      // catch up and now need to recheck if we need to rollback the log to
-      // the auth_log_shard. Discard the received missing log as this does
-      // may not be consistent with the authorative log
+      // 仅限启用 EC 优化的特殊情况：先从 primary shard 取得完整日志以追平后，
+      // 需要重新选择日志 shard，判断是否还须依据原来的非 primary 稀疏日志回滚。
+      // 刚收到的 missing 不能作为该次重新选择的依据，先删除其 peer_missing 记录。
       ps->peer_missing.erase(auth_log_shard);
       psdout(10) << "repeating auth_log_shard selection" << dendl;
+
+      // reaction 表将 RepeatGetLog 转回新的 GetLog 实例；本轮不进入 GetMissing。
       post_event(RepeatGetLog());
       return discard_event();
     }
   }
+
+  // 登记当前事务的 flush。状态机可继续收集 missing，但后续 activation 会等待
+  // 这次 flush 完成，避免用未完成的 PG 状态进入 active。
   ps->start_flush(context< PeeringMachine >().get_cur_transaction());
+
+  // 已得到用于确定权威历史的日志，下一步查询各参与副本的 missing 集合。
   return transit< GetMissing >();
 }
 
@@ -8230,11 +8362,20 @@ PeeringState::GetMissing::GetMissing(my_context ctx)
   }
 }
 
+/**
+ * 接收 GetMissing 阶段的 LOG/FULLLOG 回复：合并该副本的日志和 missing 集合；
+ * 所有查询完成后，等待 up_thru 确认或投递 Activate 开始激活。
+ */
 boost::statechart::result PeeringState::GetMissing::react(const MLogRec& logevt)
 {
   DECLARE_LOCALS;
 
+  // 该副本已返回 missing 信息，不再阻塞本阶段；重复/非请求回复即使到达，
+  // erase()也只是无副作用地返回，不会破坏等待集合。
   peer_missing_requested.erase(logevt.from);
+
+  // 处理对端携带的 pg_info、日志条目和 missing 集合，更新 peer_info、peer_missing
+  // 及本地 PGLog 对该副本的认知；missing 的所有权通过 move 转入处理流程。
   ps->proc_replica_log(logevt.msg->info,
 		       logevt.msg->log,
 		       std::move(logevt.msg->missing),
@@ -8242,15 +8383,21 @@ boost::statechart::result PeeringState::GetMissing::react(const MLogRec& logevt)
 
   if (peer_missing_requested.empty()) {
     if (ps->need_up_thru) {
+    // up_thru: Monitor 已确认该 OSD 至少持续处于 up 状态直到哪个 OSDMap epoch。
+    // 当前 OSD 的 up_thru 尚小于本 PG interval 的起始 epoch；
+    // 等待 Monitor 在后续 OSDMap 中推进 up_thru 后才能激活。
       psdout(10) << " still need up_thru update before going active"
-			 << dendl;
+		 << dendl;
       post_event(NeedUpThru());
     } else {
+      // missing 信息已收齐且 up_thru 已满足，投递 Activate 进入 peering 的激活流程。
       psdout(10) << "Got last missing, don't need missing "
-			 << "posting Activate" << dendl;
+		 << "posting Activate" << dendl;
       post_event(Activate(ps->get_osdmap_epoch()));
     }
   }
+
+  // 当前 MLogRec 已消费；上面投递的内部事件会在随后由状态机分发。
   return discard_event();
 }
 
