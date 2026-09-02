@@ -6372,6 +6372,10 @@ void PeeringState::Activating::exit()
   pl->get_peering_perf().tinc(rs_activating_latency, dur);
 }
 
+/**
+ * 等待本地 recovery IO 资源预留：只有本地和远端资源都准备好后，
+ * PG 才会进入 Recovering 状态并由 OSD recovery 队列执行恢复操作。
+ */
 PeeringState::WaitLocalRecoveryReserved::WaitLocalRecoveryReserved(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/WaitLocalRecoveryReserved")
@@ -6379,7 +6383,8 @@ PeeringState::WaitLocalRecoveryReserved::WaitLocalRecoveryReserved(my_context ct
   context< PeeringMachine >().log_enter(state_name);
   DECLARE_LOCALS;
 
-  // Make sure all nodes that part of the recovery aren't full
+  // recovery 涉及的 acting/recovery/backfill OSD 不能处于 full 状态；
+  // 若空间不足，投递 RecoveryTooFull，让状态机安排延迟重试。
   if (!ps->cct->_conf->osd_debug_skip_full_check_in_recovery &&
       ps->get_osdmap()->check_full(ps->acting_recovery_backfill)) {
     post_event(RecoveryTooFull());
@@ -6387,7 +6392,10 @@ PeeringState::WaitLocalRecoveryReserved::WaitLocalRecoveryReserved(my_context ct
   }
 
   ps->state_clear(PG_STATE_RECOVERY_TOOFULL);
+  // 已开始等待 recovery 资源；资源尚未批准前，recovery 不会真正启动。
   ps->state_set(PG_STATE_RECOVERY_WAIT);
+  // 预留成功时重新排队 LocalRecoveryReserved，驱动状态机转到 WaitRemoteRecoveryReserved；
+  // 预留被抢占时排队 DeferRecovery，稍后重试。
   pl->request_local_background_io_reservation(
     ps->get_recovery_priority(),
     std::make_unique<PGPeeringEvent>(
@@ -6398,6 +6406,7 @@ PeeringState::WaitLocalRecoveryReserved::WaitLocalRecoveryReserved(my_context ct
       ps->get_osdmap_epoch(),
       ps->get_osdmap_epoch(),
       DeferRecovery(0.0)));
+  // 对外发布 PG 当前处于等待 recovery 资源的状态。
   pl->publish_stats_to_osd();
 }
 
@@ -6435,22 +6444,36 @@ void PeeringState::WaitLocalRecoveryReserved::exit()
   pl->get_peering_perf().tinc(rs_waitlocalrecoveryreserved_latency, dur);
 }
 
+/**
+ * 等待参与 recovery 的远端 OSD 预留资源；构造时从第一个远端 shard 开始，
+ * 逐个发送 recovery reservation 请求，全部完成后再进入 Recovering。
+ */
 PeeringState::WaitRemoteRecoveryReserved::WaitRemoteRecoveryReserved(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/WaitRemoteRecoveryReserved"),
+    // 记录下一个需要发送 reservation 请求的远端 shard。
     remote_recovery_reservation_it(context< Active >().remote_shards_to_reserve_recovery.begin())
 {
+  // 记录进入状态；RemoteRecoveryReserved 是启动逐个请求流程的内部事件，
+  // 此时并不表示任何远端 OSD 已经完成资源预留。
   context< PeeringMachine >().log_enter(state_name);
   post_event(RemoteRecoveryReserved());
 }
 
+/**
+ * 推进远端 recovery 资源预留：每次处理一个事件就向下一个远端 shard 发送请求；
+ * 所有远端都完成后，通知状态机进入 Recovering。
+ */
 boost::statechart::result
 PeeringState::WaitRemoteRecoveryReserved::react(const RemoteRecoveryReserved &evt) {
   DECLARE_LOCALS;
 
   if (remote_recovery_reservation_it !=
       context< Active >().remote_shards_to_reserve_recovery.end()) {
+    // recovery 资源预留只针对远端 shard；primary 自身已经在本地预留阶段处理。
     ceph_assert(*remote_recovery_reservation_it != ps->pg_whoami);
+    // 向当前迭代位置对应的 OSD 请求 recovery 资源，
+    // 并携带 PG、shard、epoch 和 recovery 优先级，供对端执行资源检查和预留。
     pl->send_cluster_message(
       remote_recovery_reservation_it->osd,
       TOPNSPC::make_message<MRecoveryReserve>(
@@ -6462,6 +6485,7 @@ PeeringState::WaitRemoteRecoveryReserved::react(const RemoteRecoveryReserved &ev
       ps->get_osdmap_epoch());
     ++remote_recovery_reservation_it;
   } else {
+    // 所有远端 reservation 请求都已完成，转入统一处理全部远端已预留事件。
     post_event(AllRemotesReserved());
   }
   return discard_event();
@@ -6487,18 +6511,28 @@ void PeeringState::WaitRemoteRecoveryReserved::exit()
   pl->get_peering_perf().tinc(rs_waitremoterecoveryreserved_latency, dur);
 }
 
+/**
+ * 本地和所有远端 recovery 资源都已预留，进入实际 recovery 阶段；
+ * 同时把 PG 加入 OSD 的 recovery 调度队列。
+ */
 PeeringState::Recovering::Recovering(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/Recovering")
 {
+  // 记录进入 Recovering 状态。
   context< PeeringMachine >().log_enter(state_name);
 
   DECLARE_LOCALS;
+  // 已不再等待资源，也不再处于此前因 full 而暂停的状态。
   ps->state_clear(PG_STATE_RECOVERY_WAIT);
   ps->state_clear(PG_STATE_RECOVERY_TOOFULL);
+  // 对外标记 PG 正在执行 recovery；具体对象操作由后续 recovery worker 执行。
   ps->state_set(PG_STATE_RECOVERING);
+  // 通知 PrimaryLogPG reservation 已完成；该回调会把 PG 放入 OSD recovery 队列。
   pl->on_recovery_reserved();
+  // activation 必须已经结束，recovery 不能与 activation 并行启动。
   ceph_assert(!ps->state_test(PG_STATE_ACTIVATING));
+  // 发布更新后的 PG 状态和 recovery 等待信息。
   pl->publish_stats_to_osd();
 }
 
