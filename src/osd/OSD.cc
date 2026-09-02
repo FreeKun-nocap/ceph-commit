@@ -2079,12 +2079,18 @@ void OSDService::prune_sent_ready_to_merge(const OSDMapRef& osdmap)
 
 // ---
 
+/**
+ * 将一个等待中的 PG 构造成 PGRecovery 调度项并加入 OSD 操作队列；
+ * reserved_pushes 表示本次调度已经为该 PG 预留的 recovery push 槽位。
+ */
 void OSDService::_queue_for_recovery(
   pg_awaiting_throttle_t p,
   uint64_t reserved_pushes)
 {
+  // 调用者在 recovery_lock 保护下进入，确保配额和等待队列状态一致。
   ceph_assert(ceph_mutex_is_locked_by_me(recovery_lock));
 
+  // mClock 按本次预留的 push 数量计算调度成本；旧调度器使用固定 recovery 成本。
   uint64_t cost_for_queue = [this, &reserved_pushes, &p] {
     if (op_queue_type_t::mClockScheduler == osd->osd_op_queue_type()) {
       return p.cost_per_object * reserved_pushes;
@@ -2094,10 +2100,13 @@ void OSDService::_queue_for_recovery(
        * meaningful amount of throttling.  This branch should be removed after
        * Reef.
        */
+      // WeightedPriorityQueue 沿用固定成本，兼容旧版节流行为。
       return cct->_conf->osd_recovery_cost;
     }
   }();
 
+  // 创建 PGRecovery：记录目标 PG、排队时的 map epoch、预留 push 数和 recovery 优先级，
+  // 再由调度 worker 的 PGRecovery::run() 调用 OSD::do_recovery()。
   enqueue_back(
     OpSchedulerItem(
       unique_ptr<OpSchedulerItem::OpQueueable>(
@@ -10123,19 +10132,28 @@ void OSDService::queue_check_readable(spg_t spgid,
 // =========================================================
 // RECOVERY
 
+/**
+ * 根据当前 recovery 配额，把等待中的 PG 转换为可调度的 PGRecovery 项；
+ * 每个 PG 先预留一定数量的 recovery push 槽位，再交给后续 worker 执行。
+ */
 void OSDService::_maybe_queue_recovery() {
+  // recovery_lock 必须由调用者持有，保护等待队列和 push 配额计数。
   ceph_assert(ceph_mutex_is_locked_by_me(recovery_lock));
   uint64_t available_pushes;
+  // 只要还有等待的 PG 且当前没有被暂停、延迟或达到并发上限，就继续出队。
   while (!awaiting_throttle.empty() &&
 	 _recover_now(&available_pushes)) {
+    // 单次启动量同时受当前可用配额和单次启动上限限制。
     uint64_t to_start = std::min(
       available_pushes,
       cct->_conf->osd_recovery_max_single_start);
+    // 将队首 PG 包装为 PGRecovery 调度项；此时只登记任务，不执行具体对象 IO。
     _queue_for_recovery(awaiting_throttle.front(), to_start);
     awaiting_throttle.pop_front();
     dout(10) << __func__ << " starting " << to_start
 	     << ", recovery_ops_reserved " << recovery_ops_reserved
 	     << " -> " << (recovery_ops_reserved + to_start) << dendl;
+    // 先计入 reserved，避免循环或并发路径再次使用同一批 recovery 配额。
     recovery_ops_reserved += to_start;
   }
 }
@@ -10189,10 +10207,15 @@ unsigned OSDService::get_target_pg_log_entries() const
   }
 }
 
+/**
+ * 执行一个 PGRecovery 调度项：按 recovery sleep 配置决定立即执行或延迟重排，
+ * 正常情况下调用 PG::start_recovery_ops() 启动本轮对象恢复，并释放预留配额。
+ */
 void OSD::do_recovery(
   PG *pg, epoch_t queued, uint64_t reserved_pushes, int priority,
   ThreadPool::TPHandle &handle)
 {
+  // 统计本轮实际启动的 recovery operation 数量。
   uint64_t started = 0;
 
   /*
@@ -10203,12 +10226,18 @@ void OSD::do_recovery(
    * queue_recovery_after_sleep. (osd_recovery_sleep_degraded will be
    * used instead of osd_recovery_sleep when pg is degraded)
    */
+  // 从 Ceph Quincy（17.x） 开始，默认使用 mclock 作为调度器，recovery_sleep 机制会失效
+  // osd_recovery_sleep 和 osd_recovery_sleep_degraded 在 OSD 构造器中，会被强制覆盖为 0
+  // 在运行中，如果用户修改了配置文件并设置了非零值，在 handle_conf_change 中，也会被强制覆盖为 0
   float recovery_sleep = pg->is_degraded() 
                         ? get_osd_recovery_sleep_degraded() 
                         : get_osd_recovery_sleep();
   {
+    // sleep_lock 保护 recovery 的全局延迟调度状态。
     std::lock_guard l(service.sleep_lock);
     if (recovery_sleep > 0 && service.recovery_needs_sleep) {
+      // 上一轮 recovery 已经建立了 sleep 节奏；当前任务先注册定时回调，
+      // 到期后使用原参数重新进入 recovery 队列。
       PGRef pgref(pg);
       auto recovery_requeue_callback = new LambdaContext(
 	[this, pgref, queued, reserved_pushes, priority](int r) {
@@ -10217,9 +10246,11 @@ void OSD::do_recovery(
 	         << ", re-queuing recovery" << dendl;
 	std::lock_guard l(service.sleep_lock);
         service.recovery_needs_sleep = false;
+        // 重新排队时保留原 PG、epoch、预留 push 数和优先级。
         service.queue_recovery_after_sleep(pgref.get(), queued, reserved_pushes, priority);
       });
 
+      // 第一次 recovery 或上一轮任务已实际排程时，从当前时间开始计算下一次 sleep。
       // This is true for the first recovery op and when the previous recovery op
       // has been scheduled in the past. The next recovery op is scheduled after
       // completing the sleep from now.
@@ -10233,16 +10264,19 @@ void OSD::do_recovery(
 				       recovery_requeue_callback);
       dout(20) << "Recovery event scheduled at "
                << service.recovery_schedule_time << dendl;
+      // 当前任务尚未执行，预留配额将在延迟任务真正出队后释放。
       return;
     }
   }
 
   {
     {
+      // 当前任务开始执行后，下一轮 recovery 可以依据本次调度重新计算 sleep。
       std::lock_guard l(service.sleep_lock);
       service.recovery_needs_sleep = true;
     }
 
+    // PG 自排队以来发生过 reset，说明本轮 recovery 已失去适用的状态，直接放弃。
     if (pg->pg_has_reset_since(queued)) {
       goto out;
     }
@@ -10251,12 +10285,13 @@ void OSD::do_recovery(
 #ifdef DEBUG_RECOVERY_OIDS
     dout(20) << "  active was " << service.recovery_oids[pg->pg_id] << dendl;
 #endif
-
+    // 由 PG 根据 missing、replica 和 backfill 状态选择并启动具体对象操作。
     bool do_unfound = pg->start_recovery_ops(reserved_pushes, handle, &started);
     dout(10) << "do_recovery started " << started << "/" << reserved_pushes
 	     << " on " << *pg << dendl;
 
     if (do_unfound) {
+      // recovery 无法直接找到部分对象时，查询 unfound 对象可能存在的位置，尝试发现新的恢复来源
       PeeringCtx rctx;
       rctx.handle = &handle;
       pg->find_unfound(queued, rctx);
@@ -10265,6 +10300,7 @@ void OSD::do_recovery(
   }
 
  out:
+  // 本轮调度预留的 push 槽位已不再由 PGRecovery 持有，统一归还给 OSDService。
   ceph_assert(started <= reserved_pushes);
   service.release_reserved_pushes(reserved_pushes);
 }
