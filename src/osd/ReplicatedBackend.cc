@@ -134,17 +134,30 @@ ReplicatedBackend::ReplicatedBackend(
   pct_callback(this)
 {}
 
+/**
+ * 提交本轮累计的 replicated recovery 操作：
+ * 分别发送 push、pull 和 delete 请求，完成后释放保存这些待执行操作的 RPGHandle。
+ */
 void ReplicatedBackend::run_recovery_op(
   PGBackend::RecoveryHandle *_h,
   int priority)
 {
+  // _h 由本 ReplicatedBackend::open_recovery_op() 创建，实际类型为 RPGHandle。
   RPGHandle *h = static_cast<RPGHandle *>(_h);
+  // primary 向缺失副本推送对象数据。
   send_pushes(priority, h->pushes);
+  // primary 从拥有对象的副本拉取对象数据。
   send_pulls(priority, h->pulls);
+  // 将 primary 已确认删除的对象同步删除到副本。
   send_recovery_deletes(priority, h->deletes);
+  // 三类操作已经交给 backend 发送/处理，释放本轮临时操作集合。
   delete h;
 }
 
+/**
+ * 根据对象在本地是否缺失，准备一次对象 recovery：
+ * 本地缺失时从 peer pull，本地已有对象时将其 push 到缺失或版本落后的副本。
+ */
 int ReplicatedBackend::recover_object(
   const hobject_t &hoid,
   eversion_t v,
@@ -154,10 +167,11 @@ int ReplicatedBackend::recover_object(
   )
 {
   dout(10) << __func__ << ": " << hoid << dendl;
+  // RPGHandle 收集本轮待发送的 pull/push 操作，稍后由 run_recovery_op() 统一提交。
   RPGHandle *h = static_cast<RPGHandle *>(_h);
   if (get_parent()->get_local_missing().is_missing(hoid)) {
     ceph_assert(!obc);
-    // pull
+    // primary 本地没有对象，不能以 obc 作为数据源，准备从拥有该版本的 peer 拉取。
     prepare_pull(
       v,
       hoid,
@@ -165,11 +179,13 @@ int ReplicatedBackend::recover_object(
       h);
   } else {
     ceph_assert(obc);
+    // primary 本地持有对象上下文，准备向指定副本推送对象数据。
     int started = start_pushes(
       hoid,
       obc,
       h);
     if (started < 0) {
+      // push 准备失败时清除该对象的临时 push 状态，并把错误返回给上层。
       pushing[hoid].clear();
       return started;
     }
@@ -1620,6 +1636,10 @@ void ReplicatedBackend::calc_head_subsets(
 	   << "  clone_subsets " << clone_subsets << dendl;
 }
 
+/**
+ * 计算恢复 snap clone 时可由 peer 已有 clone 复用的数据范围；
+ * 结果写入 clone_subsets，未找到可复用来源的范围保留在 data_subset 中。
+ */
 void ReplicatedBackend::calc_clone_subsets(
   SnapSet& snapset, const hobject_t& soid,
   const pg_missing_t& missing,
@@ -1628,19 +1648,23 @@ void ReplicatedBackend::calc_clone_subsets(
   map<hobject_t, interval_set<uint64_t>>& clone_subsets,
   ObcLockManager &manager)
 {
+  // 初始假设需要发送整个 clone，后续再用可复用范围扣除它。
   dout(10) << "calc_clone_subsets " << soid
 	   << " clone_overlap " << snapset.clone_overlap << dendl;
 
   uint64_t size = snapset.clone_size[soid.snap];
+  // clone 的完整数据范围为 [0, size)。
   if (size)
     data_subset.insert(0, size);
 
   if (get_parent()->get_pool().allow_incomplete_clones()) {
+    // 允许不完整 clone 时不依赖 clone overlap，直接发送完整数据。
     dout(10) << __func__ << ": caching (was) enabled, skipping clone subsets" << dendl;
     return;
   }
 
   if (!cct->_conf->osd_recover_clone_overlap) {
+    // 配置关闭 clone overlap 优化，保留完整 data_subset。
     dout(10) << "calc_clone_subsets " << soid << " -- osd_recover_clone_overlap disabled" << dendl;
     return;
   }
@@ -1650,7 +1674,7 @@ void ReplicatedBackend::calc_clone_subsets(
     if (snapset.clones[i] == soid.snap)
       break;
 
-  // any overlap with next older clone?
+  // 从当前 clone 向更旧的 clone 查找一个可复用的数据来源。
   interval_set<uint64_t> cloning;
   interval_set<uint64_t> prev;
   if (size)
@@ -1658,13 +1682,15 @@ void ReplicatedBackend::calc_clone_subsets(
   for (int j=i-1; j>=0; j--) {
     hobject_t c = soid;
     c.snap = snapset.clones[j];
+    // 逐步计算当前 clone 与该旧 clone 之间仍可共享的范围。
     prev.intersection_of(snapset.clone_overlap[snapset.clones[j]]);
     if (!missing.is_missing(c) &&
-	c < last_backfill &&
-	get_parent()->try_lock_for_read(c, manager)) {
+	    c < last_backfill &&
+	    get_parent()->try_lock_for_read(c, manager)) {
       dout(10) << "calc_clone_subsets " << soid << " has prev " << c
 	       << " overlap " << prev << dendl;
       clone_subsets[c] = prev;
+      // 记录该旧 clone 可提供的范围，并停止继续向更旧版本搜索。
       cloning.union_of(prev);
       break;
     }
@@ -1672,13 +1698,14 @@ void ReplicatedBackend::calc_clone_subsets(
 	     << " overlap " << prev << dendl;
   }
 
-  // overlap with next newest?
+  // 再从当前 clone 向更新的 clone 查找一个可复用的数据来源。
   interval_set<uint64_t> next;
   if (size)
     next.insert(0, size);
   for (unsigned j=i+1; j<snapset.clones.size(); j++) {
     hobject_t c = soid;
     c.snap = snapset.clones[j];
+    // 逐步计算当前 clone 与该新 clone 之间仍可共享的范围。
     next.intersection_of(snapset.clone_overlap[snapset.clones[j-1]]);
     if (!missing.is_missing(c) &&
 	c < last_backfill &&
@@ -1686,6 +1713,7 @@ void ReplicatedBackend::calc_clone_subsets(
       dout(10) << "calc_clone_subsets " << soid << " has next " << c
 	       << " overlap " << next << dendl;
       clone_subsets[c] = next;
+      // 合并该新 clone 可提供的范围，并停止继续向更新版本搜索。
       cloning.union_of(next);
       break;
     }
@@ -1694,6 +1722,7 @@ void ReplicatedBackend::calc_clone_subsets(
   }
 
   if (cloning.num_intervals() > g_conf().get_val<uint64_t>("osd_recover_clone_overlap_limit")) {
+    // 可复用范围过于零散时，优化收益不足；释放锁并退回完整发送。
     dout(10) << "skipping clone, too many holes" << dendl;
     get_parent()->release_locks(manager);
     clone_subsets.clear();
@@ -1701,7 +1730,7 @@ void ReplicatedBackend::calc_clone_subsets(
   }
 
 
-  // what's left for us to push?
+  // 从完整数据范围中扣除 peer 可复用的部分，留下实际需要发送的数据。
   data_subset.subtract(cloning);
 
   dout(10) << "calc_clone_subsets " << soid
@@ -1826,31 +1855,35 @@ void ReplicatedBackend::prepare_pull(
   pull_info.lock_manager = std::move(lock_manager);
 }
 
-/*
+/**
  * intelligently push an object to a replica.  make use of existing
  * clones/heads and dup data ranges where possible.
+ *
+ * 为一个 peer 准备 PushOp：根据对象是 snap clone 还是 head，
+ * 计算 peer 可复用的 clone 数据和 primary 必须发送的数据范围，尽量避免传输重复数据。
  */
 int ReplicatedBackend::prep_push_to_replica(
   ObjectContextRef obc, const hobject_t& soid, pg_shard_t peer,
   PushOp *pop, bool cache_dont_need)
 {
+  // oi.version 是本次 recovery 要同步的对象版本；size 用于日志和数据范围计算。
   const object_info_t& oi = obc->obs.oi;
   uint64_t size = obc->obs.oi.size;
 
   dout(10) << __func__ << ": " << soid << " v" << oi.version
 	   << " size " << size << " to osd." << peer << dendl;
 
+  // clone_subsets 是 peer 可从其已有 clone 复用的范围；data_subset 是仍需从 primary 发送的范围。
   map<hobject_t, interval_set<uint64_t>> clone_subsets;
   interval_set<uint64_t> data_subset;
 
   ObcLockManager lock_manager;
-  // are we doing a clone on the replica?
+  // 历史 snap clone：可尝试基于 peer 已有的相邻 clone 复用数据。
   if (soid.snap && soid.snap < CEPH_NOSNAP) {
     hobject_t head = soid;
     head.snap = CEPH_NOSNAP;
 
-    // try to base push off of clones that succeed/preceed poid
-    // we need the head (and current SnapSet) locally to do that.
+    // 复用 clone 数据需要本地 head 及其当前 SnapSet；head 缺失时只能完整发送 clone。
     if (get_parent()->get_local_missing().is_missing(head)) {
       dout(15) << "push_to_replica missing head " << head << ", pushing raw clone" << dendl;
       return prep_push(obc, soid, peer, pop, cache_dont_need);
@@ -1859,6 +1892,7 @@ int ReplicatedBackend::prep_push_to_replica(
     SnapSetContext *ssc = obc->ssc;
     ceph_assert(ssc);
     dout(15) << "push_to_replica snapset is " << ssc->snapset << dendl;
+    // 把 SnapSet 一并放入 recovery 信息，让 target 能按相同的快照关系重建对象。
     pop->recovery_info.ss = ssc->snapset;
     map<pg_shard_t, pg_missing_t>::const_iterator pm =
       get_parent()->get_shard_missing().find(peer);
@@ -1866,6 +1900,7 @@ int ReplicatedBackend::prep_push_to_replica(
     map<pg_shard_t, pg_info_t>::const_iterator pi =
       get_parent()->get_shard_info().find(peer);
     ceph_assert(pi != get_parent()->get_shard_info().end());
+    // 结合 peer 的 missing 表和已完成 backfill 边界，计算需发送范围与可复用 clone 范围。
     calc_clone_subsets(
       ssc->snapset, soid,
       pm->second,
@@ -1873,11 +1908,11 @@ int ReplicatedBackend::prep_push_to_replica(
       data_subset, clone_subsets,
       lock_manager);
   } else if (soid.snap == CEPH_NOSNAP) {
-    // pushing head or unversioned object.
-    // base this on partially on replica's clones?
+    // 当前 head（或无版本对象）也可能复用 peer 现有 clone 中的数据。
     SnapSetContext *ssc = obc->ssc;
     ceph_assert(ssc);
     dout(15) << "push_to_replica snapset is " << ssc->snapset << dendl;
+    // 计算 head 的最小发送范围及可作为来源的 peer clone 范围。
     calc_head_subsets(
       obc,
       ssc->snapset, soid, get_parent()->get_shard_missing().find(peer)->second,
@@ -1886,6 +1921,7 @@ int ReplicatedBackend::prep_push_to_replica(
       lock_manager);
   }
 
+  // 将版本、数据范围、可复用 clone 和必要锁状态写入具体 PushOp。
   return prep_push(
     obc,
     soid,
@@ -2312,20 +2348,28 @@ void ReplicatedBackend::handle_push(
   }
 }
 
+/**
+ * 将待恢复对象按目标副本组织成 MOSDPGPush 消息并发送；
+ * 单条消息会受对象数量和估算成本上限约束，避免一次 push 过大。
+ */
 void ReplicatedBackend::send_pushes(int prio, map<pg_shard_t, vector<PushOp> > &pushes)
 {
+  // pushes 按目标 PG shard 分组；每组对应一个远端副本。
   for (map<pg_shard_t, vector<PushOp> >::iterator i = pushes.begin();
        i != pushes.end();
        ++i) {
+    // 获取到目标 OSD 的集群连接；连接暂不可用时，本轮不发送该组 push。
     ConnectionRef con = get_parent()->get_con_osd_cluster(
       i->first.osd,
       get_osdmap_epoch());
     if (!con)
       continue;
+    // 同一目标副本的对象可能需要拆成多条消息。
     vector<PushOp>::iterator j = i->second.begin();
     while (j != i->second.end()) {
       uint64_t cost = 0;
       uint64_t pushes = 0;
+      // 当前消息从本 PG shard 发出，携带 PG 标识、地图/peering epoch 和优先级。
       MOSDPGPush *msg = new MOSDPGPush();
       msg->from = get_parent()->whoami_shard();
       msg->pgid = get_parent()->primary_spg_t();
@@ -2333,6 +2377,7 @@ void ReplicatedBackend::send_pushes(int prio, map<pg_shard_t, vector<PushOp> > &
       msg->min_epoch = get_parent()->get_last_peering_reset_epoch();
       msg->set_priority(prio);
       msg->is_repair = get_parent()->pg_is_repair();
+      // 累积对象，直到达到单消息的成本或对象数量上限。
       for (;
            (j != i->second.end() &&
 	    cost < cct->_conf->osd_max_push_cost &&
@@ -2345,31 +2390,43 @@ void ReplicatedBackend::send_pushes(int prio, map<pg_shard_t, vector<PushOp> > &
 	msg->pushes.push_back(*j);
       }
       msg->set_cost(cost);
+      // 将这一批 push 交给消息层异步发送给目标副本。
       get_parent()->send_message_osd_cluster(msg, con);
     }
   }
 }
 
+/**
+ * 将 primary 缺失对象的 pull 请求按目标副本组织成 MOSDPGPull 消息并发送；
+ * 每个目标副本对应一条批量消息，消息成本由其中的请求对象计算。
+ */
 void ReplicatedBackend::send_pulls(int prio, map<pg_shard_t, vector<PullOp> > &pulls)
 {
+  // pulls 按提供对象的远端 PG shard 分组。
   for (map<pg_shard_t, vector<PullOp> >::iterator i = pulls.begin();
        i != pulls.end();
        ++i) {
+    // 获取到目标副本 OSD 的集群连接；连接不可用时跳过本组请求。
     ConnectionRef con = get_parent()->get_con_osd_cluster(
       i->first.osd,
       get_osdmap_epoch());
     if (!con)
       continue;
+    // 当前分组中的 PullOp 都发往同一个远端副本。
     dout(20) << __func__ << ": sending pulls " << i->second
 	     << " to osd." << i->first << dendl;
+    // 构造 pull 消息，标明来源 shard、优先级、PG 和消息适用的 epoch。
     MOSDPGPull *msg = new MOSDPGPull();
     msg->from = parent->whoami_shard();
     msg->set_priority(prio);
     msg->pgid = get_parent()->primary_spg_t();
     msg->map_epoch = get_osdmap_epoch();
     msg->min_epoch = get_parent()->get_last_peering_reset_epoch();
+    // 将该目标副本的请求列表转移给消息对象，避免再次复制 vector 内容。
     msg->set_pulls(std::move(i->second));
+    // 根据消息中的 pull 请求计算调度成本，供 OSD 队列节流使用。
     msg->compute_cost(cct);
+    // 通过消息层异步发送给提供对象的远端副本。
     get_parent()->send_message_osd_cluster(msg, con);
   }
 }
@@ -2753,15 +2810,20 @@ void ReplicatedBackend::clear_pull(
   pulling.erase(piter);
 }
 
+/**
+ * 找出 acting 集合中缺少指定对象的 peer，并为每个 peer 准备一个 PushOp；
+ * 返回本次准备的 push 数量，任一对象读取准备失败时回滚本轮已加入的 PushOp。
+ */
 int ReplicatedBackend::start_pushes(
   const hobject_t &soid,
   ObjectContextRef obc,
   RPGHandle *h)
 {
+  // 保存需要该对象的 peer；这里只保存 missing 表迭代器，具体 PushOp 稍后写入 h。
   list< map<pg_shard_t, pg_missing_t>::const_iterator > shards;
 
   dout(20) << __func__ << " soid " << soid << dendl;
-  // who needs it?
+  // 从 acting recovery/backfill 集合中筛选除本地 primary 外仍缺少 soid 的副本。
   ceph_assert(get_parent()->get_acting_recovery_backfill_shards().size() > 0);
   for (set<pg_shard_t>::iterator i =
 	 get_parent()->get_acting_recovery_backfill_shards().begin();
@@ -2773,20 +2835,22 @@ int ReplicatedBackend::start_pushes(
       get_parent()->get_shard_missing().find(peer);
     ceph_assert(j != get_parent()->get_shard_missing().end());
     if (j->second.is_missing(soid)) {
+      // 该 peer 的 missing 表包含对象，后续需要向它发送 push。
       shards.push_back(j);
     }
   }
 
-  // If more than 1 read will occur ignore possible request to not cache
+  // 只有一个 peer 需要读取时才遵守“不缓存”提示；多 peer 读取时统一保留缓存结果。
   bool cache = shards.size() == 1 ? h->cache_dont_need : false;
 
   for (auto j : shards) {
     pg_shard_t peer = j->first;
+    // 先在按 peer 分组的列表中占位，再由 prep_push_to_replica 填充 PushOp 内容。
     h->pushes[peer].push_back(PushOp());
     int r = prep_push_to_replica(obc, soid, peer,
 	    &(h->pushes[peer].back()), cache);
     if (r < 0) {
-      // Back out all failed reads
+      // 任一 peer 准备失败，撤销本轮已经为当前及之前 peer 加入的 PushOp。
       for (auto k : shards) {
 	pg_shard_t p = k->first;
 	dout(10) << __func__ << " clean up peer " << p << dendl;
