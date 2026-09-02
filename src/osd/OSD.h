@@ -646,21 +646,28 @@ public:
 
   unsigned get_target_pg_log_entries() const;
 
-  // delayed pg activation
+  /**
+   * 将需要 recovery/backfill 的 PG 放入 OSDService 的等待节流队列；
+   * 这里只登记任务并尝试推进调度，不直接执行 PGRecovery::run()。
+   */
   void queue_for_recovery(
     PG *pg, uint64_t cost_per_object,
     int priority) {
+    // recovery_lock 同时保护 awaiting_throttle 和 recovery 调度状态。
     std::lock_guard l(recovery_lock);
 
     if (pg->is_forced_recovery_or_backfill()) {
+      // 强制 recovery/backfill 需要优先于普通任务，插入等待队列头部。
       awaiting_throttle.emplace_front(
         pg_awaiting_throttle_t{
           pg->get_osdmap()->get_epoch(), pg, cost_per_object, priority});
     } else {
+      // 普通 recovery 按到达顺序追加到等待队列尾部。
       awaiting_throttle.emplace_back(
         pg_awaiting_throttle_t{
           pg->get_osdmap()->get_epoch(), pg, cost_per_object, priority});
     }
+    // 根据当前 recovery 配额和节流条件，决定是否创建 PGRecovery 调度项。
     _maybe_queue_recovery();
   }
   void queue_recovery_after_sleep(
