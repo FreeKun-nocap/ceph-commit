@@ -411,18 +411,27 @@ bool PG::op_has_sufficient_caps(OpRequestRef& op)
   return cap;
 }
 
+/**
+ * 将当前 primary PG 加入 OSD 的 recovery 调度队列；
+ * 这里只负责排队和防止重复排队，实际恢复操作由后续 recovery worker 调用 start_recovery_ops()。
+ */
 void PG::queue_recovery()
 {
+  // 只有 primary 且已经 peered 的 PG 才能由本地 OSD 调度 recovery。
+  // 不满足条件时不应已经存在 queued recovery 项。
   if (!is_primary() || !is_peered()) {
     dout(10) << "queue_recovery -- not primary or not peered " << dendl;
     ceph_assert(!recovery_queued);
   } else if (recovery_queued) {
+    // 同一个 PG 已经在 recovery 队列中，避免重复创建调度项。
     dout(10) << "queue_recovery -- already queued" << dendl;
   } else {
     dout(10) << "queue_recovery -- queuing" << dendl;
+    // 先设置标记，再提交到 OSD 队列，防止并发路径重复入队。
     recovery_queued = true;
-    // Let cost per object be the average object size
+    // 调度器用平均对象大小估算本次 PG recovery 的工作成本。
     uint64_t cost_per_object = get_average_object_size();
+    // 带上 recovery 优先级；queue_for_recovery() 只负责进入队列，不执行具体 IO。
     osd->queue_for_recovery(
       this, cost_per_object, recovery_state.get_recovery_op_priority()
     );
