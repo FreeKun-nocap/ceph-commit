@@ -75,22 +75,31 @@ void PGBackend::recover_delete_object(const hobject_t &oid, eversion_t v,
   }
 }
 
+/**
+ * 将待删除对象按目标副本 shard 组织成 MOSDPGRecoveryDelete 消息并发送；
+ * 单条消息受对象数量和估算成本限制，避免删除请求过大。
+ */
 void PGBackend::send_recovery_deletes(int prio,
 				      const map<pg_shard_t, vector<pair<hobject_t, eversion_t> > > &deletes)
 {
+  // 后续 peering 不能早于本轮 PG 最近一次 peering reset 的 epoch。
   epoch_t min_epoch = get_parent()->get_last_peering_reset_epoch();
+  // deletes 按目标 PG shard 分组，每组对象都发送给同一个远端副本。
   for (const auto& p : deletes) {
     const auto& shard = p.first;
     const auto& objects = p.second;
+    // 获取目标 OSD 的集群连接；连接不可用时跳过该组删除请求。
     ConnectionRef con = get_parent()->get_con_osd_cluster(
       shard.osd,
       get_osdmap_epoch());
     if (!con)
       continue;
+    // 同一目标副本的对象可能需要拆成多条删除消息。
     auto it = objects.begin();
     while (it != objects.end()) {
       uint64_t cost = 0;
       uint64_t deletes = 0;
+      // target_pg 使用目标副本的 shard 标识，确保对端定位到正确的 PG 副本。
       spg_t target_pg = spg_t(get_parent()->get_info().pgid.pgid, shard.shard);
       MOSDPGRecoveryDelete *msg =
 	new MOSDPGRecoveryDelete(get_parent()->whoami_shard(),
@@ -99,6 +108,7 @@ void PGBackend::send_recovery_deletes(int prio,
 				 min_epoch);
       msg->set_priority(prio);
 
+      // 按单消息成本和对象数上限填充待删除对象。
       while (it != objects.end() &&
 	     cost < cct->_conf->osd_max_push_cost &&
 	     deletes < cct->_conf->osd_max_push_objects) {
@@ -111,6 +121,7 @@ void PGBackend::send_recovery_deletes(int prio,
       }
 
       msg->set_cost(cost);
+      // 通过消息层异步发送给目标副本；副本稍后执行删除并返回结果。
       get_parent()->send_message_osd_cluster(msg, con);
     }
   }
