@@ -13435,10 +13435,15 @@ void PrimaryLogPG::on_shutdown()
   }
 }
 
+/**
+ * PG 完成 activation 后的收尾：唤醒已等待 peering 的请求，
+ * 并把后续 recovery/backfill 工作作为新的 peering 事件排队处理。
+ */
 void PrimaryLogPG::on_activate_complete()
 {
   check_local();
-  // waiters
+  // 如果旧事务的 flush 已完成，waiting_for_peered 中的请求可以重新入队；
+  // 否则先转移到 waiting_for_flush，避免新 interval 的请求越过旧事务。
   if (!recovery_state.needs_flush()) {
     requeue_ops(waiting_for_peered);
   } else if (!waiting_for_peered.empty()) {
@@ -13449,11 +13454,11 @@ void PrimaryLogPG::on_activate_complete()
     ceph_assert(waiting_for_flush.empty());
     waiting_for_flush.swap(waiting_for_peered);
   }
-
-
-  // all clean?
+  // activation 只表示副本已完成激活，不代表副本内容已经完全同步。
+  // needs_recovery() 检查 PG log/missing 中是否还有需要逐对象恢复的数据。
   if (needs_recovery()) {
     dout(10) << "activate not all replicas are up-to-date, queueing recovery" << dendl;
+    // 使用当前 OSDMap epoch 构造事件，并通过 queue_peering_event() 异步交给 OSD peering 工作队列；
     queue_peering_event(
       PGPeeringEventRef(
 	std::make_shared<PGPeeringEvent>(
@@ -13461,6 +13466,7 @@ void PrimaryLogPG::on_activate_complete()
 	  get_osdmap_epoch(),
 	  PeeringState::DoRecovery())));
   } else if (needs_backfill()) {
+    // 没有普通 log-based recovery，但仍有需要补齐的 backfill 区间/对象。
     dout(10) << "activate queueing backfill" << dendl;
     queue_peering_event(
       PGPeeringEventRef(
@@ -13469,6 +13475,7 @@ void PrimaryLogPG::on_activate_complete()
 	  get_osdmap_epoch(),
 	  PeeringState::RequestBackfill())));
   } else {
+    // recovery 和 backfill 都不需要，通知状态机所有副本已经恢复完成。
     dout(10) << "activate all replicas clean, no recovery" << dendl;
     queue_peering_event(
       PGPeeringEventRef(
@@ -13480,6 +13487,8 @@ void PrimaryLogPG::on_activate_complete()
 
   publish_stats_to_osd();
 
+  // 在 activation 完成、backfill 即将异步启动时，固定本轮 backfill 的初始边界和内部状态。
+  // 记录本轮 backfill 的起点，并为后续 backfill 调度标记 new_backfill。
   if (get_backfill_targets().size()) {
     last_backfill_started = recovery_state.earliest_backfill();
     new_backfill = true;
@@ -13700,22 +13709,33 @@ void PrimaryLogPG::check_recovery_sources(const OSDMapRef& osdmap)
   pgbackend->check_recovery_sources(osdmap);
 }
 
+/**
+ * 在一次 recovery 调度配额内选择并启动对象恢复或 backfill 操作；
+ * 返回 true 表示仍有 unfound 对象，需要由调用者继续查询其可能位置。
+ */
 bool PrimaryLogPG::start_recovery_ops(
   uint64_t max,
   ThreadPool::TPHandle &handle,
   uint64_t *ops_started)
 {
+  // started 记录本轮已经启动的对象操作数量；其上限由 reserved_pushes 决定。
   uint64_t& started = *ops_started;
   started = 0;
+  // work_in_progress 表示本轮已启动 recovery/backfill；
+  // recovery_started 用于区分 recover_replicas 是否实际产生了工作。
   bool work_in_progress = false;
   bool recovery_started = false;
+  // recovery 必须运行在 primary、peered 且未删除的 PG 上。
   ceph_assert(is_primary());
   ceph_assert(is_peered());
   ceph_assert(!recovery_state.is_deleting());
 
+  // 当前 PGRecovery 调度项已经出队，允许后续仍有工作时再次排队。
   ceph_assert(recovery_queued);
   recovery_queued = false;
 
+  // 状态机可能在任务排队后发生转换；若 PG 已不在 recovery/backfill 状态，
+  // 本轮任务已经过时，只保留 unfound 查询结果。
   if (!state_test(PG_STATE_RECOVERING) &&
       !state_test(PG_STATE_BACKFILLING)) {
     /* TODO: I think this case is broken and will make do_recovery()
@@ -13726,24 +13746,26 @@ bool PrimaryLogPG::start_recovery_ops(
 
   const auto &missing = recovery_state.get_pg_log().get_missing();
 
+  // 记录本轮开始前的 unfound 数量，用于后面判断查询是否发现了新的位置。
   uint64_t num_unfound = get_num_unfound();
 
   if (!recovery_state.have_missing()) {
+    // primary 本地没有 missing，标记本地 recovery 已完成，后续可专注于副本同步。
     recovery_state.local_recovery_complete();
   }
 
-  if (!missing.have_missing() || // Primary does not have missing
-      // or all of the missing objects are unfound.
+  // primary 没有 missing，或 primary 的 missing 全部是 unfound 时，
+  // 优先恢复仍可从 primary 获取的副本对象。
+  if (!missing.have_missing() ||
       recovery_state.all_missing_unfound()) {
-    // Recover the replicas.
     started = recover_replicas(max, handle, &recovery_started);
   }
   if (!started) {
-    // We still have missing objects that we should grab from replicas.
+    // 如果前一步没有启动操作，再尝试从副本取回 primary 缺失的对象。
     started += recover_primary(max, handle);
   }
   if (!started && num_unfound != get_num_unfound()) {
-    // second chance to recovery replicas
+    // unfound 数量发生变化后重新尝试副本恢复，利用刚发现的新位置。
     started = recover_replicas(max, handle, &recovery_started);
   }
 
@@ -13751,22 +13773,27 @@ bool PrimaryLogPG::start_recovery_ops(
     work_in_progress = true;
 
   bool deferred_backfill = false;
+  // 只有当前没有对象 recovery、PG 正在 backfilling、且 primary missing 已清空时，
+  // 才能在本轮剩余配额内推进 backfill。
   if (recovering.empty() &&
       state_test(PG_STATE_BACKFILLING) &&
       !get_backfill_targets().empty() && started < max &&
       missing.num_missing() == 0 &&
       waiting_on_backfill.empty()) {
     if (get_osdmap()->test_flag(CEPH_OSDMAP_NOBACKFILL)) {
+      // 集群设置 NOBACKFILL，保留任务状态，等待后续重新调度。
       dout(10) << "deferring backfill due to NOBACKFILL" << dendl;
       deferred_backfill = true;
     } else if (get_osdmap()->test_flag(CEPH_OSDMAP_NOREBALANCE) &&
 	       !is_degraded())  {
+      // 非 degraded PG 受 NOREBALANCE 限制时，暂不执行均衡型 backfill。
       dout(10) << "deferring backfill due to NOREBALANCE" << dendl;
       deferred_backfill = true;
     } else if (!recovery_state.is_backfill_reserved()) {
       /* DNMNOTE I think this branch is dead */
       dout(10) << "deferring backfill due to !backfill_reserved" << dendl;
       if (!backfill_reserving) {
+	// 重新进入状态机申请 backfill 资源，避免直接执行未完成 reservation 的 backfill。
 	dout(10) << "queueing RequestBackfill" << dendl;
 	backfill_reserving = true;
 	queue_peering_event(
@@ -13778,6 +13805,7 @@ bool PrimaryLogPG::start_recovery_ops(
       }
       deferred_backfill = true;
     } else {
+      // recovery 已满足前置条件，使用剩余配额执行本轮 backfill。
       started += recover_backfill(max - started, handle, &work_in_progress);
     }
   }
@@ -13785,6 +13813,8 @@ bool PrimaryLogPG::start_recovery_ops(
   dout(10) << " started " << started << dendl;
   osd->logger->inc(l_osd_rop, started);
 
+  // 仍有对象在进行、刚启动了工作、已有 active recovery op，或 backfill 被延迟时，
+  // 先返回，等待完成回调或下一次调度继续推进。
   if (!recovering.empty() ||
       work_in_progress || recovery_ops_active > 0 || deferred_backfill)
     return !work_in_progress && have_unfound();
@@ -13800,6 +13830,7 @@ bool PrimaryLogPG::start_recovery_ops(
 	   << dendl;
   int unfound = get_num_unfound();
   if (unfound) {
+    // 没有活动 recovery，但仍有 unfound；返回 true 让 OSD 查询更多来源。
     dout(10) << " still have " << unfound << " unfound" << dendl;
     return true;
   }
@@ -13820,6 +13851,7 @@ bool PrimaryLogPG::start_recovery_ops(
   }
 
   if (state_test(PG_STATE_RECOVERING)) {
+    // 普通 recovery 已经完成；若仍有 backfill target，转入 backfill，否则通知状态机所有副本已恢复完成
     state_clear(PG_STATE_RECOVERING);
     state_clear(PG_STATE_FORCED_RECOVERY);
     if (needs_backfill()) {
@@ -13841,6 +13873,7 @@ bool PrimaryLogPG::start_recovery_ops(
             PeeringState::AllReplicasRecovered())));
     }
   } else { // backfilling
+    // backfill 也已完成，通知状态机进入 Recovered。
     state_clear(PG_STATE_BACKFILLING);
     state_clear(PG_STATE_FORCED_BACKFILL);
     state_clear(PG_STATE_FORCED_RECOVERY);
@@ -13857,13 +13890,15 @@ bool PrimaryLogPG::start_recovery_ops(
 }
 
 /**
- * do one recovery op.
- * return true if done, false if nothing left to do.
+ * 恢复 primary 自己缺失的对象：按 missing 版本顺序选择对象，从已知副本准备 pull 操作；
+ * 同时处理 LOST_REVERT 等需要恢复旧版本的特殊日志项。
  */
 uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handle)
 {
+  // 只有 primary 负责选择来源并恢复本地缺失对象。
   ceph_assert(is_primary());
 
+  // primary 本地 PG log 中的 missing 集合，是本函数的恢复候选来源。
   const auto &missing = recovery_state.get_pg_log().get_missing();
 
   dout(10) << __func__ << " recovering " << recovering.size()
@@ -13872,12 +13907,15 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 
   dout(25) << __func__ << " " << missing.get_items() << dendl;
 
-  // look at log!
+  // latest 指向该对象的最新 PG log 项；started 受本轮 recovery 配额 max 限制；
+  // skipped 用于避免跳过对象后仍错误推进 last_requested。
   pg_log_entry_t *latest = 0;
   unsigned started = 0;
   int skipped = 0;
 
+  // 将本轮多个 pull 操作累计到同一个 backend recovery handle。
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
+  // 从上次成功请求的位置继续按版本顺序扫描，避免每轮都从头遍历 missing 集合。
   map<eversion_t, hobject_t>::const_iterator p =
     missing.get_rmissing().lower_bound(eversion_t(0, recovery_state.get_pg_log().get_log().last_requested));
   while (p != missing.get_rmissing().end()) {
@@ -13885,6 +13923,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
     hobject_t soid;
     eversion_t v = p->first;
 
+    // PG log 中存在该对象时，使用最新日志项中的 soid；否则直接使用 missing 索引的对象。
     auto it_objects = recovery_state.get_pg_log().get_log().objects.find(p->second);
     if (it_objects != recovery_state.get_pg_log().get_log().objects.end()) {
       latest = it_objects->second;
@@ -13894,6 +13933,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
       latest = 0;
       soid = p->second;
     }
+    // item 记录 primary 当前已有版本 have 与需要恢复到的版本 need。
     const pg_missing_item& item = missing.get_items().find(p->second)->second;
     ++p;
 
@@ -13912,6 +13952,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
     if (latest) {
       switch (latest->op) {
       case pg_log_entry_t::CLONE:
+	// 当前没有针对 CLONE 的特殊恢复处理，交给下面的通用 missing recovery 路径。
 	/*
 	 * Handling for this special case removed for now, until we
 	 * can correctly construct an accurate SnapSet from the old
@@ -13921,13 +13962,17 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 
       case pg_log_entry_t::LOST_REVERT:
 	{
+	  // LOST_REVERT 要把对象回退到较早版本：若本地已有目标版本，直接完成本地回退；
+	  // 否则先找拥有 reverting_to 版本的副本，作为后续 pull 来源。
 	  if (item.have == latest->reverting_to) {
 	    ObjectContextRef obc = get_object_context(soid, true);
 
 	    if (obc->obs.oi.version == latest->version) {
-	      // I'm already reverting
+	      // 本地已经在执行同一回退，不重复提交事务。
 	      dout(10) << " already reverting " << soid << dendl;
 	    } else {
+	      // 更新对象版本并通过本地事务记录 recovery 完成；
+	      // 其 applied/commit 回调继续推进 on_local_recover 和副本确认。
 	      dout(10) << " reverting " << soid << " to " << latest->prior_version << dendl;
 	      obc->obs.oi.version = latest->version;
 
@@ -13967,6 +14012,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 	     *  - this way we don't need to mangle the missing code to be general about needing an old
 	     *    version...
 	     */
+	    // 当前本地没有目标旧版本，挑选副本中 have == reverting_to 的 shard 作为来源。
 	    eversion_t alternate_need = latest->reverting_to;
 	    dout(10) << " need to pull prior_version " << alternate_need << " for revert " << item << dendl;
 
@@ -13979,6 +14025,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 		good_peers.insert(p->first);
 	      }
 	    }
+	    // 将这些候选来源写入 missing_loc，随后走通用 recover_missing() pull 流程。
 	    recovery_state.set_revert_with_targets(
 	      soid,
 	      good_peers);
@@ -13992,6 +14039,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
       }
     }
 
+    // 同一对象或其 head 已在恢复时不能重复启动；snap clone 需要先完成 head 的恢复。
     if (!recovering.count(soid)) {
       if (recovering.count(head)) {
 	++skipped;
@@ -14000,11 +14048,14 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 	  soid, need, recovery_state.get_recovery_op_priority(), h);
 	switch (r) {
 	case PULL_YES:
+	  // 已为当前对象准备 pull。
 	  ++started;
 	  break;
 	case PULL_HEAD:
+	  // 当前 clone 依赖的 head 被启动恢复；它同样占用一个 recovery 配额。
 	  ++started;
 	case PULL_NONE:
+	  // PULL_HEAD 故意贯穿到这里：当前 clone 本身尚未恢复，记录为 skipped。
 	  ++skipped;
 	  break;
 	default:
@@ -14015,11 +14066,12 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
       }
     }
 
-    // only advance last_requested if we haven't skipped anything
+    // 只有扫描过程中没有跳过对象，才能推进断点，避免下轮遗漏仍未能启动的对象。
     if (!skipped)
       recovery_state.set_last_requested(v.version);
   }
 
+  // 将本轮累计的 pull 操作一次性交给 backend 发送给候选副本。
   pgbackend->run_recovery_op(h, recovery_state.get_recovery_op_priority());
   return started;
 }
@@ -14133,20 +14185,25 @@ int PrimaryLogPG::prep_object_replica_pushes(
   return 1;
 }
 
+/**
+ * 恢复 acting 集中仍缺少对象的副本：从副本 missing 集合中选择对象，
+ * 为删除对象准备 delete 操作，为普通对象准备从 primary push 的 recovery 操作。
+ */
 uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &handle,
   bool *work_started)
 {
   dout(10) << __func__ << "(" << max << ")" << dendl;
+  // started 记录本轮已准备的副本 recovery 操作数量。
   uint64_t started = 0;
 
+  // 打开一次 backend recovery handle，汇总本轮准备的多个对象操作。
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
 
-  // this is FAR from an optimal recovery order.  pretty lame, really.
+  // 当前排序策略并非全局最优，但优先处理 missing 较少的副本，可以更快地让它恢复到正常状态。
   ceph_assert(!get_acting_recovery_backfill().empty());
-  // choose replicas to recover, replica has the shortest missing list first
-  // so we can bring it back to normal ASAP
   std::vector<std::pair<unsigned int, pg_shard_t>> replicas_by_num_missing,
     async_by_num_missing;
+  // 为普通 acting 副本和 async recovery target 分开收集待恢复副本。
   replicas_by_num_missing.reserve(get_acting_recovery_backfill().size() - 1);
   for (auto &p: get_acting_recovery_backfill()) {
     if (p == get_primary()) {
@@ -14156,6 +14213,7 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
     ceph_assert(pm != recovery_state.get_peer_missing().end());
     auto nm = pm->second.num_missing();
     if (nm != 0) {
+      // 只处理确实有 missing 对象的副本；async target 放到第二组，稍后处理。
       if (is_async_recovery_target(p)) {
         async_by_num_missing.push_back(make_pair(nm, p));
       } else {
@@ -14163,12 +14221,12 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
       }
     }
   }
-  // sort by number of missing objects, in ascending order.
+  // 每组都按 missing 对象数量升序排列，优先恢复缺口最小的副本。
   auto func = [](const std::pair<unsigned int, pg_shard_t> &lhs,
                  const std::pair<unsigned int, pg_shard_t> &rhs) {
     return lhs.first < rhs.first;
   };
-  // acting goes first
+  // 普通 acting 副本优先于 async recovery target。
   std::sort(replicas_by_num_missing.begin(), replicas_by_num_missing.end(), func);
   // then async_recovery_targets
   std::sort(async_by_num_missing.begin(), async_by_num_missing.end(), func);
@@ -14186,7 +14244,7 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
     // generate 1M+ character log entries and several GB of log output per recovery
     dout(25) << " peer osd." << peer << " missing " << pm->second.get_items() << dendl;
 
-    // oldest first!
+    // 同一副本内按最早版本优先处理 missing 对象。
     const pg_missing_t &m(pm->second);
     for (map<eversion_t, hobject_t>::const_iterator p = m.get_rmissing().begin();
 	 p != m.get_rmissing().end() && started < max;
@@ -14195,12 +14253,15 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
       const hobject_t soid(p->second);
 
       if (recovery_state.get_missing_loc().is_unfound(soid)) {
+	// primary 也找不到该对象时，暂时不能向副本推送它。
 	dout(10) << __func__ << ": " << soid << " still unfound" << dendl;
 	continue;
       }
 
       const pg_info_t &pi = recovery_state.get_peer_info(peer);
       if (soid > pi.last_backfill) {
+	// 该对象属于 backfill 区间，不能走普通 replica recovery；
+	// recovering 集合中应已有对应的 backfill 记录。
 	if (!recovering.count(soid)) {
           derr << __func__ << ": object " << soid << " last_backfill "
 	       << pi.last_backfill << dendl;
@@ -14212,11 +14273,13 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
       }
 
       if (recovering.count(soid)) {
+	// 对象已经有 recovery 操作在进行，避免重复准备。
 	dout(10) << __func__ << ": already recovering " << soid << dendl;
 	continue;
       }
 
       if (recovery_state.get_missing_loc().is_deleted(soid)) {
+	// 对象在 primary 侧已被判定为删除，向副本准备删除操作而不是 push 数据。
 	dout(10) << __func__ << ": " << soid << " is a delete, removing" << dendl;
 	map<hobject_t,pg_missing_item>::const_iterator r = m.get_items().find(soid);
 	started += prep_object_replica_deletes(soid, r->second.need, h, work_started);
@@ -14226,22 +14289,26 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
       if (soid.is_snap() &&
 	  recovery_state.get_pg_log().get_missing().is_missing(
 	    soid.get_head())) {
+	// snap clone 依赖的 head 仍在 primary missing 中，先等待 head 恢复。
 	dout(10) << __func__ << ": " << soid.get_head()
 		 << " still missing on primary" << dendl;
 	continue;
       }
 
       if (recovery_state.get_pg_log().get_missing().is_missing(soid)) {
+	// primary 自己仍缺该对象，当前不能把它作为数据源推送给副本。
 	dout(10) << __func__ << ": " << soid << " still missing on primary" << dendl;
 	continue;
       }
 
       dout(10) << __func__ << ": recover_object_replicas(" << soid << ")" << dendl;
       map<hobject_t,pg_missing_item>::const_iterator r = m.get_items().find(soid);
+      // 为副本准备从 primary 推送对象的 recovery 操作。
       started += prep_object_replica_pushes(soid, r->second.need, h, work_started);
     }
   }
 
+  // 将本轮累计的 delete/push 操作一次性交给 backend 执行。
   pgbackend->run_recovery_op(h, recovery_state.get_recovery_op_priority());
   return started;
 }
@@ -14300,6 +14367,10 @@ bool PrimaryLogPG::all_peer_done() const
  * std::min(peer_backfill_info[*].begin, backfill_info.begin) in the event that client
  * io created objects since the last scan.  For this reason, we call
  * update_range() again before continuing backfill.
+ *
+ * primary 扫描本地与各个 backfill target 的对象区间：
+ * 副本多出的对象发送删除请求，primary 或副本版本较新的对象则准备 push；
+ * 只有越过所有 in-flight 操作的连续前缀才会推进各副本的 last_backfill。
  */
 uint64_t PrimaryLogPG::recover_backfill(
   uint64_t max,
@@ -14313,12 +14384,14 @@ uint64_t PrimaryLogPG::recover_backfill(
   ceph_assert(!get_backfill_targets().empty());
 
   // Initialize from prior backfill state
+  // new_backfill 在 activation 完成时被设为 true。因此首次进入 recover_backfill() 时，执行一次
   if (new_backfill) {
     // on_activate() was called prior to getting here
+    // 确认本轮起点仍是所有 backfill target 中最落后的 last_backfill。
     ceph_assert(last_backfill_started == recovery_state.earliest_backfill());
     new_backfill = false;
 
-    // initialize BackfillIntervals
+    // 每个 target 从其已确认的 last_backfill 开始扫描；本地也从本轮起点开始。
     for (set<pg_shard_t>::const_iterator i = get_backfill_targets().begin();
 	 i != get_backfill_targets().end();
 	 ++i) {
@@ -14327,6 +14400,7 @@ uint64_t PrimaryLogPG::recover_backfill(
     }
     backfill_info.reset(last_backfill_started);
 
+    // 新一轮不继承先前批次的在途对象和待提交统计。
     backfills_in_flight.clear();
     pending_backfill_updates.clear();
   }
@@ -14342,14 +14416,15 @@ uint64_t PrimaryLogPG::recover_backfill(
 	   << dendl;
   }
 
-  // update our local interval to cope with recent changes
+  // 每轮重新扫描本地区间，纳入上轮扫描后客户端 I/O 新增或修改的对象。
   backfill_info.begin = last_backfill_started;
-  update_range(&backfill_info, handle);
+  update_range(&backfill_info, handle);  // 把 primary 这一侧“待对账的对象区间”更新成当前可信的对象清单。
 
   unsigned ops = 0;
   vector<boost::tuple<hobject_t, eversion_t, pg_shard_t> > to_remove;
   set<hobject_t> add_to_stat;
 
+  // 已确认的前缀无需重复比较，收缩各侧区间到本轮尚未完成的位置。
   for (set<pg_shard_t>::const_iterator i = get_backfill_targets().begin();
        i != get_backfill_targets().end();
        ++i) {
@@ -14360,8 +14435,16 @@ uint64_t PrimaryLogPG::recover_backfill(
   }
   backfill_info.trim_to(last_backfill_started);
 
+  // 将本轮准备出的多次 push 汇总到同一个 backend recovery handle。
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
+  // recover_backfill() 不能一次扫完整个 PG，否则一个很大的 PG 会长期占用 recovery 工作线程和 recovery reservation。
+  // 它每次最多启动 max 个需要等待完成的 backfill 操作，然后返回，后续由调度/完成回调再次进入。
+  // 一次扫描并参与对比的对象区间大小
+  //  由配置控制：
+  //  osd_backfill_scan_min = 64
+  //  osd_backfill_scan_max = 512
   while (ops < max) {
+    // 重置起点，继续对比
     if (backfill_info.begin <= earliest_peer_backfill() &&
 	!backfill_info.extends_to_end() && backfill_info.empty()) {
       hobject_t next = backfill_info.end;
@@ -14381,6 +14464,7 @@ uint64_t PrimaryLogPG::recover_backfill(
       ReplicaBackfillInterval& pbi = peer_backfill_info[bt];
 
       dout(20) << " peer shard " << bt << " backfill " << pbi << dendl;
+      // target 的已知区间耗尽时，先异步请求它继续扫描；结果回来前不能比较新范围。
       if (pbi.begin <= backfill_info.begin &&
 	  !pbi.extends_to_end() && pbi.empty()) {
 	dout(10) << " scanning peer osd." << bt << " from " << pbi.end << dendl;
@@ -14402,7 +14486,7 @@ uint64_t PrimaryLogPG::recover_backfill(
       }
     }
 
-    // Count simultaneous scans as a single op and let those complete
+    // 同轮发往多个 target 的 scan 共同占用一个 recovery 配额，并等待回复推进区间。
     if (sent_scan) {
       ops++;
       start_recovery_op(hobject_t::get_max()); // XXX: was pbi.end
@@ -14414,13 +14498,14 @@ uint64_t PrimaryLogPG::recover_backfill(
       break;
     }
 
-    // Get object within set of peers to operate on and
-    // the set of targets for which that object applies.
+    // 选择 primary/targets 中最靠前的对象位置，并找出需要对此对象执行操作的 target。
     hobject_t check = earliest_peer_backfill();
 
     if (check < backfill_info.begin) {
+      // 某个 target 当前最靠前的待对账对象比 primary 当前最靠前的待对账对象还小
+      // 该对象只出现在 target 区间：primary 已无此对象，应从对应副本删除。
 
-      set<pg_shard_t> check_targets;
+      set<pg_shard_t> check_targets;  // 哪些 target 当前正停在这个多余对象 check 上
       for (set<pg_shard_t>::const_iterator i = get_backfill_targets().begin();
 	   i != get_backfill_targets().end();
 	   ++i) {
@@ -14436,6 +14521,7 @@ uint64_t PrimaryLogPG::recover_backfill(
       for (set<pg_shard_t>::iterator i = check_targets.begin();
 	   i != check_targets.end();
 	   ++i) {
+        // 记录待删除请求
         pg_shard_t bt = *i;
         ReplicaBackfillInterval& pbi = peer_backfill_info[bt];
         ceph_assert(pbi.begin == check);
@@ -14444,6 +14530,7 @@ uint64_t PrimaryLogPG::recover_backfill(
         pbi.pop_front();
       }
 
+      // 删除请求不等待 recovery-op 回复，但扫描游标可以继续向前比较。
       last_backfill_started = check;
 
       // Don't increment ops here because deletions
@@ -14451,24 +14538,32 @@ uint64_t PrimaryLogPG::recover_backfill(
       // and we can't increment ops without requeueing ourself
       // for recovery.
     } else {
-      // Unpack versions for the object being backfilled
+      // primary 当前有对象：判断哪些 target 需要它
+
+      // 从 primary 的 backfill_info 中，取出当前第一个对象 hoid 的全部版本记录，整理成后续比较/推送需要的两个结果。
       auto it = backfill_info.objects.begin();
-      const hobject_t& hoid = it->first;
-      eversion_t obj_v;
-      std::map<shard_id_t,eversion_t> versions;
+      const hobject_t& hoid = it->first;  // 当前要处理的对象名
+      eversion_t obj_v;  // 该对象的最高版本，后续 push 时使用
+      std::map<shard_id_t,eversion_t> versions;  // 该对象在不同 shard 上应有的版本
+      // 副本池通常只有一条：
+      //  object B -> NO_SHARD: 10'5
+      //  EC 部分写时可能有多条：
+      //  object B -> NO_SHARD: 10'5
+      //  object B -> shard 1: 10'3
       while (it != backfill_info.objects.end() && it->first == hoid) {
 	obj_v = std::max(obj_v, it->second.second);
 	versions[it->second.first] = it->second.second;
 	++it;
       }
+      // 将 target 分为版本不符、缺对象、版本正确、尚未追到比较线四类。
       vector<pg_shard_t> need_ver_targs, missing_targs, keep_ver_targs, skip_targs;
       for (set<pg_shard_t>::const_iterator i = get_backfill_targets().begin();
 	   i != get_backfill_targets().end();
 	   ++i) {
 	pg_shard_t bt = *i;
 	ReplicaBackfillInterval& pbi = peer_backfill_info[bt];
-        // Find all check peers that have the wrong version
 	if (check == backfill_info.begin && check == pbi.begin) {
+    // 两侧游标都指向该对象时，直接比较 target 已报告的版本。
 	  eversion_t replicaobj_v;
 	  if (versions.contains(bt.shard)) {
 	    replicaobj_v = versions.at(bt.shard);
@@ -14483,9 +14578,8 @@ uint64_t PrimaryLogPG::recover_backfill(
         } else {
 	  const pg_info_t& pinfo = recovery_state.get_peer_info(bt);
 
-          // Only include peers that we've caught up to their backfill line
-	  // otherwise, they only appear to be missing this object
-	  // because their pbi.begin > backfill_info.begin.
+          // 仅对已追到该位置的 target 判定“缺对象”；
+          // 游标还在后面的 target 尚未完成扫描，不能据此认为它缺少此对象。
           if (backfill_info.begin > pinfo.last_backfill)
 	    missing_targs.push_back(bt);
 	  else
@@ -14514,7 +14608,8 @@ uint64_t PrimaryLogPG::recover_backfill(
 	         << " with ver " << obj_v
 	         << " to peers " << missing_targs << dendl;
 	  }
-	  vector<pg_shard_t> all_push = need_ver_targs;
+          // 对版本不符和缺对象的 target 发送同一次对象 push。
+          vector<pg_shard_t> all_push = need_ver_targs;
 	  all_push.insert(all_push.end(), missing_targs.begin(), missing_targs.end());
 
 	  handle.reset_tp_timeout();
@@ -14524,7 +14619,8 @@ uint64_t PrimaryLogPG::recover_backfill(
 	    dout(0) << __func__ << " Error " << r << " trying to backfill " << backfill_info.begin << dendl;
 	    break;
 	  }
-	  ops++;
+          // 该对象的 push 将异步完成；其完成回调才会允许 last_backfill 跨过此位置。
+          ops++;
 	} else {
 	  *work_started = true;
 	  dout(20) << "backfill blocking on " << backfill_info.begin
@@ -14538,6 +14634,7 @@ uint64_t PrimaryLogPG::recover_backfill(
 	       << " missing_targs=" << missing_targs
 	       << " skip_targs=" << skip_targs << dendl;
 
+      // 在“当前对象已经完成对账决策后”，推进内存中的扫描游标，但不代表对象已经真正 backfill 完成。
       last_backfill_started = backfill_info.begin;
       add_to_stat.insert(backfill_info.begin); // XXX: Only one for all pushes?
       backfill_info.pop_front();
@@ -14553,6 +14650,7 @@ uint64_t PrimaryLogPG::recover_backfill(
     }
   }
 
+  // 统计与 last_backfill 必须随对象实际完成推进，因此先保存在 pending 表中。
   for (set<hobject_t>::iterator i = add_to_stat.begin();
        i != add_to_stat.end();
        ++i) {
@@ -14562,6 +14660,7 @@ uint64_t PrimaryLogPG::recover_backfill(
     add_object_context_to_pg_stat(obc, &stat);
     pending_backfill_updates[*i] = stat;
   }
+  // 将同一 target 的多个删除项合并为一条 BackfillRemove 消息。
   map<pg_shard_t,MOSDPGBackfillRemove*> reqs;
   for (unsigned i = 0; i < to_remove.size(); ++i) {
     handle.reset_tp_timeout();
@@ -14592,7 +14691,9 @@ uint64_t PrimaryLogPG::recover_backfill(
 				  get_osdmap_epoch());
   }
 
+  // 提交本轮累计的对象 push；实际数据传输和完成通知在 backend 中异步进行。
   pgbackend->run_recovery_op(h, recovery_state.get_recovery_op_priority());
+
 
   hobject_t backfill_pos =
     std::min(backfill_info.begin, earliest_peer_backfill());
@@ -14603,6 +14704,9 @@ uint64_t PrimaryLogPG::recover_backfill(
     dout(20) << *i << " is still in flight" << dendl;
   }
 
+  // 在途对象之前的连续区间才可确认完成，不能跨越最靠前的 in-flight 对象推进游标。
+  // backfills_in_flight 已经发起对象 push、但尚未完成全局 recovery 的 backfill 对象。
+  // pending_backfill_updates 已经处理到、但还不能正式计入 target PG 统计的对象
   hobject_t next_backfill_to_complete = backfills_in_flight.empty() ?
     backfill_pos : *(backfills_in_flight.begin());
   hobject_t new_last_backfill = recovery_state.earliest_backfill();
@@ -14614,9 +14718,7 @@ uint64_t PrimaryLogPG::recover_backfill(
        pending_backfill_updates.erase(i++)) {
     dout(20) << " pending_backfill_update " << i->first << dendl;
     ceph_assert(i->first > new_last_backfill);
-    // carried from a previous round – if we are here, then we had to
-    // be requeued (by e.g. on_global_recover()) and those operations
-    // are done.
+    // 该项来自已结束的先前批次；现在可以把对象统计并入 peer 的完成前缀。
     recovery_state.update_complete_backfill_object_stats(
       i->first,
       i->second);
@@ -14634,6 +14736,7 @@ uint64_t PrimaryLogPG::recover_backfill(
   }
   dout(10) << "final new_last_backfill at " << new_last_backfill << dendl;
 
+  // 若 new_last_backfill 到达 MAX，向 target 发送 OP_BACKFILL_FINISH；否则发送进度更新。
   // If new_last_backfill == MAX, then we will send OP_BACKFILL_FINISH to
   // all the backfill targets.  Otherwise, we will move last_backfill up on
   // those targets need it and send OP_BACKFILL_PROGRESS to them.
@@ -14644,6 +14747,7 @@ uint64_t PrimaryLogPG::recover_backfill(
     const pg_info_t& pinfo = recovery_state.get_peer_info(bt);
 
     if (new_last_backfill > pinfo.last_backfill) {
+      // 先更新内存中的 peer_info，再把新的进度和统计同步给对应 target。
       recovery_state.update_peer_last_backfill(bt, new_last_backfill);
       epoch_t e = get_osdmap_epoch();
       MOSDPGBackfill *m = NULL;
@@ -14684,6 +14788,10 @@ uint64_t PrimaryLogPG::recover_backfill(
   return ops;
 }
 
+/**
+ * 为一个对象准备 backfill push：记录对象和目标副本的在途状态，
+ * 更新 recovery missing 信息，并把实际数据恢复请求交给 PGBackend。
+ */
 int PrimaryLogPG::prep_backfill_object_push(
   hobject_t oid, eversion_t v,
   ObjectContextRef obc,
@@ -14693,14 +14801,18 @@ int PrimaryLogPG::prep_backfill_object_push(
   dout(10) << __func__ << " " << oid << " v " << v << " to peers " << peers << dendl;
   ceph_assert(!peers.empty());
 
+  // 在对象真正完成 push 前，将其作为 backfill 在途对象记录下来，阻止完成边界越过它。
   backfills_in_flight.insert(oid);
+  // 记录该对象的目标版本以及需要接收它的 target，供 recovery 完成回调更新状态。
   recovery_state.prepare_backfill_for_missing(oid, v, peers);
 
   ceph_assert(!recovering.count(oid));
 
+  // 为对象建立一个 active recovery 操作，并保存其上下文，便于完成或失败时收尾。
   start_recovery_op(oid);
   recovering.insert(make_pair(oid, obc));
 
+  // backfill 时 primary 持有对象 obc，因此 backend 会准备向 peers 推送对象数据。
   int r = pgbackend->recover_object(
     oid,
     v,
@@ -14708,6 +14820,7 @@ int PrimaryLogPG::prep_backfill_object_push(
     obc,
     h);
   if (r < 0) {
+    // backend 准备失败时立即走失败路径，清理本次 recovery 的状态。
     dout(0) << __func__ << " Error " << r << " on oid " << oid << dendl;
     on_failed_pull({ pg_whoami }, oid, v);
   }
