@@ -169,16 +169,23 @@ void PGScrubChunkIsFree::run([[maybe_unused]] OSD* osd,
   pg->unlock();
 }
 
+/**
+ * 执行一个已经从 OSD 调度队列取出的 PGRecovery 任务：记录排队延迟，
+ * 调用 OSD::do_recovery() 推进本轮 recovery，并释放 worker 持有的 PG 锁。
+ */
 void PGRecovery::run(
   OSD *osd,
   OSDShard *sdata,
   PGRef& pg,
   ThreadPool::TPHandle &handle)
 {
+  // 统计该 recovery 任务从入队到被 worker 取出的等待时间。
   osd->logger->tinc(
     l_osd_recovery_queue_lat,
     ceph_clock_now() - time_queued);
+  // 使用排队时的 epoch、预留 push 数和优先级，执行本轮 PG recovery。
   osd->do_recovery(pg.get(), epoch_queued, reserved_pushes, priority, handle);
+  // _process() 在调用 run() 前已持有 PG 锁；任务处理完后由此释放。
   pg->unlock();
 }
 
