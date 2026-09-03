@@ -225,6 +225,13 @@ bool ReplicatedBackend::can_handle_while_inactive(OpRequestRef op)
   }
 }
 
+/**
+ * 将未被 PGBackend 基类处理的副本协议消息分派到具体处理函数。
+ *
+ * push/pull 及其回复负责对象恢复数据的传输，repop/repopreply 负责副本写入协议，
+ * pct 用于处理副本一致性相关消息。消息被对应函数消费后返回 true；
+ * 未识别的类型返回 false，由上层继续判断或报告未处理消息。
+ */
 bool ReplicatedBackend::_handle_message(
   OpRequestRef op
   )
@@ -1050,20 +1057,50 @@ int ReplicatedBackend::be_deep_scrub(
   return 0;
 }
 
+/**
+ * 在副本端处理 primary 发来的 MOSDPGPush 消息。
+ *
+ * 函数为本条消息创建一个 ObjectStore 事务，逐个调用 handle_push() 将各个
+ * PushOp 的对象数据和元数据写入事务，并收集对应的 PushReplyOp。
+ * 事务提交完成后通过 on-complete 回调发送 MOSDPGPushReply，
+ * 通知 primary 本次 push 的处理结果；因此回复发送建立在本地写入完成之后。
+ *
+ * MOSDPGPush
+ * PushOp(A) -> submit_push_data() -> 追加对象 A 的写操作
+ * PushOp(B) -> submit_push_data() -> 追加对象 B 的写操作
+ * PushOp(C) -> submit_push_data() -> 追加对象 C 的写操作
+ *                                   ↓
+ *                          一个 Transaction t
+ *
+ * 每收到一条 MOSDPGPush
+ *  -> 创建并提交一个 ObjectStore Transaction
+ *
+ * 如果同一个对象被拆成三块，通常是三条消息、三个事务：
+ *   第 1 个 PushOp -> Transaction 1：写临时对象
+ *   第 2 个 PushOp -> Transaction 2：继续写临时对象
+ *   第 3 个 PushOp -> Transaction 3：写最后数据并切换正式对象
+ */
 void ReplicatedBackend::_do_push(OpRequestRef op)
 {
+  // 将收到的请求解码为 MOSDPGPush，里面可能包含多个对象的 PushOp。
   auto m = op->get_req<MOSDPGPush>();
   ceph_assert(m->get_type() == MSG_OSD_PG_PUSH);
+  // 记录发送 push 的 peer，后续 handle_push() 用它更新对应的 recovery 状态。
   pg_shard_t from = m->from;
 
+  // 标记该内部请求已经开始在 PG 中处理。
   op->mark_started();
 
+  // replies 与 m->pushes 中的 PushOp 一一对应，最后随回复消息发回 primary。
   vector<PushReplyOp> replies;
+  // 同一条 push 消息中的对象写入同一个 ObjectStore 事务，统一提交。
   ObjectStore::Transaction t{get_parent()->min_peer_features()};
   if (get_parent()->check_failsafe_full()) {
+    // failsafe full 表示 OSD 已不能继续安全写入，直接中止而不是接受更多恢复数据。
     dout(10) << __func__ << " Out of space (failsafe) processing push request." << dendl;
     ceph_abort();
   }
+  // 逐个处理 primary 携带的对象；handle_push() 把写操作加入 t 并填充对应回复。
   for (vector<PushOp>::const_iterator i = m->pushes.begin();
        i != m->pushes.end();
        ++i) {
@@ -1071,6 +1108,7 @@ void ReplicatedBackend::_do_push(OpRequestRef op)
     handle_push(from, *i, &(replies.back()), &t, m->is_repair);
   }
 
+  // 构造本次 push 的统一回复，携带发送端、PG、epoch 和每个对象的处理结果。
   MOSDPGPushReply *reply = new MOSDPGPushReply;
   reply->from = get_parent()->whoami_shard();
   reply->set_priority(m->get_priority());
@@ -1078,12 +1116,15 @@ void ReplicatedBackend::_do_push(OpRequestRef op)
   reply->map_epoch = m->map_epoch;
   reply->min_epoch = m->min_epoch;
   reply->replies.swap(replies);
+  // 根据回复中包含的对象结果计算其调度成本。
   reply->compute_cost(cct);
 
+  // 只有事务完成后才发送回复，确保 primary 收到成功结果时本地写入已经完成。
   t.register_on_complete(
     new PG_SendMessageOnConn(
       get_parent(), reply, m->get_connection()));
 
+  // 将对象写入和完成回调交给 ObjectStore 异步执行。
   get_parent()->queue_transaction(std::move(t));
 }
 
@@ -1559,6 +1600,10 @@ void ReplicatedBackend::repop_commit(RepModifyRef rm)
 
 // ===========================================================
 
+/**
+ * 计算恢复 head 时需要从 primary 发送的数据范围，
+ * 以及可由 peer 的旧 clone 复用的范围；结果分别写入 data_subset 和 clone_subsets。
+ */
 void ReplicatedBackend::calc_head_subsets(
   ObjectContextRef obc, SnapSet& snapset, const hobject_t& head,
   const pg_missing_t& missing,
@@ -1567,26 +1612,31 @@ void ReplicatedBackend::calc_head_subsets(
   map<hobject_t, interval_set<uint64_t>>& clone_subsets,
   ObcLockManager &manager)
 {
+  // 初始假设需要发送整个 head，后续根据 dirty 区域和 clone overlap 缩小范围。
   dout(10) << "calc_head_subsets " << head
 	   << " clone_overlap " << snapset.clone_overlap << dendl;
 
   uint64_t size = obc->obs.oi.size;
+  // head 的完整数据范围为 [0, size)。
   if (size)
     data_subset.insert(0, size);
 
   ceph_assert(HAVE_FEATURE(parent->min_peer_features(), SERVER_OCTOPUS));
   const auto it = missing.get_items().find(head);
   ceph_assert(it != missing.get_items().end());
+  // 只发送 peer 可能不一致的 dirty 区域，clean 区域无需重新传输。
   data_subset.intersection_of(it->second.clean_regions.get_dirty_regions());
   dout(10) << "calc_head_subsets " << head
 	   << " data_subset " << data_subset << dendl;
 
   if (get_parent()->get_pool().allow_incomplete_clones()) {
+    // 允许不完整 clone 时不使用 clone overlap 优化，保留 dirty 区域直接发送。
     dout(10) << __func__ << ": caching (was) enabled, skipping clone subsets" << dendl;
     return;
   }
 
   if (!cct->_conf->osd_recover_clone_overlap) {
+    // 配置关闭 clone overlap 优化，直接发送 data_subset。
     dout(10) << "calc_head_subsets " << head << " -- osd_recover_clone_overlap disabled" << dendl;
     return;
   }
@@ -1598,8 +1648,10 @@ void ReplicatedBackend::calc_head_subsets(
   if (size)
     prev.insert(0, size);
 
+  // 从最新 clone 向较旧 clone 查找一个 peer 已有且可作为数据来源的 clone。
   for (int j=snapset.clones.size()-1; j>=0; j--) {
     c.snap = snapset.clones[j];
+    // 沿 clone 链求交集，只保留从该 clone 到 head 一直未变化的范围。
     prev.intersection_of(snapset.clone_overlap[snapset.clones[j]]);
     if (!missing.is_missing(c) &&
 	c < last_backfill &&
@@ -1613,13 +1665,16 @@ void ReplicatedBackend::calc_head_subsets(
 	     << " overlap " << prev << dendl;
   }
 
+  // 只保留同时属于 dirty 区域和 clone 共享区域的部分，避免复用 clean 数据。
   cloning.intersection_of(data_subset);
   if (cloning.empty()) {
+    // 没有可复用且确实需要恢复的范围，继续按普通数据发送路径处理。
     dout(10) << "skipping clone, nothing needs to clone" << dendl;
     return;
   }
 
   if (cloning.num_intervals() > g_conf().get_val<uint64_t>("osd_recover_clone_overlap_limit")) {
+    // 共享范围过于零散时优化收益不足，释放已持有的 clone 读锁并放弃复用。
     dout(10) << "skipping clone, too many holes" << dendl;
     get_parent()->release_locks(manager);
     clone_subsets.clear();
@@ -1627,7 +1682,7 @@ void ReplicatedBackend::calc_head_subsets(
     return;
   }
 
-  // what's left for us to push?
+  // 保存 peer 可提供的 clone 范围，并从待发送范围中扣除它。
   clone_subsets[c] = cloning;
   data_subset.subtract(cloning);
 
@@ -1948,6 +2003,10 @@ int ReplicatedBackend::prep_push(ObjectContextRef obc,
 	    pop, cache_dont_need, ObcLockManager());
 }
 
+/**
+ * 保存一次向 peer 推送对象所需的 recovery 状态，并根据当前进度构造 PushOp；
+ * data_subset/clone_subsets 已由上层计算，具体对象内容由 build_push_op() 填充。
+ */
 int ReplicatedBackend::prep_push(
   ObjectContextRef obc,
   const hobject_t& soid, pg_shard_t peer,
@@ -1958,13 +2017,15 @@ int ReplicatedBackend::prep_push(
   bool cache_dont_need,
   ObcLockManager &&lock_manager)
 {
+  // 标记该 peer 正在恢复此对象，并确认 peer 的 missing 表仍包含该对象。
   get_parent()->begin_peer_recover(peer, soid);
   const auto pmissing_iter = get_parent()->get_shard_missing().find(peer);
   const auto missing_iter = pmissing_iter->second.get_items().find(soid);
   ceph_assert(missing_iter != pmissing_iter->second.get_items().end());
-  // take note.
+  // 在 pushing 中建立该对象到 peer 的 backend 内部状态，后续分块 push 会继续更新它。
   push_info_t &push_info = pushing[soid][peer];
   push_info.obc = obc;
+  // 保存对象大小、版本、属性、SnapSet 及已计算出的数据/clone 范围。
   push_info.recovery_info.size = obc->obs.oi.size;
   push_info.recovery_info.copy_subset = data_subset;
   push_info.recovery_info.clone_subset = clone_subsets;
@@ -1973,21 +2034,36 @@ int ReplicatedBackend::prep_push(
   push_info.recovery_info.ss = pop->recovery_info.ss;
   push_info.recovery_info.version = version;
   push_info.recovery_info.object_exist = missing_iter->second.clean_regions.object_is_exist();
+  // omap 脏标记决定 build_push_op 是否还需要读取并发送 omap 内容。
   push_info.recovery_progress.omap_complete = !missing_iter->second.clean_regions.omap_is_dirty();
+  // 保留 clone 复用过程中获取的读锁，直到该对象 recovery 完成。
   push_info.lock_manager = std::move(lock_manager);
 
+  // 按当前 recovery 进度读取对象并填充 PushOp，同时计算下一次进度。
+  // push_info.recovery_progress 副本收到 PushOp 后，返回 PushReply，
+  // primary 收到 PushReply -> handle_push_reply() 再次根据 push_info.recovery_progress 调用 build_push_op()
   ObjectRecoveryProgress new_progress;
   int r = build_push_op(push_info.recovery_info,
 			push_info.recovery_progress,
 			&new_progress,
 			pop,
 			&(push_info.stat), cache_dont_need);
-  if (r < 0)
+  if (r < 0) {
+    // 读取或构造 push 内容失败，交由上层执行 recovery 失败清理。
     return r;
+  }
+  // 保存增量 push 的新进度，后续继续请求时从这里接着读取。
   push_info.recovery_progress = new_progress;
   return 0;
 }
 
+/**
+ * 将一次 PushOp 携带的数据提交到副本端的 ObjectStore 事务。
+ *
+ * 首块负责选择并初始化正式对象或临时恢复对象，后续各块向该对象写入数据、零区间、omap 和属性。
+ * 收到最后一块后，函数将临时对象原子切换为正式对象，
+ * 并调用 submit_push_complete() 处理 clone 数据和恢复收尾。
+ */
 void ReplicatedBackend::submit_push_data(
   const ObjectRecoveryInfo &recovery_info,
   bool first,
@@ -2002,21 +2078,26 @@ void ReplicatedBackend::submit_push_data(
   const map<string, bufferlist> &omap_entries,
   ObjectStore::Transaction *t)
 {
+  // 未完成的分块恢复先写入临时对象，避免客户端看到不完整的数据。
   hobject_t target_oid;
   if (first && complete) {
+    // 单块即可完成时直接写入正式对象。
     target_oid = recovery_info.soid;
   } else {
+    // 多块恢复或非首块都使用与对象版本绑定的临时对象。
     target_oid = get_parent()->get_temp_recovery_object(recovery_info.soid,
-							recovery_info.version);
+								recovery_info.version);
     if (first) {
+      // 首次使用临时对象时，将其登记到临时 collection，便于恢复中断时清理。
       dout(10) << __func__ << ": Adding oid "
-	       << target_oid << " in the temp collection" << dendl;
+		       << target_oid << " in the temp collection" << dendl;
       add_temp_obj(target_oid);
     }
   }
 
   if (first) {
     if (!complete) {
+      // 首块开始前重置临时对象，并设置预期大小和写入大小等分配提示。
       t->remove(coll, ghobject_t(target_oid));
       t->touch(coll, ghobject_t(target_oid));
       object_info_t oi(attrs.at(OI_ATTR));
@@ -2025,29 +2106,33 @@ void ReplicatedBackend::submit_push_data(
 		        oi.expected_write_size,
 		        oi.alloc_hint_flags);
       } else {
+        // 单块完成或覆盖正式对象时，仅在原对象不存在时先创建对象。
         if (!recovery_info.object_exist) {
-	  t->remove(coll, ghobject_t(target_oid));
+		  t->remove(coll, ghobject_t(target_oid));
           t->touch(coll, ghobject_t(target_oid));
           object_info_t oi(attrs.at(OI_ATTR));
           t->set_alloc_hint(coll, ghobject_t(target_oid),
                             oi.expected_object_size,
                             oi.expected_write_size,
-                            oi.alloc_hint_flags);
+	                            oi.alloc_hint_flags);
         }
-        //remove xattr and update later if overwrite on original object
+        // 覆盖已有对象时清除旧属性，随后由本次 push 的 attrs 重新设置。
         t->rmattrs(coll, ghobject_t(target_oid));
-        //if need update omap, clear the previous content first
+        // 本次需要更新 omap 时先清空旧键，避免残留不属于当前版本的键。
         if (clear_omap)
           t->omap_clear(coll, ghobject_t(target_oid));
       }
 
+    // 首块设置对象最终大小，并写入 omap header（如果消息携带）。
     t->truncate(coll, ghobject_t(target_oid), recovery_info.size);
     if (omap_header.length())
       t->omap_setheader(coll, ghobject_t(target_oid), omap_header);
 
+    // 读取本地正式对象大小，用于 backfill 字节统计和 clone overlap 复制。
     struct stat st;
     int r = store->stat(ch, ghobject_t(recovery_info.soid), &st);
     if (get_parent()->pg_is_remote_backfilling()) {
+      // 远端 backfill 需要把目标对象大小变化反映到 PG 的字节统计中。
       uint64_t size = 0;
       if (r == 0)
         size = st.st_size;
@@ -2063,21 +2148,30 @@ void ReplicatedBackend::submit_push_data(
       }
     }
     if (!complete) {
-      //clone overlap content in local object
+      // 某对象恢复的第一块，并且对象还没有恢复完成 -> first == true + complete == false
+      // 此时副本不能直接把不完整数据写入正式对象，而是先创建临时对象。
+      // 临时对象需要包含完整内容，因此要把“本地已有、primary 不会发送”的部分也复制过去。
       if (recovery_info.object_exist) {
         ceph_assert(r == 0);
         uint64_t local_size = std::min(recovery_info.size, (uint64_t)st.st_size);
+        // local_intervals_included 表示副本本地正式对象已有的全部范围
+        // local_intervals_excluded 计算本地范围和 primary 发送范围的交集。这些区间之后会由 primary 提供，因此本地副本不需要复制。
         interval_set<uint64_t> local_intervals_included, local_intervals_excluded;
         if (local_size) {
+          // 以本地对象实际大小为上限，排除本次需要从 primary 恢复的范围。
           local_intervals_included.insert(0, local_size);
+          // recovery_info.copy_subset 表示 primary 会通过 recovery push 发送给副本的范围
           local_intervals_excluded.intersection_of(local_intervals_included, recovery_info.copy_subset);
+          // 从本地已有范围中扣除 primary 将发送的范围，剩下的就是可以直接复用的本地数据。
           local_intervals_included.subtract(local_intervals_excluded);
         }
        for (interval_set<uint64_t>::const_iterator q = local_intervals_included.begin();
           q != local_intervals_included.end();
          ++q) {
+         // clone_range 复用本地已有内容，减少从 primary 传输的数据量。
          dout(15) << " clone_range " << recovery_info.soid << " "
                   << q.get_start() << "~" << q.get_len() << dendl;
+        // 把这些本地区间复制到临时对象。
          t->clone_range(coll, ghobject_t(recovery_info.soid), ghobject_t(target_oid),
              q.get_start(), q.get_len(), q.get_start());
         }
@@ -2085,11 +2179,13 @@ void ReplicatedBackend::submit_push_data(
     }
   }
   uint64_t off = 0;
+  // data_included 中的数据按区间紧密排列，off 表示当前区间在 bufferlist 中的偏移。
   uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL;
   if (cache_dont_need)
     fadvise_flags |= CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
-  // Punch zeros for data, if fiemap indicates nothing but it is marked dirty
+  // 对 fiemap 中未实际分配但被标记为 dirty 的范围显式写零，保持对象内容正确。
   if (data_zeros.size() > 0) {
+    // 只处理对象恢复范围内的零区间，并扣除本次已经携带真实数据的区间。
     data_zeros.intersection_of(recovery_info.copy_subset);
     ceph_assert(intervals_included.subset_of(data_zeros));
     data_zeros.subtract(intervals_included);
@@ -2099,9 +2195,11 @@ void ReplicatedBackend::submit_push_data(
              << " intervals_included: " << intervals_included
              << " data_zeros: " << data_zeros << dendl;
 
+    // 对剩余空洞生成 zero 操作，后续与普通写操作一起提交。
     for (auto p = data_zeros.begin(); p != data_zeros.end(); ++p)
       t->zero(coll, ghobject_t(target_oid), p.get_start(), p.get_len());
   }
+  // 将 data_included 中的紧密数据逐段写入目标对象的实际偏移。
   for (interval_set<uint64_t>::const_iterator p = intervals_included.begin();
        p != intervals_included.end();
        ++p) {
@@ -2112,6 +2210,7 @@ void ReplicatedBackend::submit_push_data(
     off += p.get_len();
   }
 
+  // 写入本次 push 携带的 omap 键和值，以及对象属性。
   if (!omap_entries.empty())
     t->omap_setkeys(coll, ghobject_t(target_oid), omap_entries);
   if (!attrs.empty())
@@ -2119,6 +2218,7 @@ void ReplicatedBackend::submit_push_data(
 
   if (complete) {
     if (!first) {
+      // 后续块完成时，删除正式对象并把完整临时对象重命名为正式对象。
       dout(10) << __func__ << ": Removing oid "
                << target_oid << " from the temp collection" << dendl;
       clear_temp_obj(target_oid);
@@ -2127,6 +2227,7 @@ void ReplicatedBackend::submit_push_data(
                                 coll, ghobject_t(recovery_info.soid));
     }
 
+    // 登记对象恢复完成后的 clone 复制和 PG 状态更新操作。
     submit_push_complete(recovery_info, t);
 
   }
@@ -2300,27 +2401,42 @@ bool ReplicatedBackend::handle_pull_response(
   }
 }
 
+/**
+ * 在副本端处理一个来自 primary 的 PushOp。
+ *
+ * 函数根据 PushOp 的前后恢复进度判断本次数据是否为首块、对象是否已经完整恢复，
+ * 以及是否需要清理 omap，然后调用 submit_push_data() 将数据、属性和 omap 内容加入 ObjectStore 事务。
+ * 对象的最后一块处理完成后，通过 on_local_recover() 更新 PG 的本地恢复状态。
+ */
 void ReplicatedBackend::handle_push(
   pg_shard_t from, const PushOp &pop, PushReplyOp *response,
   ObjectStore::Transaction *t, bool is_repair)
 {
+  // 输出本次 PushOp 携带的恢复信息和处理前后的进度，便于诊断分块恢复。
   dout(10) << "handle_push "
 	   << pop.recovery_info
 	   << pop.after_progress
 	   << dendl;
+  // 复制数据使用独立的 bufferlist，后续交由 submit_push_data() 写入事务。
   bufferlist data;
   data = pop.data;
+  // before_progress.first 表示这是该对象恢复的第一块数据。
   bool first = pop.before_progress.first;
+  // 数据和 omap 都完成时，整个对象的 push 才算完成。
   bool complete = pop.after_progress.data_complete &&
     pop.after_progress.omap_complete;
+  // 如果此前 omap 尚未完成，本次写入需要按恢复数据处理并更新 omap。
   bool clear_omap = !pop.before_progress.omap_complete;
   interval_set<uint64_t> data_zeros;
+  // 根据前后进度计算本次 push 覆盖的数据区间；区间中的空洞需要按零处理。
   uint64_t z_offset = pop.before_progress.data_recovered_to;
   uint64_t z_length = pop.after_progress.data_recovered_to - pop.before_progress.data_recovered_to;
   if (z_length)
     data_zeros.insert(z_offset, z_length);
+  // 回复必须带回本次处理的对象标识，供 primary 匹配其 recovery 状态。
   response->soid = pop.recovery_info.soid;
 
+  // 将本块的数据、属性、omap 和进度信息加入副本端事务。
   submit_push_data(pop.recovery_info,
 		   first,
 		   complete,
@@ -2335,10 +2451,12 @@ void ReplicatedBackend::handle_push(
 		   t);
 
   if (complete) {
+    // repair push 完成时额外累计 repaired 统计。
     if (is_repair) {
       get_parent()->inc_osd_stat_repaired();
       dout(20) << __func__ << " repair complete" << dendl;
     }
+    // 对象已在副本端恢复完成，登记本地恢复完成回调并关联当前事务。
     get_parent()->on_local_recover(
       pop.recovery_info.soid,
       pop.recovery_info,
@@ -2437,6 +2555,11 @@ static bufferlist to_bufferlist(std::string_view in) {
   return bl;
 }
 
+/**
+ * 按当前 recovery 进度构造一个 PushOp：
+ * 读取对象元数据、omap 和数据范围，将本次分块内容写入 out_op，并返回下一次继续读取所需的进度。
+ * 一个对象可能需要多个 PushOp 才能完成，progress 用于保证分块读取可续接。
+ */
 int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
 				     const ObjectRecoveryProgress &progress,
 				     ObjectRecoveryProgress *out_progress,
@@ -2444,10 +2567,12 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
 				     object_stat_sum_t *stat,
                                      bool cache_dont_need)
 {
+  // 调用者可以传入输出进度；未提供时使用局部对象，仍保证本次计算有独立结果。
   ObjectRecoveryProgress _new_progress;
   if (!out_progress)
     out_progress = &_new_progress;
   ObjectRecoveryProgress &new_progress = *out_progress;
+  // 先继承上次进度，下面只推进本次实际读取到的位置。
   new_progress = progress;
 
   dout(7) << __func__ << " " << recovery_info.soid
@@ -2459,6 +2584,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
   eversion_t v  = recovery_info.version;
   object_info_t oi;
   if (progress.first) {
+    // 第一个分块读取 omap header 和对象属性，并据此校验本地对象版本。
     int r = store->omap_get_header(ch, ghobject_t(recovery_info.soid), &out_op->omap_header);
     if (r < 0) {
       dout(1) << __func__ << " get omap header failed: " << cpp_strerror(-r) << dendl;
@@ -2470,7 +2596,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
       return r;
     }
 
-    // Debug
+    // 解码 OI_ATTR，既用于版本校验，也用于后面的完整对象 CRC 校验。
     try {
      oi.decode(out_op->attrset[OI_ATTR]);
     } catch (...) {
@@ -2478,7 +2604,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
       return -EINVAL;
     }
 
-    // If requestor didn't know the version, use ours
+    // 请求方未提供版本时采用本地版本；若版本不一致，说明恢复源已发生变化。
     if (v == eversion_t()) {
       v = oi.version;
     } else if (oi.version != v) {
@@ -2498,6 +2624,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
 
   uint64_t available = cct->_conf->osd_recovery_max_chunk;
   if (!progress.omap_complete) {
+    // omap 尚未读完时，先在本次 chunk 预算内继续读取 omap 条目。
     using omap_iter_seek_t = ObjectStore::omap_iter_seek_t;
     auto result = store->omap_iterate(
       ch,
@@ -2514,28 +2641,33 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
       (std::string_view key, std::string_view value) mutable {
         const auto num_new_bytes = key.size() + value.size();
         if (auto cur_num_entries = omap_entries.size(); cur_num_entries > 0) {
-	  if (max_entries > 0 && cur_num_entries >= max_entries) {
+          if (max_entries > 0 && cur_num_entries >= max_entries) {
+            // 达到单个 push 允许携带的 omap 条目数，保存当前 key 供下一块继续。
             new_progress.omap_recovered_to = key;
             return ObjectStore::omap_iter_ret_t::STOP; // want more!
 	  }
-	  if (num_new_bytes >= available) {
+          if (num_new_bytes >= available) {
+            // 当前条目放不进剩余预算，保留其 key，下一块从这里继续。
             new_progress.omap_recovered_to = key;
             return ObjectStore::omap_iter_ret_t::STOP;
 	  }
         }
         omap_entries.insert(make_pair(key, to_bufferlist(value)));
-	available -= std::min(available, num_new_bytes);
+	        // omap 条目占用与对象数据共享同一个 recovery chunk 预算。
+	        available -= std::min(available, num_new_bytes);
         return ObjectStore::omap_iter_ret_t::NEXT;
       });
     if (result < 0) {
       return -EIO;
     } else if (const auto more = static_cast<bool>(result); !more) {
+      // 迭代器已到末尾，本次之后 omap 部分完成。
       new_progress.omap_complete = true;
     }
   }
 
   if (available > 0) {
     if (!recovery_info.copy_subset.empty()) {
+      // 只从 copy_subset 中选择本次要发送的范围，并过滤掉本地未实际分配的区间。
       interval_set<uint64_t> copy_subset = recovery_info.copy_subset;
       map<uint64_t, uint64_t> m;
       int r = store->fiemap(ch, ghobject_t(recovery_info.soid), 0,
@@ -2548,9 +2680,10 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
         copy_subset.clear();
       }
 
+      // 从上次进度位置开始，最多选取 available 字节的连续/稀疏范围。
       out_op->data_included.span_of(copy_subset, progress.data_recovered_to,
                                     available);
-      // zero filled section, skip to end!
+      // 若没有可读范围或已到 copy_subset 末尾，直接把数据进度推进到末尾。
       if (out_op->data_included.empty() ||
           out_op->data_included.range_end() == copy_subset.range_end())
         new_progress.data_recovered_to = recovery_info.copy_subset.range_end();
@@ -2558,11 +2691,13 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
         new_progress.data_recovered_to = out_op->data_included.range_end();
     }
   } else {
+    // omap 已耗尽本次 chunk 预算，不再读取对象数据。
     out_op->data_included.clear();
   }
 
   auto origin_size = out_op->data_included.size();
   bufferlist bit;
+  // 按 data_included 指定的范围读取对象数据
   int r = store->readv(ch, ghobject_t(recovery_info.soid),
 		       out_op->data_included, bit,
                        cache_dont_need ? CEPH_OSD_OP_FLAG_FADVISE_DONTNEED: 0);
@@ -2572,6 +2707,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
     r = -EIO;
   }
   if (r < 0) {
+    // 本地读取失败时，当前 PushOp 无法发送，交由上层 recovery 失败处理。
     return r;
   }
   if (out_op->data_included.size() != origin_size) {
@@ -2584,6 +2720,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
   if (progress.first && !out_op->data_included.empty() &&
       out_op->data_included.begin().get_start() == 0 &&
       out_op->data.length() == oi.size && oi.is_data_digest()) {
+    // 第一个分块恰好包含完整对象时，用 OI_ATTR 中的 digest 校验读取内容。
     uint32_t crc = out_op->data.crc32c(-1);
     if (oi.data_digest != crc) {
       dout(0) << __func__ << " " << coll << std::hex
@@ -2595,6 +2732,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
   }
 
   if (new_progress.is_complete(recovery_info)) {
+    // 数据和 omap 都已完成，记录对象恢复/修复统计。
     new_progress.data_complete = true;
     if (stat) {
       stat->num_objects_recovered++;
@@ -2602,11 +2740,13 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
         stat->num_objects_repaired++;
     }
   } else if (progress.first && progress.omap_complete) {
+    // 数据仍未完成时，强制后续分块继续处理 omap 状态，避免遗漏元数据。
     // If omap is not changed, we need recovery omap when recovery cannot be completed once
     new_progress.omap_complete = false;
   }
 
   if (stat) {
+    // 统计本次 push 实际读取的 omap 条目和数据字节数。
     stat->num_keys_recovered += out_op->omap_entries.size();
     stat->num_bytes_recovered += out_op->data.length();
     get_parent()->get_logger()->inc(l_osd_rbytes, out_op->omap_entries.size() + out_op->data.length());
@@ -2615,7 +2755,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
   get_parent()->get_logger()->inc(l_osd_push);
   get_parent()->get_logger()->inc(l_osd_push_outb, out_op->data.length());
 
-  // send
+  // 把版本、对象标识、前后进度和 recovery 信息写入待发送的 PushOp。
   out_op->version = v;
   out_op->soid = recovery_info.soid;
   out_op->recovery_info = recovery_info;
