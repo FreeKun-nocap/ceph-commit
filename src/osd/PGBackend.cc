@@ -127,6 +127,13 @@ void PGBackend::send_recovery_deletes(int prio,
   }
 }
 
+/**
+ * 处理送达 PG backend 的内部协议消息。
+ *
+ * recovery delete 及其回复由 PGBackend 基类直接处理；
+ * 其他消息继续交给具体 backend 的 _handle_message()，例如 ReplicatedBackend 负责处理 push、pull 及其回复。
+ * 返回 true 表示消息已被当前 backend 消费，调用方无需再做通用的 PG 消息分派。
+ */
 bool PGBackend::handle_message(OpRequestRef op)
 {
   switch (op->get_req()->get_type()) {
