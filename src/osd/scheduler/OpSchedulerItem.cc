@@ -211,6 +211,13 @@ void PGDelete::run(
   osd->dequeue_delete(sdata, pg.get(), epoch_queued, handle);
 }
 
+/**
+ * 执行一个已从 OSD 调度队列取出的恢复相关消息。
+ *
+ * 该消息可能是 push、push reply、pull、backfill 或 scan 等恢复协议消息。
+ * 函数先记录消息在恢复队列中的等待延迟，再通过 OSD::dequeue_op() 将消息交给目标 PG 及其 backend 处理；
+ * 处理完成后释放调度 worker 为该 PG 持有的锁。
+ */
 void PGRecoveryMsg::run(
   OSD *osd,
   OSDShard *sdata,
