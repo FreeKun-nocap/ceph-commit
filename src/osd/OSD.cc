@@ -10321,25 +10321,36 @@ void OSDService::start_recovery_op(PG *pg, const hobject_t& soid)
 #endif
 }
 
+/**
+ * 完成一个 PG recovery operation 在 OSD 全局层面的登记。
+ *
+ * 函数在 recovery_lock 保护下减少 OSD 当前活动 recovery 数量，
+ * 并在调试模式下移除对应的 PG/对象记录。
+ * 释放出的全局 recovery 配额随后交给 _maybe_queue_recovery()，尝试唤醒等待中的 recovery 任务。
+ */
 void OSDService::finish_recovery_op(PG *pg, const hobject_t& soid, bool dequeue)
 {
+  // recovery_ops_active 会被多个 PG 共享，必须在全局 recovery 锁下更新。
   std::lock_guard l(recovery_lock);
+  // dequeue 仅用于记录本次完成是否来自出队/清理路径，便于调试调度行为。
   dout(10) << "finish_recovery_op " << *pg << " " << soid
 	   << " dequeue=" << dequeue
 	   << " (" << recovery_ops_active << "/"
 	   << osd->get_recovery_max_active() << " rops)"
 	   << dendl;
 
-  // adjust count
+  // 归还一个 OSD 全局 recovery 槽位。
   ceph_assert(recovery_ops_active > 0);
   recovery_ops_active--;
 
 #ifdef DEBUG_RECOVERY_OIDS
+  // 调试模式下同步删除该 PG 中对象的活动 recovery 记录。
   dout(20) << "  active oids was " << recovery_oids[pg->pg_id] << dendl;
   ceph_assert(recovery_oids[pg->pg_id].count(soid));
   recovery_oids[pg->pg_id].erase(soid);
 #endif
 
+  // 利用刚释放的槽位，尝试从等待队列中再调度 recovery。
   _maybe_queue_recovery();
 }
 
