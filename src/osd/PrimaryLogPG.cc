@@ -497,43 +497,59 @@ void PrimaryLogPG::on_local_recover(
       info.last_complete));
 }
 
+/**
+ * 处理一个对象已经完成全局 recovery 的通知。
+ *
+ * 该通知表示对象已经在 primary 以及所有需要恢复的 peer 上完成同步。
+ * 函数更新 recovery 状态和统计，清理对象级 tracking，
+ * 并通过 finish_recovery_op() 触发下一轮 recovery 调度；
+ * 同时唤醒因对象 degraded 或 unreadable 而等待的请求。
+ */
 void PrimaryLogPG::on_global_recover(
   const hobject_t &soid,
   const object_stat_sum_t &stat_diff,
   bool is_delete)
 {
+  // 从 recovery 状态中移除该对象，并应用本次恢复产生的统计变化。
   recovery_state.object_recovered(soid, stat_diff);
   publish_stats_to_osd();
   dout(10) << "pushed " << soid << " to all replicas" << dendl;
+  // recovering 中应存在该对象的全局恢复记录。
   auto i = recovering.find(soid);
   ceph_assert(i != recovering.end());
 
   if (i->second && i->second->rwstate.recovery_read_marker) {
-    // recover missing won't have had an obc, but it gets filled in
-    // during on_local_recover
+    // 释放 recovery 期间持有的读标记，并重新排队此前被该标记阻塞的请求。
     ceph_assert(i->second);
     list<OpRequestRef> requeue_list;
     i->second->drop_recovery_read(&requeue_list);
     requeue_ops(requeue_list);
   }
 
+  // 该对象不再占用 backfill 并发槽位。
   backfills_in_flight.erase(soid);
 
+  // 清除对象级恢复记录，并减少当前 PG 的活动 recovery 数量。
   recovering.erase(i);
+  // finish_recovery_op() 内部会重新 queue_recovery()，让 OSD 调度下一轮工作。
   finish_recovery_op(soid);
+  // 恢复完成后解除针对该对象的 backoff 限制。
   release_backoffs(soid);
+  // 恢复对象后，唤醒等待 PG 变为非 degraded 的请求。
   auto degraded_object_entry = waiting_for_degraded_object.find(soid);
   if (degraded_object_entry != waiting_for_degraded_object.end()) {
     dout(20) << " kicking degraded waiters on " << soid << dendl;
     requeue_ops(degraded_object_entry->second);
     waiting_for_degraded_object.erase(degraded_object_entry);
   }
+  // 对象恢复后，唤醒此前因对象不可读而等待的请求。
   auto unreadable_object_entry = waiting_for_unreadable_object.find(soid);
   if (unreadable_object_entry != waiting_for_unreadable_object.end()) {
     dout(20) << " kicking unreadable waiters on " << soid << dendl;
     requeue_ops(unreadable_object_entry->second);
     waiting_for_unreadable_object.erase(unreadable_object_entry);
   }
+  // 清理对象级 degraded/unreadable 等待状态。
   finish_degraded_object(soid);
   finish_unreadable_object(soid);
 }
