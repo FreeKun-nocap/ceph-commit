@@ -503,22 +503,34 @@ void PG::start_recovery_op(const hobject_t& soid)
   osd->start_recovery_op(this, soid);
 }
 
+/**
+ * 完成一个对象级 recovery operation 的 bookkeeping。
+ *
+ * 函数减少 PG 内部和 OSDService 中的活动 recovery 计数，并移除调试用的对象记录。
+ * 正常完成时继续调用 queue_recovery()，让 PG 处理剩余工作；
+ * dequeue 为 true 时表示正在清理或取消已有 recovery，不再重新排队。
+ */
 void PG::finish_recovery_op(const hobject_t& soid, bool dequeue)
 {
+  // 记录本次结束的对象，便于观察 recovery operation 的生命周期。
   dout(10) << "finish_recovery_op " << soid
 #ifdef DEBUG_RECOVERY_OIDS
 	   << " (" << recovering_oids << ")"
 #endif
 	   << dendl;
+  // PG 必须至少有一个活动 recovery operation 才能结束其中一个。
   ceph_assert(recovery_ops_active > 0);
   recovery_ops_active--;
 #ifdef DEBUG_RECOVERY_OIDS
+  // 调试模式下同步删除该对象的活动 recovery 标记。
   ceph_assert(recovering_oids.count(soid));
   recovering_oids.erase(recovering_oids.find(soid));
 #endif
+  // 更新 OSDService 的全局 recovery 配额，并尝试唤醒其他 PG 的 recovery。
   osd->finish_recovery_op(this, soid, dequeue);
 
   if (!dequeue) {
+    // 普通对象完成后重新排队，让下一次 PGRecovery 任务继续推进 recovery。
     queue_recovery();
   }
 }
