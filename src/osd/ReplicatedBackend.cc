@@ -1226,38 +1226,67 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
   get_parent()->queue_transaction(std::move(t));
 }
 
+/**
+ * 在提供数据的副本端处理 primary 发来的 MOSDPGPull 请求。
+ *
+ * 函数取出消息中的多个 PullOp，逐个调用 handle_pull() 从本地对象构造 PushOp，
+ * 并按请求来源 peer 组织回复，最后通过 send_pushes() 将对象数据返回给 primary。
+ */
 void ReplicatedBackend::do_pull(OpRequestRef op)
 {
+  // 取得可修改的 pull 消息，以便转移其中的 PullOp 列表。
   MOSDPGPull *m = static_cast<MOSDPGPull *>(op->get_nonconst_req());
   ceph_assert(m->get_type() == MSG_OSD_PG_PULL);
+  // from 是发起 pull 的 primary，后续 PushOp 将发送回该 shard。
   pg_shard_t from = m->from;
 
+  // 按目标 peer 分组保存要返回的 PushOp；本消息通常只对应一个来源 peer。
   map<pg_shard_t, vector<PushOp> > replies;
+  // 一条 MOSDPGPull 可以批量请求多个对象，逐个生成对应的数据回复。
   for (auto& i : m->take_pulls()) {
+    // 为当前 PullOp 预留一个 PushOp，handle_pull() 会填充对象数据和进度。
     replies[from].push_back(PushOp());
     handle_pull(from, i, &(replies[from].back()));
   }
+  // 将构造出的 PushOp 批量封装为 MOSDPGPush，发送回发起请求的 primary。
   send_pushes(m->get_priority(), replies);
 }
 
+/**
+ * 在 primary 端处理副本返回的 MOSDPGPushReply。
+ *
+ * 函数逐个处理回复中的 PushReplyOp，由 handle_push_reply() 更新对象的 recovery 进度并构造下一块 PushOp；
+ * 仍有数据未发送完的对象会被重新组织，最后通过 send_pushes() 继续向同一个副本发送。
+ * 所有对象都完成时则不会生成新的 PushOp。
+ */
 void ReplicatedBackend::do_push_reply(OpRequestRef op)
 {
+  // 将请求解析为 push 回复消息，并确认消息类型正确。
   auto m = op->get_req<MOSDPGPushReply>();
   ceph_assert(m->get_type() == MSG_OSD_PG_PUSH_REPLY);
+  // 记录回复来源，用于后续继续向同一个 peer 发送 recovery 数据。
   pg_shard_t from = m->from;
 
+  // 预留一个输出元素；每个仍未完成的对象会对应一个新的 PushOp。
   vector<PushOp> replies(1);
+  // 一条回复消息可能包含多个对象的处理结果，逐个推进其 recovery 状态。
   for (vector<PushReplyOp>::const_iterator i = m->replies.begin();
        i != m->replies.end();
        ++i) {
+    // 根据副本反馈的进度构造下一块数据；返回 true 表示该对象尚未完成。
     bool more = handle_push_reply(from, *i, &(replies.back()));
-    if (more)
+    if (more) {
+      // 当前输出 PushOp 已被当前对象使用，下一对象需要新的输出槽位。
       replies.push_back(PushOp());
+    }
   }
+  // 循环结束时最后一个元素只是预留槽位，移除它避免发送空 PushOp。
   replies.erase(replies.end() - 1);
 
+  // 将仍需继续恢复的 PushOp 按原 peer 分组，交给统一发送函数。
   map<pg_shard_t, vector<PushOp> > _replies;
   _replies[from].swap(replies);
+  // 对象还有剩余分块时发送下一轮；没有剩余对象时发送空集合，不会产生消息。
   send_pushes(m->get_priority(), _replies);
 }
 
@@ -2233,17 +2262,27 @@ void ReplicatedBackend::submit_push_data(
   }
 }
 
+/**
+ * 将对象恢复完成阶段可复用的 clone 数据追加到 ObjectStore 事务。
+ *
+ * clone_subset 按源对象和数据区间记录无需从 primary 传输、可以在本地复制的内容；
+ * 本函数只生成对应的 clone_range() 操作，不负责提交事务。
+ * 事务由调用方随后通过 queue_transaction() 统一提交。
+ */
 void ReplicatedBackend::submit_push_complete(
   const ObjectRecoveryInfo &recovery_info,
   ObjectStore::Transaction *t)
 {
+  // 外层遍历每个可提供数据的源 clone 对象。
   for (map<hobject_t, interval_set<uint64_t>>::const_iterator p =
 	 recovery_info.clone_subset.begin();
        p != recovery_info.clone_subset.end();
        ++p) {
+    // 同一个源对象可能对应多个不连续的可复用区间。
     for (interval_set<uint64_t>::const_iterator q = p->second.begin();
 	 q != p->second.end();
 	 ++q) {
+      // 将源 clone 的指定区间复制到已恢复的正式对象相同偏移处。
       dout(15) << " clone_range " << p->first << " "
 	       << q.get_start() << "~" << q.get_len() << dendl;
       t->clone_range(coll, ghobject_t(p->first), ghobject_t(recovery_info.soid),
@@ -2771,24 +2810,37 @@ void ReplicatedBackend::prep_push_op_blank(const hobject_t& soid, PushOp *op)
   op->soid = soid;
 }
 
+/**
+ * 处理一个副本对 PushOp 的回复，并推进该对象向该副本的恢复状态。
+ *
+ * primary 从 pushing[soid][peer] 取得此前保存的发送进度；
+ * 若对象还有未发送的数据，则构造下一块 PushOp 并返回 true。否则释放该 peer 的恢复状态；
+ * 当同一对象的所有目标 peer 都回复完成时，通知 PG 全局恢复成功或失败并返回 false。
+ */
 bool ReplicatedBackend::handle_push_reply(
   pg_shard_t peer, const PushReplyOp &op, PushOp *reply)
 {
+  // 回复只携带对象标识；primary 用它定位此前为该对象建立的 pushing 状态。
   const hobject_t &soid = op.soid;
   if (pushing.count(soid) == 0) {
+    // 本地已无该对象的 push 状态，说明回复过期或重复，不能再继续发送。
     dout(10) << "huh, i wasn't pushing " << soid << " to osd." << peer
 	     << ", or anybody else"
 	     << dendl;
     return false;
   } else if (pushing[soid].count(peer) == 0) {
+    // 该对象仍在恢复，但当前 peer 并不是等待回复的目标，同样忽略此回复。
     dout(10) << "huh, i wasn't pushing " << soid << " to osd." << peer
 	     << dendl;
     return false;
   } else {
+    // 取得这个对象到当前 peer 的恢复进度、统计信息和 clone 读锁。
     push_info_t *push_info = &pushing[soid][peer];
+    // 同一对象发往多个 peer 时，任一 peer 的读取失败都会传播为对象级错误。
     bool error = pushing[soid].begin()->second.recovery_progress.error;
 
     if (!push_info->recovery_progress.data_complete && !error) {
+      // 副本已确认上一块，primary 从保存的位置继续读取并构造下一块 PushOp。
       dout(10) << " pushing more from, "
 	       << push_info->recovery_progress.data_recovered_to
 	       << " of " << push_info->recovery_info.copy_subset << dendl;
@@ -2797,22 +2849,25 @@ bool ReplicatedBackend::handle_push_reply(
 	push_info->recovery_info,
 	push_info->recovery_progress, &new_progress, reply,
 	&(push_info->stat));
-      // Handle the case of a read error right after we wrote, which is
-      // hopefully extremely rare.
+      // 上一块已成功发送后本地读取下一块仍可能失败；此时转入统一失败清理。
       if (r < 0) {
         dout(5) << __func__ << ": oid " << soid << " error " << r << dendl;
 
 	error = true;
 	goto done;
       }
+      // 保存本次已构造的末尾进度，等待下一条 PushReply 再继续推进。
       push_info->recovery_progress = new_progress;
+      // true 让 do_push_reply() 将 reply 加入下一轮 MOSDPGPush。
       return true;
     } else {
-      // done!
+      // 该 peer 的数据已全部确认，或此前其他 peer 已使该对象进入错误状态。
 done:
+      // 成功时先通知 PG：当前 peer 已恢复该对象。
       if (!error)
 	get_parent()->on_peer_recover( peer, soid, push_info->recovery_info);
 
+      // 此 peer 不再需要 clone 范围读锁和恢复统计，清除对应 pushing 条目。
       get_parent()->release_locks(push_info->lock_manager);
       object_stat_sum_t stat = push_info->stat;
       eversion_t v = push_info->recovery_info.version;
@@ -2820,18 +2875,20 @@ done:
       push_info = nullptr;
 
       if (pushing[soid].empty()) {
+	// 最后一个 peer 完成时，才将对象标记为全局恢复完成或全局恢复失败。
 	if (!error)
 	  get_parent()->on_global_recover(soid, stat, false);
 	else
+	  // 后续 pull/recovery 会重新选择来源或按 PG 的失败路径处理该对象。
 	  get_parent()->on_failed_pull(
 	    std::set<pg_shard_t>{ get_parent()->whoami_shard() },
 	    soid,
 	    v);
 	pushing.erase(soid);
       } else {
-	// This looks weird, but we erased the current peer and need to remember
-	// the error on any other one, while getting more acks.
+	// 当前 peer 已完成，但仍在等待其他 peer 的回复。
 	if (error)
+	  // 将错误保存到剩余状态，避免其他 peer 完成后错误地报告全局成功。
 	  pushing[soid].begin()->second.recovery_progress.error = true;
 	dout(10) << "pushed " << soid << ", still waiting for push ack from "
 		 << pushing[soid].size() << " others" << dendl;
@@ -2841,35 +2898,52 @@ done:
   }
 }
 
+/**
+ * 根据 primary 发来的一个 PullOp，从本地对象构造对应的 PushOp 回复。
+ *
+ * 函数先确认对象仍存在并取得其大小；首次请求且大小尚未知时，用本地 stat 结果修正 recovery_info 的数据范围。
+ * 随后调用 build_push_op() 按当前进度读取一个恢复分块；
+ * 对象不存在或读取失败时生成空 PushOp，由请求方按失败路径处理。
+ */
 void ReplicatedBackend::handle_pull(pg_shard_t peer, PullOp &op, PushOp *reply)
 {
+  // PullOp 指定了请求方希望读取的对象。
   const hobject_t &soid = op.soid;
+  // 先检查本地对象是否存在，并取得其实际大小。
   struct stat st;
   int r = store->stat(ch, ghobject_t(soid), &st);
   if (r != 0) {
+    // 对象不可读时记录错误，并生成带空版本信息的回复，避免发送无效数据。
     get_parent()->clog_error() << get_info().pgid << " "
 			       << peer << " tried to pull " << soid
 			       << " but got " << cpp_strerror(-r);
     prep_push_op_blank(soid, reply);
   } else {
+    // 使用 PullOp 中保存的恢复信息和进度继续构造本对象的下一块数据。
     ObjectRecoveryInfo &recovery_info = op.recovery_info;
     ObjectRecoveryProgress &progress = op.recovery_progress;
     if (progress.first && recovery_info.size == ((uint64_t)-1)) {
-      // Adjust size and copy_subset
+      // 首次请求可能不知道对象大小，此时以本地 stat 结果补全 recovery 范围。
       recovery_info.size = st.st_size;
       if (st.st_size) {
+        // copy_subset 不能超出本地对象实际范围。
         interval_set<uint64_t> object_range;
         object_range.insert(0, st.st_size);
         recovery_info.copy_subset.intersection_of(object_range);
       } else {
+        // 空对象没有可发送的数据范围。
         recovery_info.copy_subset.clear();
       }
+      // pull 路径只处理 primary 请求的对象，不应携带 clone 复用范围。
       ceph_assert(recovery_info.clone_subset.empty());
     }
 
+    // 按当前 progress 读取并填充一个 PushOp；此处不需要额外输出新 progress。
     r = build_push_op(recovery_info, progress, 0, reply);
-    if (r < 0)
+    if (r < 0) {
+      // 本地读取或构造失败时发送空回复，由 primary 进入失败处理。
       prep_push_op_blank(soid, reply);
+    }
   }
 }
 
