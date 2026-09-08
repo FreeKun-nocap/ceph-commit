@@ -180,8 +180,10 @@ public:
     : pg(pg), c(c), e(e) {}
   void finish(T t) override {
     if (pg->pg_has_reset_since(e))
+      // PG 已 reset  -> 丢弃 c
       c.reset();
     else
+      // PG 未 reset  -> c->complete(handle)
       c.release()->complete(t);
   }
   bool sync_finish(T t) {
@@ -400,6 +402,14 @@ struct CopyFromFinisher : public PrimaryLogPG::OpFinisher {
 // ======================
 // PGBackend::Listener
 
+/**
+ * 将一个已接收完整的 recovery 对象登记为本地恢复完成。
+ *
+ * 调用者已经把对象数据或删除操作加入事务；本函数继续在同一事务中更新
+ * snap 映射、PG missing/last_complete 等持久化状态，并同步更新必要的内存状态。
+ * 随后分别为 primary 或 replica 注册 applied 回调，用于结束 active_pushes 计数，
+ * 再注册 commit 回调推进 last_complete_ondisk。函数本身不提交事务。
+ */
 void PrimaryLogPG::on_local_recover(
   const hobject_t &hoid,
   const ObjectRecoveryInfo &_recovery_info,
@@ -410,9 +420,12 @@ void PrimaryLogPG::on_local_recover(
 {
   dout(10) << __func__ << ": " << hoid << dendl;
 
+  // 使用副本，便于 LOST_REVERT 分支修正恢复版本而不修改调用者传入的信息。
   ObjectRecoveryInfo recovery_info(_recovery_info);
+  // 先从同一事务中清除旧的对象到快照映射；非删除 clone 会在下面重新建立。
   clear_object_snap_mapping(t, hoid);
   if (!is_delete && recovery_info.soid.is_snap()) {
+    // clone 对象需要按恢复信息中的 clone_snaps 重建 SnapMapper 索引。
     OSDriver::OSTransaction _t(osdriver.get_transaction(t));
     set<snapid_t> snaps;
     dout(20) << " snapset " << recovery_info.ss << dendl;
@@ -428,6 +441,10 @@ void PrimaryLogPG::on_local_recover(
       derr << __func__ << " " << hoid << " had no clone_snaps" << dendl;
     }
   }
+  // LOST_REVERT 代表对象无法恢复到最新版本，人工操作执行 mark_unfound_lost revert，将对象恢复到较旧版本。
+  // 但是最终需要将版本设置为最新版本 + 1，避免 PG 后续再次认为该对象仍缺失
+  // LOST_REVERT 可能拉回较旧的 reverting_to 版本，但 PG Log 需要把它记为
+  // LOST_REVERT 条目的新版本，因此同时修正 object_info 及 OI_ATTR。
   if (!is_delete && recovery_state.get_pg_log().get_missing().is_missing(recovery_info.soid) &&
       recovery_state.get_pg_log().get_missing().get_items().find(recovery_info.soid)->second.need > recovery_info.version) {
     ceph_assert(is_primary());
@@ -438,6 +455,7 @@ void PrimaryLogPG::on_local_recover(
 	       << " for " << *latest << dendl;
       recovery_info.version = latest->version;
       // update the attr to the revert event version
+      // 保留对象原版本为 prior_version，并让内存/磁盘属性使用 revert 日志版本。
       recovery_info.oi.prior_version = recovery_info.oi.version;
       recovery_info.oi.version = latest->version;
       bufferlist bl;
@@ -451,8 +469,11 @@ void PrimaryLogPG::on_local_recover(
   }
 
   // keep track of active pushes for scrub
+  // applied 回调会递减该计数；非零时 scrub 需等待 recovery 写操作应用完成。
   ++active_pushes;
 
+  // 从本地 missing 集合移除该版本，推进 last_complete，并把脏 PG 信息加入事务。
+  // primary 还会把自身加入该对象的可用位置；这不是“所有副本均已恢复”。
   recovery_state.recover_got(
     recovery_info.soid,
     recovery_info.version,
@@ -461,8 +482,10 @@ void PrimaryLogPG::on_local_recover(
 
   if (is_primary()) {
     if (!is_delete) {
+      // primary 已取得对象内容，更新 OBC 的存在性和最终 object_info 投影。
       obc->obs.exists = true;
 
+      // 为刚恢复出的 OBC 获取 recovery read 锁并设置标记，直至全局恢复完成后释放。
       bool got = obc->get_recovery_read();
       ceph_assert(got);
 
@@ -471,25 +494,30 @@ void PrimaryLogPG::on_local_recover(
       obc->obs.oi = recovery_info.oi;  // may have been updated above
     }
 
+    // 对象事务 applied 后减少 active_pushes，并在必要时恢复被阻塞的 scrub。
     t->register_on_applied(new C_OSD_AppliedRecoveredObject(this, obc));
 
+    // missing/readability 的内存状态已经更新，发布统计并解除不再需要的 backoff。
     publish_stats_to_osd();
     release_backoffs(hoid);
     if (!is_unreadable_object(hoid)) {
       auto unreadable_object_entry = waiting_for_unreadable_object.find(hoid);
       if (unreadable_object_entry != waiting_for_unreadable_object.end()) {
 	dout(20) << " kicking unreadable waiters on " << hoid << dendl;
+	// 对象在 primary 本地已可读，重新调度此前等待它的客户端请求。
 	requeue_ops(unreadable_object_entry->second);
 	finish_unreadable_object(unreadable_object_entry->first);
 	waiting_for_unreadable_object.erase(unreadable_object_entry);
       }
     }
   } else {
+    // replica 没有 primary 的 OBC 收尾，只需在 applied 后更新计数并唤醒 replica scrub。
     t->register_on_applied(
       new C_OSD_AppliedRecoveredObjectReplica(this));
 
   }
 
+  // 事务 commit 后，仅在 PG 未跨越新的 interval 时推进持久化的 last_complete 水位。
   t->register_on_commit(
     new C_OSD_CommittedPushedObject(
       this,
@@ -12965,11 +12993,23 @@ void PrimaryLogPG::finish_unreadable_object(const hobject_t oid)
     objects_blocked_on_unreadable_snap.erase(i);
 }
 
+/**
+ * 在 recovery 事务 commit 后推进持久化完成水位。
+ *
+ * on_local_recover() 注册 C_OSD_CommittedPushedObject，
+ * 并将登记回调时的 OSDMap epoch 与 info.last_complete 一同保存。
+ * ObjectStore 确认事务 commit 后，该 Context 的 finish() 调用本函数；
+ * 只有 PG 自该 epoch 起未 reset，才将 last_complete_ondisk 推进到该版本。
+ * 这样旧 interval 的异步回调不会覆盖当前 peering 状态。
+ */
 void PrimaryLogPG::_committed_pushed_object(
   epoch_t epoch, eversion_t last_complete)
 {
+  // 串行化访问 PG 的 recovery 状态与 last_complete_ondisk。
   std::scoped_lock locker{*this};
+  // PG 被删除，或已在更高 epoch reset 时，此回调对应的事务已属于旧 interval。
   if (!pg_has_reset_since(epoch)) {
+    // 标记该版本已落盘；replica 全量追平时，PeeringState 还会通知 primary。
     recovery_state.recovery_committed_to(last_complete);
   } else {
     dout(10) << __func__
@@ -12977,19 +13017,31 @@ void PrimaryLogPG::_committed_pushed_object(
   }
 }
 
+/**
+ * 在 primary 的本地 recovery 事务 applied 后完成内存收尾。
+ *
+ * on_local_recover() 为每个恢复事务递增 active_pushes，
+ * 并注册 C_OSD_AppliedRecoveredObject 回调；该回调经 Context::complete() 进入本函数。
+ * 此时 ObjectStore 已使事务结果可见，故减少计数。
+ * 最后一个恢复写操作完成时，若有进行中的 scrub 正等待 recovery，则重新排队 scrub 的 push 更新。
+ * 这不表示所有副本的全局恢复已经完成，也不提交新的事务。
+ */
 void PrimaryLogPG::_applied_recovered_object(ObjectContextRef obc)
 {
   dout(20) << __func__ << dendl;
   if (obc) {
     dout(20) << "obc = " << *obc << dendl;
   }
+  // 必须与 on_local_recover() 中的递增一一配对，防止回调重复执行或计数失衡。
   ceph_assert(active_pushes >= 1);
   --active_pushes;
 
   // requeue an active chunky scrub waiting on recovery ops
+  // 仅在 PG 未进入删除流程、所有 recovery 写已 applied 且 scrub 仍活跃时唤醒它。
   if (!recovery_state.is_deleting() && active_pushes == 0 &&
       is_scrub_active()) {
 
+    // 交给 OSD 队列继续推进 primary 的 scrub push/update 阶段。
     osd->queue_scrub_pushes_update(this, is_scrub_blocking_ops());
   }
 }
@@ -13008,22 +13060,34 @@ void PrimaryLogPG::_applied_recovered_object_replica()
   }
 }
 
+/**
+ * 处理从指定 shard 拉取对象失败的结果。
+ *
+ * 本函数撤销该对象的本地 recovery 读保护，清理 recovering 状态，
+ * 并把失败来源重新标记为缺少该版本；随后关闭本次 recovery 尝试、解除 degraded 状态。
+ * 若失败来源包含 primary，则还要记录 primary 本地缺失错误并释放 backfill 槽位。
+ * 这里处理的是一次 pull 尝试失败，不等同于对象已经被判定为全局 unfound。
+ */
 void PrimaryLogPG::on_failed_pull(
   const set<pg_shard_t> &from,
   const hobject_t &soid,
   const eversion_t &v)
 {
   dout(20) << __func__ << ": " << soid << dendl;
+  // on_failed_pull() 只能处理当前正在 recovery 的对象。
   ceph_assert(recovering.count(soid));
   auto obc = recovering[soid];
   if (obc) {
+    // 释放 recovery read 标记，并重新排队此前被该标记阻塞的请求。
     list<OpRequestRef> blocked_ops;
     obc->drop_recovery_read(&blocked_ops);
     requeue_ops(blocked_ops);
   }
+  // 无论是否存在 OBC，都结束该对象的 recovering 跟踪。
   recovering.erase(soid);
   for (auto&& i : from) {
     if (i != pg_whoami) { // we'll get it below in primary_error
+      // 远端来源失败，先让 peering 状态重新记录该 peer 缺少此版本。
       recovery_state.force_object_missing(i, soid, v);
     }
   }
@@ -13032,12 +13096,16 @@ void PrimaryLogPG::on_failed_pull(
 	  << ", reps on " << recovery_state.get_missing_loc().get_locations(soid)
 	  << " unfound? " << recovery_state.get_missing_loc().is_unfound(soid)
 	  << dendl;
+  // 关闭本次 recovery 尝试；后续是否重试由 recovery 调度逻辑决定。
   finish_recovery_op(soid);  // close out this attempt,
+  // 失败后解除该对象的 degraded 等待状态。
   finish_degraded_object(soid);
 
   if (from.count(pg_whoami)) {
+    // primary 自身也缺少对象时，补记 primary 的 missing 状态并报告错误。
     dout(0) << " primary missing oid " << soid << " version " << v << dendl;
     primary_error(soid, v);
+    // 该对象不再占用 backfill 并发槽位。
     backfills_in_flight.erase(soid);
   }
 }
