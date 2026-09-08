@@ -1719,14 +1719,19 @@ double OSDService::get_cost_per_io() const
   return osd->op_shardedwq.get_cost_per_io();
 }
 
+/**
+ * 将已完成存储事务后的 recovery 续接回调排入 OSD 调度器。
+ */
 void OSDService::queue_recovery_context(
   PG *pg,
   GenContext<ThreadPool::TPHandle&> *c,
   uint64_t cost,
   int priority)
 {
+  // 记录该续接任务入队时的 OSDMap epoch，供 OpSchedulerItem 和 PGRecoveryContext 使用。
   epoch_t e = get_osdmap_epoch();
 
+  // mClock 使用调用者按实际恢复数据量估算的成本；旧 WPQ 保留固定配置成本。
   uint64_t cost_for_queue = [this, cost] {
     if (op_queue_type_t::mClockScheduler == osd->osd_op_queue_type()) {
       return cost;
@@ -1740,6 +1745,8 @@ void OSDService::queue_recovery_context(
     }
   }();
 
+  // PGRecoveryContext 接管 c 的所有权；priority 保存给后续 recovery 续接逻辑，
+  // osd_recovery_priority 则是本 OpSchedulerItem 在调度器中的优先级。
   enqueue_back(
     OpSchedulerItem(
       unique_ptr<OpSchedulerItem::OpQueueable>(
