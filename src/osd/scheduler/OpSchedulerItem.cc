@@ -189,16 +189,25 @@ void PGRecovery::run(
   pg->unlock();
 }
 
+/**
+ * 执行已排入 OSD 调度器的 recovery 续接回调。
+ *
+ * OSDService::queue_recovery_context() 将 GenContext 封装为本调度项；
+ * _process() 已在进入本函数前持有 PG 锁。回调完成后由这里释放 PG 锁。
+ */
 void PGRecoveryContext::run(
   OSD *osd,
   OSDShard *sdata,
   PGRef& pg,
   ThreadPool::TPHandle &handle)
 {
+  // 统计从 queue_recovery_context() 入队到实际执行的等待时间。
   osd->logger->tinc(
     l_osd_recovery_context_queue_lat,
     ceph_clock_now() - time_queued);
+  // 转移 GenContext 所有权并执行；GenContext::complete() 在 finish() 返回后删除回调。
   c.release()->complete(handle);
+  // 与 _process() 获取的 PG 锁配对；回调本身执行期间仍受该锁保护。
   pg->unlock();
 }
 
