@@ -1138,26 +1138,42 @@ struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
     list<ReplicatedBackend::pull_complete_info> &&to_continue)
     : bc(bc), to_continue(std::move(to_continue)), priority(priority) {}
 
+  /**
+   * 在 primary 的本地 pull 事务完成后，继续已拉完整对象的 recovery。
+   *
+   * _do_pull_response() 仅在 to_continue 非空时注册本回调，
+   * 并经 PG_RecoveryQueueAsync 重新进入 OSD recovery 调度器。
+   * 每个对象先清除 pulling 状态，再尝试向仍缺失它的副本准备 push；
+   * 所有准备结果集中到 一个 RPGHandle，最后由 run_recovery_op() 统一发送。
+   */
   void finish(ThreadPool::TPHandle &handle) override {
+    // 同一回调中的多个已完成 pull 对象共用一个 recovery handle，合并后续消息发送。
     ReplicatedBackend::RPGHandle *h = bc->_open_recovery_op();
     for (auto &&i: to_continue) {
+      // pull 信息保留到事务完成后，确保 OBC 和 pulling 状态在本地数据可用前不会被释放。
       auto j = bc->pulling.find(i.hoid);
       ceph_assert(j != bc->pulling.end());
       ObjectContextRef obc = j->second.obc;
+      // handle_pull_response() 已清除 pull_from_peer 反向索引；这里只删除 pulling 条目。
       bc->clear_pull(j, false /* already did it */);
       ceph_assert(obc);
+      // 为仍缺失该对象的 peer 准备 PushOp，并追加到 h。
       int started = bc->start_pushes(i.hoid, obc, h);
       if (started < 0) {
+	// 准备 push 失败时撤销本对象的临时 push 状态，并按本地 pull 失败处理。
 	bc->pushing[i.hoid].clear();
 	bc->get_parent()->on_failed_pull(
 	  { bc->get_parent()->whoami_shard() },
 	  i.hoid, obc->obs.oi.version);
       } else if (!started) {
+	// 没有 peer 需要继续接收该对象，primary 可直接登记该对象全局恢复完成。
 	bc->get_parent()->on_global_recover(
 	  i.hoid, i.stat, false);
       }
+      // 防止处理多个对象时 worker 因长时间运行触发线程池超时。
       handle.reset_tp_timeout();
     }
+    // 统一提交本批准备好的 push/pull/delete recovery 消息；空 handle 也由该函数收尾。
     bc->run_recovery_op(h, priority);
   }
 
@@ -1171,30 +1187,44 @@ struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
   }
 };
 
+/**
+ * 在 primary 端处理数据源副本以 MOSDPGPush 形式返回的 Pull 响应。
+ *
+ * 函数逐个将 PushOp 中收到的数据和恢复状态加入本地 ObjectStore 事务。
+ * 对象尚未完整时构造下一轮 PullOp；
+ * 对象完整时则在事务完成后清理 pulling 状态，并继续向需要该对象的副本发起 push 恢复。
+ * 下一轮 Pull 消息同样只在本事务完成后发送，因而不会要求对端继续传输而本地尚未完成前一块数据的写入。
+ */
 void ReplicatedBackend::_do_pull_response(OpRequestRef op)
 {
+  // 该 MOSDPGPush 是先前 PullOp 的响应；from 为本次数据的提供者。
   auto m = op->get_req<MOSDPGPush>();
   ceph_assert(m->get_type() == MSG_OSD_PG_PUSH);
   pg_shard_t from = m->from;
 
   op->mark_started();
 
+  // 尾部占位元素供当前 PushOp 填充；只有需要下一块数据时才保留它。
   vector<PullOp> replies(1);
   if (get_parent()->check_failsafe_full()) {
     dout(10) << __func__ << " Out of space (failsafe) processing pull response (push)." << dendl;
     ceph_abort();
   }
 
+  // 将本批收到的数据、属性及 PG 恢复状态作为一个本地事务提交。
   ObjectStore::Transaction t{get_parent()->min_peer_features()};
+  // 已完成 pull 的对象需等待上述事务完成后，才能开始向其他副本 push。
   list<pull_complete_info> to_continue;
   for (vector<PushOp>::const_iterator i = m->pushes.begin();
        i != m->pushes.end();
        ++i) {
+    // handle_pull_response() 更新 pulling 进度，并在未完成时写入下一轮 PullOp。
     bool more = handle_pull_response(from, *i, &(replies.back()), &to_continue, &t);
     if (more)
       replies.push_back(PullOp());
   }
   if (!to_continue.empty()) {
+    // 回调在本地数据写入完成后清理 pull，并将已恢复对象继续推给目标副本。
     C_ReplicatedBackend_OnPullComplete *c =
       new C_ReplicatedBackend_OnPullComplete(
 	this,
@@ -1206,9 +1236,11 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
 	get_parent()->bless_unlocked_gencontext(c),
         std::max<uint64_t>(1, c->estimate_push_costs())));
   }
+  // 最后一个元素始终是下一个 PushOp 的预留槽；循环结束后将其移除。
   replies.erase(replies.end() - 1);
 
   if (replies.size()) {
+    // 仍未完成的对象向同一数据源请求下一块；发送也延后到事务完成后。
     MOSDPGPull *reply = new MOSDPGPull;
     reply->from = parent->whoami_shard();
     reply->set_priority(m->get_priority());
@@ -1223,6 +1255,7 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
 	get_parent(), reply, m->get_connection()));
   }
 
+  // ObjectStore 异步执行事务，并在完成时依次触发恢复续接和消息发送回调。
   get_parent()->queue_transaction(std::move(t));
 }
 
@@ -2311,11 +2344,20 @@ ObjectRecoveryInfo ReplicatedBackend::recalc_subsets(
   return new_info;
 }
 
+/**
+ * 在 primary 端处理副本返回的一块 PushOp（即先前 Pull 请求的响应）。
+ *
+ * 函数根据 pulling 中保存的恢复状态裁剪并接收本块数据，
+ * 调用 submit_push_data() 将数据和对象元数据加入事务。
+ * 对象尚未完整时填充下一轮 PullOp 并返回 true；
+ * 对象完整时清理 pull 来源索引、登记本地恢复完成并返回 false。
+ */
 bool ReplicatedBackend::handle_pull_response(
   pg_shard_t from, const PushOp &pop, PullOp *response,
   list<pull_complete_info> *to_continue,
   ObjectStore::Transaction *t)
 {
+  // 先复制消息中本块数据及其区间；后续会裁掉本次恢复不需要的范围。
   interval_set<uint64_t> data_included = pop.data_included;
   bufferlist data;
   data = pop.data;
@@ -2325,34 +2367,41 @@ bool ReplicatedBackend::handle_pull_response(
 	   << " data.size() is " << data.length()
 	   << " data_included: " << data_included
 	   << dendl;
+  // 如果 pop.version 是空版本，说明副本端没有该对象，它可能被回收或丢失了；primary 需要重新选择可用来源。
   if (pop.version == eversion_t()) {
     // replica doesn't have it!
+    // 数据源副本没有该对象，结束本次 pull 并通知 PG 重新处理对象的可用来源。
     _failed_pull(from, pop.soid);
     return false;
   }
 
   const hobject_t &hoid = pop.soid;
+  // 带数据的 PushOp 必须同时说明这些数据对应的对象区间，反之亦然。
   ceph_assert((data_included.empty() && data.length() == 0) ||
          (!data_included.empty() && data.length() > 0));
 
   auto piter = pulling.find(hoid);
   if (piter == pulling.end()) {
+    // 本地已因 map 变化或失败清除了 pull 状态；迟到回复无需再写入。
     return false;
   }
 
   pull_info_t &pull_info = piter->second;
   if (pull_info.recovery_info.size == (uint64_t(-1))) {
+    // primary 首次 pull 时可能未知对象大小；以数据源确认的范围收窄请求范围。
     pull_info.recovery_info.size = pop.recovery_info.size;
     pull_info.recovery_info.copy_subset.intersection_of(
       pop.recovery_info.copy_subset);
   }
   // If primary doesn't have object info and didn't know version
+  // primary 本地缺失对象时可能连版本也未知，首个有效响应提供该版本。
   if (pull_info.recovery_info.version == eversion_t()) {
     pull_info.recovery_info.version = pop.version;
   }
 
   bool first = pull_info.recovery_progress.first;
   if (first) {
+    // 首块建立对象上下文，并据此重新计算 clone 可复用范围和实际待接收区间。
     // attrs only reference the origin bufferlist (decode from
     // MOSDPGPush message) whose size is much greater than attrs in
     // recovery. If obc cache it (get_obc maybe cache the attr), this
@@ -2378,6 +2427,7 @@ bool ReplicatedBackend::handle_pull_response(
 
   // if `first` is true, obc was just set above. Otherwise, we should be
   // able to reuse it.
+  // 首块刚建立 obc，后续块复用同一个对象上下文和锁。
   ceph_assert(pull_info.obc);
   interval_set<uint64_t> usable_intervals;
   bufferlist usable_data;
@@ -2389,20 +2439,24 @@ bool ReplicatedBackend::handle_pull_response(
   data_included = usable_intervals;
   data = std::move(usable_data);
 
-
+  // 接受本块后推进内存中的恢复进度；该进度将被带入下一轮 PullOp。
   pull_info.recovery_progress = pop.after_progress;
 
   dout(10) << "new recovery_info " << pull_info.recovery_info
            << ", new progress " << pull_info.recovery_progress
            << dendl;
+  // data_recovered_to 前进的范围可能含稀疏空洞，需在事务中显式写零。
   interval_set<uint64_t> data_zeros;
   uint64_t z_offset = pop.before_progress.data_recovered_to;
   uint64_t z_length = pop.after_progress.data_recovered_to - pop.before_progress.data_recovered_to;
   if (z_length)
     data_zeros.insert(z_offset, z_length);
+  // 完整性同时取决于数据、omap 等恢复进度，而不只是本块数据长度。
   bool complete = pull_info.is_complete();
+  // 首个携带 omap 的块到来前，目标对象需要先清除旧 omap 键。
   bool clear_omap = !pop.before_progress.omap_complete;
 
+  // 仅把本块写操作追加到事务草稿；真正落盘由调用者稍后的 queue_transaction() 发起。
   submit_push_data(pull_info.recovery_info,
                   first,
                   complete,
@@ -2416,23 +2470,28 @@ bool ReplicatedBackend::handle_pull_response(
                   pop.omap_entries,
                   t);
 
+  // 统计采用裁剪后的有效数据，而非消息中可能超出 copy_subset 的原始数据。
   pull_info.stat.num_keys_recovered += pop.omap_entries.size();
   pull_info.stat.num_bytes_recovered += data.length();
   get_parent()->get_logger()->inc(l_osd_rbytes, pop.omap_entries.size() + data.length());
 
   if (complete) {
+    // 此处对象数据已加入事务，但 pull_info 保留到事务完成回调再释放锁和删除。
     pull_info.stat.num_objects_recovered++;
     // XXX: This could overcount if regular recovery is needed right after a repair
     if (get_parent()->pg_is_repair()) {
       pull_info.stat.num_objects_repaired++;
       get_parent()->inc_osd_stat_repaired();
     }
+    // 立即撤销“正从 from 拉取”的反向索引，避免同一对象再被调度到该来源。
     clear_pull_from(piter);
     to_continue->push_back({hoid, pull_info.stat});
+    // 通过同一事务记录 primary 的本地恢复状态；其 applied 回调会在事务执行后继续收尾。
     get_parent()->on_local_recover(
       hoid, pull_info.recovery_info, pull_info.obc, false, t);
     return false;
   } else {
+    // 返回当前恢复信息和进度，由调用者封装为事务完成后发送的下一轮 PullOp。
     response->soid = pop.soid;
     response->recovery_info = pull_info.recovery_info;
     response->recovery_progress = pull_info.recovery_progress;
