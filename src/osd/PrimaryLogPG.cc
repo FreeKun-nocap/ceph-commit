@@ -13730,32 +13730,48 @@ void PrimaryLogPG::plpg_on_pool_change()
   agent_setup();
 }
 
-// clear state.  called on recovery completion AND cancellation.
+/**
+ * 清理 PrimaryLogPG 中与 recovery/backfill 相关的运行时状态。
+ *
+ * 函数既用于 recovery 正常完成，也用于 interval 变化或其他路径取消
+ * recovery；它会释放对象级跟踪、解除 recovery read 标记、重新排队被
+ * 阻塞的请求，最后让 PG backend 清理自身的 recovery 状态。
+ */
 void PrimaryLogPG::_clear_recovery_state()
 {
 #ifdef DEBUG_RECOVERY_OIDS
+  // 调试模式下清空当前 PG 记录的 recovery 对象集合。
   recovering_oids.clear();
 #endif
   dout(15) << __func__ << dendl;
 
+  // 本轮 backfill 的起始游标失效，下一轮需要重新建立。
   last_backfill_started = hobject_t();
+
+  // 清除仍处于 backfill 在途状态的对象。
   set<hobject_t>::iterator i = backfills_in_flight.begin();
   while (i != backfills_in_flight.end()) {
     backfills_in_flight.erase(i++);
   }
 
+  // 清理每个正在 recovery 的对象，并解除其 recovery read 保护。
   list<OpRequestRef> blocked_ops;
   for (map<hobject_t, ObjectContextRef>::iterator i = recovering.begin();
        i != recovering.end();
        recovering.erase(i++)) {
     if (i->second) {
       i->second->drop_recovery_read(&blocked_ops);
+      // 对象恢复读保护解除后，重新调度此前被阻塞的客户端请求。
       requeue_ops(blocked_ops);
     }
   }
+
+  // 上面的清理必须完整移除所有对象级 backfill/recovery 跟踪。
   ceph_assert(backfills_in_flight.empty());
   pending_backfill_updates.clear();
   ceph_assert(recovering.empty());
+
+  // 让具体 backend 清除 push/pull 等协议操作的内部状态。
   pgbackend->clear_recovery_state();
 }
 
