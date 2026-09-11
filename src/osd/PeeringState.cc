@@ -3649,6 +3649,13 @@ void PeeringState::proc_master_log(
   peer_missing[from].claim(std::move(omissing));
 }
 
+/**
+ * 处理副本在 GetMissing 阶段返回的 PGInfo、PG log 和 missing 集合。
+ *
+ * 权威 PG log 已在 GetLog 阶段确定，本函数不再选择或合并权威历史；
+ * 它仅按副本日志修正必要的 EC partial-write 元数据，更新该副本的 pg_info，
+ * 并保存其 missing 集合，供后续选择 recovery 来源和判断恢复需求。
+ */
 void PeeringState::proc_replica_log(
   pg_info_t &oinfo,
   pg_log_t &olog,
@@ -3658,18 +3665,26 @@ void PeeringState::proc_replica_log(
   psdout(10) << "proc_replica_log for osd." << from << ": "
 	     << oinfo << " " << olog << " " << omissing << dendl;
 
+  // EC partial write 可能使不同 shard 的 last_complete 不同；
+  // 先按本地记录修正 peer 信息和日志，再交给 PGLog 更新副本日志相关状态。
   if (info.partial_writes_last_complete.contains(from.shard)) {
     apply_pwlc(info.partial_writes_last_complete[from.shard], from, oinfo,
 	       &olog);
   }
+
+  // 更新 PGLog 对该副本日志的认知；primary 的权威日志不会在此路径被替换。
   pg_log.proc_replica_log(oinfo, olog, omissing, from, pg_whoami, pool.info.allows_ecoptimizations());
 
+  // 保存最新 PGInfo，并更新 peer 的统计、状态和相关元数据。
   peer_info[from] = oinfo;
   update_peer_info(from, oinfo);
   psdout(10) << " peer osd." << from << " now "
 	     << oinfo << " " << omissing << dendl;
+
+  // 该副本的日志/missing 已被确认，它可能拥有后续 unfound 对象的某个版本。
   might_have_unfound.insert(from);
 
+  // 输出副本缺失对象的版本关系，便于诊断后续 recovery 的来源选择。
   for (auto i = omissing.get_items().begin();
        i != omissing.get_items().end();
        ++i) {
@@ -3677,6 +3692,9 @@ void PeeringState::proc_replica_log(
 	       << " need " << i->second.need
 	       << " have " << i->second.have << dendl;
   }
+
+  // 转移 missing 集合所有权，形成 peer_missing[from]，
+  // 供 needs_recovery() 和 MissingLoc 构建恢复来源时使用。
   peer_missing[from].claim(std::move(omissing));
 }
 
@@ -5787,11 +5805,17 @@ PeeringState::Backfilling::Backfilling(my_context ctx)
 void PeeringState::Backfilling::backfill_release_reservations()
 {
   DECLARE_LOCALS;
+  // 释放 primary 在本地为本轮 backfill 申请的后台 IO 资源。
   pl->cancel_local_background_io_reservation();
+
+  // backfill target 的远端 reservation 由 primary 逐个申请，结束或暂停时也要逐个释放。
   for (auto it = ps->backfill_targets.begin();
        it != ps->backfill_targets.end();
        ++it) {
+    // primary 只负责向其他 OSD backfill，不会把自己作为远端 target。
     ceph_assert(*it != ps->pg_whoami);
+
+    // 通知 target OSD 撤销该 PG 的 backfill reservation；消息 epoch 用于丢弃过期请求。
     pl->send_cluster_message(
       it->osd,
       TOPNSPC::make_message<MBackfillReserve>(
@@ -6634,20 +6658,28 @@ void PeeringState::Recovering::exit()
   pl->get_peering_perf().tinc(rs_recovering_latency, dur);
 }
 
+/**
+ * 进入 Recovered 状态，表示本轮普通 recovery 或 backfill 已完成。
+ *
+ * 这里重新检查 PG 是否仍需要 recovery，并根据 backfill 完成后的 acting 集合变化调整 acting；
+ * 只有所有副本都完成 activation 且不存在异步 recovery target 时，才继续投递 GoClean 进入 Clean 状态。
+ */
 PeeringState::Recovered::Recovered(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/Recovered")
 {
+  // choose_acting() 通过该参数返回需要获取 PG log 的 shard。
   pg_shard_t get_log_shard;
 
   context< PeeringMachine >().log_enter(state_name);
 
   DECLARE_LOCALS;
 
+  // 进入 Recovered 时，PG log 中不应再存在待恢复对象。
   ceph_assert(!ps->needs_recovery());
 
-  // if we finished backfill, all acting are active; recheck if
-  // DEGRADED | UNDERSIZED is appropriate.
+  // backfill 完成后所有 acting shard 都应已激活；
+  // 根据当前 acting 数量重新判断是否还需要保留 DEGRADED 或 UNDERSIZED 状态。
   ceph_assert(!ps->acting_recovery_backfill.empty());
   if (ps->get_osdmap()->get_pg_size(context< PeeringMachine >().spgid.pgid) <=
       ps->acting_recovery_backfill.size()) {
@@ -6655,7 +6687,8 @@ PeeringState::Recovered::Recovered(my_context ctx)
     pl->publish_stats_to_osd();
   }
 
-  // adjust acting set?  (e.g. because backfill completed...)
+  // backfill 完成后，之前仅作为 recovery/backfill target 的 OSD 可能需要
+  // 正式加入 acting 集合，因此重新计算 acting。
   if (ps->acting != ps->up &&
       !ps->choose_acting(get_log_shard, true)) {
     ceph_assert(ps->want_acting.size());
@@ -6664,6 +6697,8 @@ PeeringState::Recovered::Recovered(my_context ctx)
     ps->choose_acting(get_log_shard, true);
   }
 
+  // 只有本轮 activation 已完成且没有异步 recovery target，PG 才能继续
+  // 进入 Clean 状态；否则仍需等待后续 acting 调整或异步恢复。
   if (context< Active >().all_replicas_activated  &&
       ps->async_recovery_targets.empty())
     post_event(GoClean());
@@ -6678,6 +6713,12 @@ void PeeringState::Recovered::exit()
   pl->get_peering_perf().tinc(rs_recovered_latency, dur);
 }
 
+/**
+ * 进入 Clean 状态，表示 PG 的 recovery/backfill 已完成且 PG log 已追平。
+ *
+ * 这里确认 last_complete 已经追上 last_update，将 PG 标记为 clean；
+ * on_clean() 会立即执行必要的收尾准备，并返回一个在事务提交后执行的 Context。
+ */
 PeeringState::Clean::Clean(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/Clean")
@@ -6686,13 +6727,15 @@ PeeringState::Clean::Clean(my_context ctx)
 
   DECLARE_LOCALS;
 
+  // Clean 状态要求 PG 的最后完整版本已经追上最后更新版本。
   if (ps->info.last_complete != ps->info.last_update) {
     ceph_abort();
   }
 
-
+  // 设置 PG_STATE_CLEAN，并更新 PG 状态统计。
   ps->try_mark_clean();
 
+  // on_clean() 先立即准备 recovery 收尾，并将返回的 Context 注册到事务提交回调。
   context< PeeringMachine >().get_cur_transaction().register_on_commit(
     pl->on_clean());
 }
@@ -8308,6 +8351,13 @@ void PeeringState::Incomplete::exit()
 }
 
 /*------GetMissing--------*/
+/**
+ * 收集参与本轮 peering 的副本 missing 集合，并决定请求增量日志还是完整日志。
+ *
+ * 权威 PG log 已在 GetLog 阶段确定。这里逐个检查远端 acting_recovery_backfill shard 的 pg_info：
+ * 无法通过连续 PG log 追平、或已确定需要全量 backfill 的副本无需再请求 missing；
+ * 其余副本返回的日志和 missing 将用于建立 peer_missing 与后续 recovery 来源判断。
+ */
 PeeringState::GetMissing::GetMissing(my_context ctx)
   : my_base(ctx),
     NamedState(context< PeeringMachine >().state_history, "Started/Primary/Peering/GetMissing")
@@ -8315,29 +8365,43 @@ PeeringState::GetMissing::GetMissing(my_context ctx)
   context< PeeringMachine >().log_enter(state_name);
 
   DECLARE_LOCALS;
+  // 输出当前 PG log/missing 的异常诊断，帮助发现不连续或异常的 peering 状态。
   ps->log_weirdness();
+
+  // 本轮至少应有 primary 自身参与 acting/recovery/backfill 集合。
   ceph_assert(!ps->acting_recovery_backfill.empty());
+
+  // `since` 指定向 peer 获取增量日志和 missing 时的起始版本。
   eversion_t since;
   for (auto i = ps->acting_recovery_backfill.begin();
        i != ps->acting_recovery_backfill.end();
        ++i) {
+    // primary 的本地 missing 已在状态机中持有，不需要向自己发查询。
     if (*i == ps->get_primary()) continue;
+
+    // peer_info 来自 GetInfo 阶段，描述该 shard 当前 PG log 与 backfill 进度。
     pg_info_t& pi = ps->peer_info[*i];
+
     // reset this so to make sure the pg_missing_t is initialized and
     // has the correct semantics even if we don't need to get a
     // missing set from a shard. This way later additions due to
     // lost+unfound delete work properly.
     ps->peer_missing[*i].may_include_deletes = !ps->perform_deletes_during_peering();
 
-    if (pi.is_empty())
-      continue;                                // no pg data, nothing divergent
+    if (pi.is_empty()) {
+      // 空 PG 没有可与权威日志分歧的对象或日志记录。
+      continue;
+    }
 
     if (pi.last_update < ps->pg_log.get_tail()) {
+      // peer 的最新版本早于权威日志仍保留的起点，无法用连续日志找出差异；
+      // 后续会重新开始 backfill，因此此时可直接视为没有可用 missing 集合。
       psdout(10) << " osd." << *i << " is not contiguous, will restart backfill" << dendl;
       ps->peer_missing[*i].clear();
       continue;
     }
     if (pi.last_backfill == hobject_t()) {
+      // 已选定对该 peer 做完整 backfill，遗漏对象将由全量扫描处理。
       psdout(10) << " osd." << *i << " will fully backfill; can infer empty missing set" << dendl;
       ps->peer_missing[*i].clear();
       continue;
@@ -8354,11 +8418,13 @@ PeeringState::GetMissing::GetMissing(my_context ctx)
       continue;
     }
 
-    // We pull the log from the peer's last_epoch_started to ensure we
-    // get enough log to detect divergent updates.
+    // 从 peer 本轮 interval 的起点开始获取，确保有足够日志识别分歧更新。
     since.epoch = pi.last_epoch_started;
+
+    // 能进入 acting_recovery_backfill 的 peer 至少覆盖本地 PG log tail。
     ceph_assert(pi.last_update >= ps->info.log_tail);  // or else choose_acting() did a bad thing
     if (pi.log_tail <= since) {
+      // peer 仍保留 since 起的连续日志，只请求该范围的增量 LOG 与 missing。
       psdout(10) << " requesting log+missing since " << since << " from osd." << *i << dendl;
       context< PeeringMachine >().send_query(
 	i->osd,
@@ -8368,6 +8434,7 @@ PeeringState::GetMissing::GetMissing(my_context ctx)
 	  since, ps->info.history,
 	  ps->get_osdmap_epoch()));
     } else {
+      // peer 已裁剪掉所需起点之前的日志，必须请求 FULLLOG 才能正确重建差异。
       psdout(10) << " requesting fulllog+missing from osd." << *i
 			 << " (want since " << since << " < log.tail "
 			 << pi.log_tail << ")" << dendl;
@@ -8377,21 +8444,28 @@ PeeringState::GetMissing::GetMissing(my_context ctx)
 	  i->shard, ps->pg_whoami.shard,
 	  ps->info.history, ps->get_osdmap_epoch()));
     }
+
+    // 记录尚未返回的 peer，并在 PG 状态中显示本阶段被这些 OSD 阻塞。
     peer_missing_requested.insert(*i);
     ps->blocked_by.insert(i->osd);
   }
 
   if (peer_missing_requested.empty()) {
+    // need_up_thru 是一个标志：
+    // 当前 primary 需要等待 Monitor 在新 OSDMap 中把本 OSD 的 up_thru
+    // 推进到本次 PG interval 的起始 epoch，才能继续 activation。
     if (ps->need_up_thru) {
+      // missing 已无需等待，但 primary 尚未满足 up_thru 要求，不能激活。
       psdout(10) << " still need up_thru update before going active"
-			 << dendl;
+		 << dendl;
       post_event(NeedUpThru());
       return;
     }
 
-    // all good!
+    // 所有 peer 的 missing 已知且 up_thru 满足，开始 activation。
     post_event(Activate(ps->get_osdmap_epoch()));
   } else {
+    // 仍在等待 peer 回复，先发布 blocked_by 等最新 PG 状态。
     pl->publish_stats_to_osd();
   }
 }
