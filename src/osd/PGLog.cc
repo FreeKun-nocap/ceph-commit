@@ -221,6 +221,13 @@ void PGLog::trim(
   }
 }
 
+/**
+ * 根据 primary 的权威日志修正一个副本返回的 PG log、missing 和 PGInfo。
+ *
+ * 当副本日志头与权威日志头不一致且两者存在重叠时，函数从权威日志中找到最后的共同版本 `lu`，
+ * 将副本在该边界之后的分歧条目回退或标记为 missing，然后重算副本的 last_update 和 last_complete。
+ * 真正将缺失对象补回副本的 recovery/backfill 操作发生在后续 activation 之后。
+ */
 void PGLog::proc_replica_log(
   pg_info_t &oinfo,
   const pg_log_t &olog,
@@ -232,11 +239,18 @@ void PGLog::proc_replica_log(
   dout(10) << "proc_replica_log for osd." << from << ": "
 	   << oinfo << " " << olog << " " << omissing << dendl;
 
+  // log.tail   primary 当前仍保留的最早日志版本
+  // log.head   primary 日志的最新版本
+  // olog.head  replica 日志的最新版本
+  // 副本日志头早于权威日志 tail，二者没有足以定位分歧的重叠区间；
+  // 该副本将通过后续 backfill/recovery 追平，无需在这里回退日志。
   if (olog.head < log.tail) {
     dout(10) << __func__ << ": osd." << from << " does not overlap, not looking "
 	     << "for divergent objects" << dendl;
     return;
   }
+
+  // 日志头已经一致，不存在需要从副本头部回退的分歧条目。
   if (olog.head == log.head) {
     dout(10) << __func__ << ": osd." << from << " same log head, not looking "
 	     << "for divergent objects" << dendl;
@@ -244,15 +258,10 @@ void PGLog::proc_replica_log(
   }
 
   /*
-    basically what we're doing here is rewinding the remote log,
-    dropping divergent entries, until we find something that matches
-    our master log.  we then reset last_update to reflect the new
-    point up to which missing is accurate.
-
-    later, in activate(), missing will get wound forward again and
-    we will send the peer enough log to arrive at the same state.
-  */
-
+   * 从副本日志头向后回退，删除或回滚分歧条目，直到与权威日志相交。
+   * 回退后 last_update 表示 missing 集合已准确覆盖到的版本；
+   * 后续 activation 会重新向副本推进权威日志并执行对象恢复。
+   */
   for (auto i = omissing.get_items().begin();
        i != omissing.get_items().end();
        ++i) {
@@ -260,6 +269,7 @@ void PGLog::proc_replica_log(
 	     << " have " << i->second.have << dendl;
   }
 
+  // 逆序遍历权威日志，寻找版本不超过副本日志头的最后共同条目。
   auto first_non_divergent = log.log.rbegin();
   while (1) {
     if (first_non_divergent == log.log.rend())
@@ -283,20 +293,22 @@ void PGLog::proc_replica_log(
    * log.tail <= e.version <= log.head, the last_update must actually be
    * max(log.tail, olog.tail).
    */
+  // 两侧 tail 均代表已确认且不可分歧的边界；共同版本不能早于较新的 tail。
   eversion_t limit = std::max(olog.tail, log.tail);
+
+  // `lu` 是副本可保留的最后版本，也是从副本日志头开始回退的边界。
   eversion_t lu =
     (first_non_divergent == log.log.rend() ||
      first_non_divergent->version < limit) ?
     limit :
     first_non_divergent->version;
 
-  // we merge and adjust the replica's log, rollback the rollbackable divergent entry, 
-  // remove the unrollbackable divergent entry and mark the according object as missing. 
-  // the rollback boundary must choose crt of the olog which going to be merged. 
-  // The replica log's(olog) crt will not be modified, so it could get passed
-  // to _merge_divergent_entries() directly.
+  // 基于副本日志建立可回退索引；rewind_from_head() 取出 lu 之后的分歧条目。
   IndexedLog folog(olog);
   auto divergent = folog.rewind_from_head(lu);
+
+  // 可回滚的分歧条目会回滚；不可回滚条目会从副本移除并把相应对象标为 missing。
+  // 副本原始日志的 can_rollback_to 是此次回退的安全边界。
   _merge_divergent_entries(
     folog,
     divergent,
@@ -308,12 +320,14 @@ void PGLog::proc_replica_log(
     to.shard,
     this);
 
+  // 分歧回退可能使副本的有效日志头后移。
   if (lu < oinfo.last_update) {
     dout(10) << " peer osd." << from << " last_update now " << lu << dendl;
     oinfo.last_update = lu;
   }
 
   if (omissing.have_missing()) {
+    // 有缺失对象时，last_complete 只能推进到第一个缺失版本之前。
     eversion_t first_missing =
       omissing.get_items().at(omissing.get_rmissing().begin()->second).need;
     oinfo.last_complete = eversion_t();
@@ -324,6 +338,7 @@ void PGLog::proc_replica_log(
 	break;
     }
   } else {
+    // 没有缺失对象时，副本已完整追到调整后的 last_update。
     oinfo.last_complete = oinfo.last_update;
   }
 } // proc_replica_log
