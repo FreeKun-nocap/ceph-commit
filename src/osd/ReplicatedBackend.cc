@@ -270,9 +270,15 @@ bool ReplicatedBackend::_handle_message(
   return false;
 }
 
+/**
+ * 清理副本池 backend 中的 recovery 运行时状态。
+ *
+ * 函数释放所有在途 push/pull 操作持有的对象锁，并清空按对象和来源 peer 建立的 recovery 跟踪表。
+ * 调用者已经完成 PG 层的 recovery 清理，此处不提交事务或发送协议消息。
+ */
 void ReplicatedBackend::clear_recovery_state()
 {
-  // clear pushing/pulling maps
+  // 一个对象可同时向多个 target push，逐项释放每个 push 操作持有的锁。
   for (auto &&i: pushing) {
     for (auto &&j: i.second) {
       get_parent()->release_locks(j.second.lock_manager);
@@ -280,10 +286,13 @@ void ReplicatedBackend::clear_recovery_state()
   }
   pushing.clear();
 
+  // 每个本地 pull 操作也可能持有对象锁，清空记录前必须先释放。
   for (auto &&i: pulling) {
     get_parent()->release_locks(i.second.lock_manager);
   }
   pulling.clear();
+
+  // pull_from_peer 是 pulling 的按来源 peer 反向索引，随主表一并失效。
   pull_from_peer.clear();
 }
 
