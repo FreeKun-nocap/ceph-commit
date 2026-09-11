@@ -447,43 +447,68 @@ unsigned PG::get_scrub_priority()
   return pool_scrub_priority > 0 ? pool_scrub_priority : cct->_conf->osd_scrub_priority;
 }
 
+/**
+ * 完成 PG recovery 的第一阶段收尾。
+ *
+ * 函数确认 PG log 已经追平，立即清理内存中的 recovery 状态；
+ * 随后返回一个回调，等待相关事务同步完成后再执行 stray 清理和 scrubber 通知。
+ * 这里不直接阻塞等待存储事务完成。
+ */
 Context *PG::finish_recovery()
 {
   dout(10) << "finish_recovery" << dendl;
+
+  // recovery 完成要求 PG 的最后完整版本已经追上最后更新版本。
   ceph_assert(info.last_complete == info.last_update);
 
+  // 立即释放对象级 recovery 跟踪、backfill 区间和 backend recovery 状态。
   clear_recovery_state();
 
   /*
-   * sync all this before purging strays.  but don't block!
+   * 先等待前面的事务同步完成，再清理 stray；这里通过异步回调完成，不在当前 PG 工作线程中阻塞等待。
    */
   finish_sync_event = new C_PG_FinishRecovery(this);
   return finish_sync_event;
 }
 
+/**
+ * 在 recovery 相关事务同步完成后执行最终收尾。
+ *
+ * 函数确认 PG 仍未被删除且仍处于 clean 状态，只处理当前有效的 finish_sync_event；
+ * 随后清理 stray、发布最新统计，并通知 scrubber recovery 已完成。
+ */
 void PG::_finish_recovery(Context* c)
 {
   dout(15) << __func__ << " finish_sync_event? " << finish_sync_event << " clean? "
 		 << is_clean() << dendl;
 
+  // 回调可能在 PG 状态变化后才到达，因此先在 PG 锁内重新检查状态。
   std::scoped_lock locker{*this};
   if (recovery_state.is_deleting() || !is_clean()) {
     dout(10) << __func__ << " raced with delete or repair" << dendl;
     return;
   }
+  // repair 触发的 recovery 完成后，清除 repair 状态标记。
   // When recovery is initiated by a repair, that flag is left on
   state_clear(PG_STATE_REPAIR);
+
   if (c == finish_sync_event) {
     dout(15) << fmt::format("{}: scrub_after_recovery: {}", __func__,
       m_scrubber->is_after_repair_required()) << dendl;
+
+    // 当前回调已经被消费，避免旧回调重复执行最终收尾。
     finish_sync_event = 0;
+
+    // 事务同步完成后，清理不再属于当前 acting 集合的 stray 对象。
     recovery_state.purge_strays();
 
+    // 发布 purge stray 后的最新 PG 统计。
     publish_stats_to_osd();
 
-    // notify the scrubber that recovery is done. This may trigger a scrub.
+    // 通知 scrubber recovery 已完成；如果 repair 后需要 deep scrub，可能在此处重新入队。
     m_scrubber->recovery_completed();
   } else {
+    // 不是当前 finish_sync_event，说明这是旧 interval 遗留的过期回调。
     dout(10) << "_finish_recovery -- stale" << dendl;
   }
 }
@@ -1453,13 +1478,27 @@ void PG::on_active_exit()
   agent_stop();
 }
 
+/**
+ * 处理 PG 进入 Clean 状态后的 recovery 收尾准备。
+ *
+ * 函数会启动待处理的 snap trim，通知 scrubber 当前 PG 已经 clean，
+ * 唤醒等待 clean/repair 条件的请求，并返回一个等待 recovery 事务同步完成后继续执行的 Context。
+ */
 Context* PG::on_clean()
 {
+  // PG active 时可以开始处理此前积累的 snapshot trim 请求。
   if (is_active()) {
     kick_snap_trim();
   }
+
+  // m_scrubber 是 PG 内部负责 scrub/深度 scrub/repair 检查 的对象
+  // 通知 scrubber：primary PG 已完成 recovery 并进入 clean。
   m_scrubber->on_primary_active_clean();
+
+  // PG 已经满足 clean 条件，重新调度此前等待 clean 后再执行的请求。
   requeue_ops(waiting_for_clean_to_primary_repair);
+
+  // 清理 recovery 状态，并返回事务同步完成后的后续回调。
   return finish_recovery();
 }
 
