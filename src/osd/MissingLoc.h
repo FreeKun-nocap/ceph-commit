@@ -225,6 +225,19 @@ class MissingLoc {
     }
   }
 
+  /**
+   * 将一个参与本轮激活的 shard 的 missing 集合并入 needs_recovery_map。
+   *
+   * activate() 会对 primary 和所有 acting/recovery/backfill 副本调用本函数。
+   * needs_recovery_map 因此表示当前 PG 中至少有一个参与 shard 缺失的对象，
+   * 是后续建立对象恢复来源（missing_loc）的输入。
+   * 这里仅汇总“哪些对象需要恢复”及其目标版本，不判断哪个 shard 可以提供对象。
+   *
+   * 同一对象可能在多个 shard 的 missing 集合中出现，但它们必须请求相同的 need 版本；
+   * 否则表示已归一化的 PG 日志状态彼此矛盾，不能继续恢复。
+   *
+   * @param missing 一个参与 shard 的 pg_missing_t
+   */
   void add_active_missing(const pg_missing_t &missing) {
     for (std::map<hobject_t, pg_missing_item>::const_iterator i =
 	   missing.get_items().begin();
@@ -233,9 +246,12 @@ class MissingLoc {
       std::map<hobject_t, pg_missing_item>::const_iterator j =
 	needs_recovery_map.find(i->first);
       if (j == needs_recovery_map.end()) {
+	// 首次看到该对象，登记其恢复目标版本及已有版本。
 	needs_recovery_map.insert(*i);
       } else {
 	if (i->second.need != j->second.need) {
+	  // 同一 PG 内的缺失对象必须收敛到相同的目标版本；
+	  // 否则无法确定应从哪个版本恢复，说明前面的日志归一化结果不一致。
 	  lgeneric_dout(cct, 0) << this << " " << pgid << " unexpected need for "
 				<< i->first << " have " << j->second
 				<< " tried to add " << i->second << dendl;

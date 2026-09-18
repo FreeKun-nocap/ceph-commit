@@ -65,6 +65,28 @@ void MissingLoc::add_batch_sources_info(
   }
 }
 
+/**
+ * 判断某个候选来源 shard 上是否持有 needs_recovery_map 中各对象的副本，
+ * 并把通过检查的对象位置登记进 missing_loc。
+ *
+ * activate() 会为每个携带日志/缺失信息的 peer 调用本函数；
+ * 与 add_active_missing 只汇总“缺什么”相对，本函数回答“从谁那里恢复”。
+ * 对每个待恢复对象依次排除不能作为来源的情形（见下），全部通过才登记 fromosd。
+ *
+ * 四个排除条件按代价从低到高排列：
+ * 1. 删除型缺失不需要数据来源；
+ * 2. 对端 last_update 低于目标版本，说明其日志没跟上、必无该版本数据；
+ * 3. 对象位于对端 last_backfill 之后的未定义区间，无法确认其是否存在；
+ * 4. 对端自己的 missing 集合包含该对象。
+ *
+ * 注意对象可能已有其他来源：此时先 _dec_count 旧集合再插入，
+ * 保证 missing_by_count（按持有 shard 数的索引）与 missing_loc 一致。
+ *
+ * @param fromosd 候选来源 shard
+ * @param oinfo 对端上报的 pg_info_t（last_update/last_backfill 用于排除）
+ * @param omissing 对端上报的 pg_missing_t（非空时用于排除对端也缺失的对象）
+ * @return 是否至少为一个对象找到了新来源
+ */
 bool MissingLoc::add_source_info(
   pg_shard_t fromosd,
   const pg_info_t &oinfo,
@@ -83,6 +105,7 @@ bool MissingLoc::add_source_info(
        ++p) {
     const hobject_t &soid(p->first);
     eversion_t need = p->second.need;
+    // 遍历可能覆盖海量对象，周期性重置线程池超时并按耗时关闭调试日志。
     if (++loop >= cct->_conf->osd_loop_before_reset_tphandle) {
       if (handle) {
 	handle->reset_tp_timeout();
@@ -95,6 +118,7 @@ bool MissingLoc::add_source_info(
       }
       loop = 0;
     }
+    // 删除型缺失只需在各副本上执行删除，无需寻找数据来源。
     if (p->second.is_delete()) {
       if (!suppress_logging) {
         ldout(cct, 10) << __func__ << " " << soid
@@ -102,6 +126,7 @@ bool MissingLoc::add_source_info(
       }
       continue;
     }
+    // 对端日志落后于目标版本：其上不可能存在 need 版本的数据。
     if (oinfo.last_update < need) {
       if (!suppress_logging) {
         ldout(cct, 10) << "search_for_missing " << soid << " " << need
@@ -111,6 +136,7 @@ bool MissingLoc::add_source_info(
       }
       continue;
     }
+    // 对象落在对端 backfill 进度之后的区间，其对端是否有该对象未知。
     if (p->first >= oinfo.last_backfill) {
       // FIXME: this is _probably_ true, although it could conceivably
       // be in the undefined region!  Hmm!
@@ -122,6 +148,7 @@ bool MissingLoc::add_source_info(
       }
       continue;
     }
+    // 对端自身也缺失该对象，不能作为来源。
     if (omissing.is_missing(soid)) {
       if (!suppress_logging) {
         ldout(cct, 10) << "search_for_missing " << soid << " " << need
@@ -136,16 +163,22 @@ bool MissingLoc::add_source_info(
     }
 
     {
+      // 登记来源。对象已有来源集合时先减计数，替换后统一重新计数，
+      // 以维护 missing_by_count 与 missing_loc 的一致性。
       auto p = missing_loc.find(soid);
       if (p == missing_loc.end()) {
+        // 情况 A:该对象第一次找到来源 → 建空条目
 	p = missing_loc.emplace(soid, set<pg_shard_t>()).first;
       } else {
+        // 情况 B:已有来源集合 → 先把旧集合从计数索引中减掉
 	_dec_count(p->second);
       }
-      p->second.insert(fromosd);
-      _inc_count(p->second);
+      p->second.insert(fromosd);  // 两种情况统一:把 fromosd 加入来源集合
+      _inc_count(p->second);  // 重新计入 missing_by_count
     }
 
+    // missing_loc_sources 记录曾提供过来源的全部 shard，
+    // 供 check_recovery_sources() 在其 down 掉时清除相关位置。
     if (!sources_updated) {
       missing_loc_sources.insert(fromosd);
       sources_updated = true;

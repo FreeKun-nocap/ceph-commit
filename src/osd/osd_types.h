@@ -4523,6 +4523,7 @@ struct pg_log_entry_t {
   /// map extra_reqids by index to error return code (if any)
   mempool::osd_pglog::map<uint32_t, int> extra_reqid_return_codes;
 
+  // 
   eversion_t version, prior_version, reverting_to;
   version_t user_version; // the user version for this entry
   utime_t     mtime;  // this is the _user_ mtime, mind you

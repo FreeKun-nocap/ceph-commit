@@ -664,26 +664,39 @@ public:
       e.mod_desc.trim_bl();
 
       // add to log
+      // 追加到日志列表尾部（日志按版本递增有序）。
       log.push_back(e);
 
       // riter previously pointed to the previous entry
+      // rollback_info_trimmed_to_riter 是反向游标，指向第一条 <= rollback_info_trimmed_to 的条目。
+      // 若它正指向原列表尾部（即最后一个定案条目），push_back 后它仍指向同一元素；
+      // 但 rbegin() 变成了新元素，为保持游标语义需前移一位。
       if (rollback_info_trimmed_to_riter == log.rbegin())
 	++rollback_info_trimmed_to_riter;
 
+      // 日志头推进的两条不变量：新版本必须严格大于 head。
+      // head.version == 0 特判新 PG（head 尚为零值，无版本可比）。
       ceph_assert(e.version > head);
       ceph_assert(head.version == 0 || e.version.version > head.version);
       head = e.version;
 
       // to our index
+      // 按需更新三个哈希索引（indexed_data 是位掩码，标记哪些索引
+      // 当前有效——按需建索引，未开启时 O(1) 跳过）：
+      // 对象索引：missing/恢复时按 soid 快速定位条目。
       if ((indexed_data & PGLOG_INDEXED_OBJECTS) && e.object_is_indexed()) {
         objects[e.soid] = &(log.back());
       }
+      // 客户端 reqid 索引：重复请求（dup）检测，同一 reqid 重试时
+      // 直接从这里找到原条目返回结果，不重做操作。
       if (indexed_data & PGLOG_INDEXED_CALLER_OPS) {
         if (e.reqid_is_indexed()) {
 	  caller_ops[e.reqid] = &(log.back());
         }
       }
 
+      // 子操作 reqid 索引：一次写可能拆出多个子请求
+      // （extra_reqids），multimap 支持一个 reqid 对多条。
       if (indexed_data & PGLOG_INDEXED_EXTRA_CALLER_OPS) {
         for (auto j = e.extra_reqids.begin();
 	     j != e.extra_reqids.end();
@@ -1069,24 +1082,30 @@ protected:
   }
 
   /**
-   * _merge_object_divergent_entries
+   * 处理一个对象的分歧日志记录。
    *
-   * There are 5 distinct cases:
-   * 1) There is a more recent update: in this case we assume we adjusted the
-   *    store and missing during merge_log
-   * 2) The first entry in the divergent sequence is a create.  This might
-   *    either be because the object is a clone or because prior_version is
-   *    eversion_t().  In this case the object does not exist and we must
-   *    adjust missing and the store to match.
-   * 3) We are currently missing the object.  In this case, we adjust the
-   *    missing to our prior_version taking care to add a divergent_prior
-   *    if necessary
-   * 4) We can rollback all of the entries.  In this case, we do so using
-   *    the rollbacker and return -- the object does not go into missing.
-   * 5) We cannot rollback at least 1 of the entries.  In this case, we
-   *    clear the object out of the store and add a missing entry at
-   *    prior_version taking care to add a divergent_prior if
-   *    necessary.
+   * 输入记录属于同一个对象，表示副本日志中存在、但权威日志中不存在的更新。
+   * 本函数不执行 recovery，而是将副本的对象状态、日志状态和 missing 集合
+   * 调整为与权威日志一致，以便后续 recovery 或 backfill 使用处理结果。
+   *
+   * 分歧日志按以下情况处理：
+   * 1) 权威日志中已经存在更新版本。该对象已在前面的日志合并阶段处理，本函数清理分歧记录，并将对象标记为需要权威版本。
+   * 2) 分歧序列创建了该对象，可能是 clone，也可能是 prior_version 为 eversion_t()。
+   *    权威状态中对象不应存在，因此删除对象且不加入 missing。
+   * 3) 对象本来就处于 missing 状态，将 missing 条目调整到 prior_version。
+   * 4) 所有分歧记录都可以回滚。按逆序执行回滚，对象不进入 missing。
+   * 5) 至少有一条记录无法回滚。删除对象，并为 prior_version 添加 missing 条目，之后由 recovery 重新获取对象。
+   *
+   * @param log 用于检查更新版本的权威日志
+   * @param hoid 当前正在处理分歧记录的对象
+   * @param orig_entries hoid 对应的分歧日志记录
+   * @param info 用于判断 last_backfill 和其他日志元数据的 PG 信息
+   * @param olog_can_rollback_to 副本日志声明的回滚边界
+   * @param missing 待更新的 missing 集合
+   * @param rollbacker 用于执行对象回滚或删除操作的可选处理器
+   * @param ec_optimizations_enabled 是否启用 EC partial write 放宽逻辑
+   * @param orig_shard 持有 orig_entries 的 shard
+   * @param dpp 日志输出上下文
    */
   template <typename missing_type>
   static void _merge_object_divergent_entries(
@@ -1104,36 +1123,35 @@ protected:
     ldpp_dout(dpp, 20) << __func__ << ": merging hoid " << hoid
 		       << " entries: " << orig_entries << dendl;
 
+    // last_backfill 之后的对象不在当前副本已经确认的 backfill 范围内，
+    // 不能仅凭这批日志判断其对象状态，留给后续 backfill 处理。
     if (hoid > info.last_backfill) {
       ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid << " after last_backfill"
 			 << dendl;
       return;
     }
 
-    // entries is non-empty
+    // orig_entries 来自同一个对象的分歧日志，调用者保证它非空。
     ceph_assert(!orig_entries.empty());
-    // strip out and ignore ERROR entries
+    // 先过滤不影响对象内容的 ERROR 记录，以及当前 shard 没有参与的 EC partial write。
+    // 后面的判断只针对本 shard 真正需要处理的日志记录。
     mempool::osd_pglog::list<pg_log_entry_t> entries;
     eversion_t last;
     bool seen_non_error = false;
     for (auto i = orig_entries.begin();
 	 i != orig_entries.end();
 	 ++i) {
-      // all entries are on hoid
+      // split_by_object() 已保证这一组记录都属于同一个对象。
       ceph_assert(i->soid == hoid);
-      // did not see error entries before this entry and this entry is not error
-      // then this entry is the first non error entry
+      // ERROR 记录不提供可靠的 prior_version，因此首个非 ERROR 记录不参与后续 prior_version 连续性校验。
       bool first_non_error = ! seen_non_error && ! i->is_error();
       if (! i->is_error() ) {
         // see a non error entry now
         seen_non_error = true;
       }
       
-      // No need to check the first entry since it prior_version is unavailable
-      // in the std::list
-      // No need to check if the prior_version is the minimal version
-      // No need to check the first non-error entry since the leading error
-      // entries are not its prior version
+      // 第一条记录的 prior_version 无法从本组记录中校验；最小版本也表示没有可校验的前驱。
+      // partial write 允许跳过某些日志，所以 EC 优化开启时只要求 prior_version 不早于上一条记录。
       if (i != orig_entries.begin() && i->prior_version != eversion_t() &&
           ! first_non_error) {
 	// in increasing order of version
@@ -1169,6 +1187,8 @@ protected:
     const bool object_not_in_store =
       !missing.is_missing(hoid) &&
       entries.rbegin()->is_delete();
+    // 如果最后一条分歧记录是删除且对象当前不在 missing 中，说明本地对象已经不存在。
+    // 此时清理事务不需要再次 remove 该对象。
     ldpp_dout(dpp, 10) << __func__ << ": hoid " << " object_not_in_store: "
                        << object_not_in_store << dendl;
     ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid
@@ -1181,6 +1201,8 @@ protected:
     if (objiter != log.objects.end() &&
 	objiter->second->version >= first_divergent_update) {
       /// Case 1)
+      // 权威日志中已经存在更晚的记录，说明该对象的正确状态已在前面的 merge_log/日志合并阶段处理过。
+      // 这里不能再按旧的分歧记录回滚，只需把副本标记为需要重新获取该对象，并清理分歧记录的影响。
       ldpp_dout(dpp, 10) << __func__ << ": more recent entry found: "
 			 << *objiter->second << ", already merged" << dendl;
 
@@ -1220,6 +1242,8 @@ protected:
 		       <<" has no more recent entries in log" << dendl;
     if (prior_version == eversion_t() || entries.front().is_clone()) {
       /// Case 2)
+      // 分歧序列从 create/clone 开始，表示该对象是在分歧日志中才产生的；
+      // 权威日志中没有它，因此正确状态是对象不存在，而不是把它加入 missing。
       ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid
 			 << " prior_version or op type indicates creation,"
 			 << " deleting"
@@ -1239,6 +1263,8 @@ protected:
 
     if (missing.is_missing(hoid)) {
       /// Case 3)
+      // 对象本来就已在 missing 中。分歧日志只改变了“对象应恢复到哪个版本”，
+      // 因此调整 missing 的 need/have，而不是重新决定对象是否缺失。
       ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid
 			 << " missing, " << missing.get_items().at(hoid)
 			 << " adjusting" << dendl;
@@ -1273,8 +1299,9 @@ protected:
 		       << " attempting to rollback"
 		       << dendl;
     bool can_rollback = true;
-    // We are going to make an important decision based on the
-    // olog_can_rollback_to value we have received, better known it.
+    // 接下来决定是直接回滚，还是删除对象并加入 missing。
+    // olog_can_rollback_to 是副本日志声明的回滚安全边界；
+    // 版本不在该边界之后，或者日志记录本身不可回滚，都不能直接恢复到 prior_version。
     ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid
                        << " olog_can_rollback_to: "
                        << olog_can_rollback_to << dendl;
@@ -1290,6 +1317,8 @@ protected:
 
     if (can_rollback) {
       /// Case 4)
+      // 所有分歧记录都可以安全回滚。按最新到最旧的逆序撤销，恢复到 prior_version 对应的对象状态；
+      // 因为对象已经被回滚，不需要进入 missing。
       for (auto i = entries.rbegin(); i != entries.rend(); ++i) {
 	ceph_assert(i->can_rollback() && i->version > olog_can_rollback_to);
 	ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid
@@ -1302,6 +1331,8 @@ protected:
       return;
     } else {
       /// Case 5)
+      // 至少有一条记录无法安全回滚。无法可靠地在本地还原对象内容，
+      // 因此删除本地对象并把 prior_version 记录为 need，交给后续 recovery 从其他副本重新获取。
       ldpp_dout(dpp, 10) << __func__ << ": hoid " << hoid << " cannot roll back, "
 			 << "removing and adding to missing" << dendl;
       if (rollbacker) {
@@ -1321,7 +1352,7 @@ protected:
     }
   }
 
-  /// Merge all entries using above
+  // 将分歧记录按对象拆分，再逐个对象执行上面的 5 类处理。
   template <typename missing_type>
   static void _merge_divergent_entries(
     const IndexedLog &log,               ///< [in] log to merge against

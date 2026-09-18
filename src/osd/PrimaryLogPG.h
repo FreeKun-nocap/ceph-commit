@@ -512,6 +512,14 @@ public:
     return clear_object_snap_mapping(t, soid);
   }
 
+  /**
+   * 将本次写事务产生的 PG log 条目（logv）连同 trim/committed 水位
+   * 写入 PG 状态（内存 + ObjectStore::Transaction），随数据事务一起落盘。
+   *
+   * primary 侧同步推进 projected_log（读投影用日志），并要求 trim_to <= pg_committed_to（确认提交后才允许裁剪）；
+   * 副本侧在日志落盘后释放 repop 期间的对象快照缓存。
+   * 由 PGBackend 在 submit_transaction（primary）/ do_repop（副本）中回调。
+   */
   void log_operation(
     std::vector<pg_log_entry_t>&& logv,
     const std::optional<pg_hit_set_history_t> &hset_history,
@@ -522,22 +530,33 @@ public:
     ObjectStore::Transaction &t,
     bool async = false) override {
     if (is_primary()) {
+      // primary 决定副本日志可以裁剪到哪个位置，trim_to 不应超过它。
       ceph_assert(trim_to <= pg_committed_to);
     }
     if (hset_history) {
+      // 写事务若涉及 hitset 元数据，同步更新 PG 内存中的 hitset 历史。
       recovery_state.update_hset(*hset_history);
     }
     if (transaction_applied) {
+      // 本事务直接生效（而非经过 recovery/backfill 补日志）时，
+      // 依据 logv 中的 snap 相关操作更新 snap 映射。
       update_snap_map(logv, t);
     }
     auto last = logv.rbegin();
     if (is_primary() && last != logv.rend()) {
+      // primary：内存中的 projected_log（用于投影后续读请求的日志副本）
+      // 同步推进——本次写已确定包含到 last->version，不存在该版本之前的
+      // 未确定（can_rollback）区间，并把 <= last->version 的条目裁掉。
       projected_log.skip_can_rollback_to_to_head();
       projected_log.trim(cct, last->version, nullptr, nullptr, nullptr);
     }
     if (!is_primary()) {
+      // 副本：本事务覆盖的对象快照缓存（repop 期间 projections 使用的 obc）在日志落盘后即可释放。
       clear_repop_obc(logv, t);
     }
+    // 最终把 logv、trim_to、roll_forward_to、pg_committed_to 连同事务 t
+    // 交给 PeeringState：追加内存日志、标记 dirty 区间、必要时裁剪日志，
+    // 这些修改都编码进同一个 ObjectStore::Transaction 随数据一起落盘。
     recovery_state.append_log(
       std::move(logv), trim_to, roll_forward_to, pg_committed_to,
       t, transaction_applied, async);

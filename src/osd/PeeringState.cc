@@ -4797,28 +4797,54 @@ void PeeringState::merge_new_log_entries(
   }
 }
 
+/**
+ * 将单条 log entry 追加到 PGLog（由 append_log 的循环逐条调用）。
+ *
+ * 前半部分推进 pg_info 的三条水位：last_complete
+ * （仅当本地原已完全追平才随之推进——否则中间有 missing 对象，不能跳过它们）、
+ * last_update（必须严格递增，代表本 PG 已知的最写版本）、
+ * last_user_version（客户端视角的版本，可能不随每条日志递增）。
+ * 最后交给 PGLog::add 完成内存日志/missing/dups 的更新与脏区间标记。
+ */
 void PeeringState::add_log_entry(const pg_log_entry_t& e, ObjectStore::Transaction &t, bool applied)
 {
   // raise last_complete only if we were previously up to date
+  // 仅当本地此前已完全追平（没有 missing）时才推进 last_complete；
+  // 若本地本来就有缺口，缺口不会因为收到更新的日志而消失，
+  // last_complete 必须保持原位，否则会掩盖 missing。
   if (info.last_complete == info.last_update)
     info.last_complete = e.version;
 
   // raise last_update.
+  // last_update 必须严格递增：每条日志代表一个新版本。
   ceph_assert(e.version > info.last_update);
   info.last_update = e.version;
 
   // raise user_version, if it increased (it may have not get bumped
   // by all logged updates)
+  // user_version 是客户端视角的版本（如 rbd 侧），部分操作不递增它，所以只在变大时推进。
   if (e.user_version > info.last_user_version)
     info.last_user_version = e.user_version;
 
   // log mutation
+  // nonprimary 标记本 shard 是否为 EC 的非 primary 分片，PGLog::add
+  // 据此调整 missing 的处理方式（【EC 相关】影响分片条目）。
   enum PGLog::NonPrimary nonprimary{pool.info.is_nonprimary_shard(info.pgid.shard)};
   PGLog::LogEntryHandlerRef handler{pl->get_log_handler(t)};
-  pg_log.add(e, nonprimary, applied, &info, handler.get());
+  // 核心：追加到内存日志、更新 missing/dups、标记 dirty 区间。
+  pg_log.add(e, nonprimary, applied, &info, handler.get());  // 重点
 }
 
 
+/**
+ * 将一批 log entry（logv）追加到 PGLog 内存状态，并把日志/missing/trim 相关修改编码进事务 t，随数据事务一起落盘；
+ * 写路径（primary 的 submit_transaction、副本的 do_repop）经 log_operation 进入这里。
+ *
+ * 关键分支：transaction_applied 为 false 时（backfill/async recovery peer 收到超前日志），
+ * 只推进 crt 不做实际前滚（skip_rollforward），避免破坏对象等后续 _merge_object_divergent_entries() 处理。
+ *
+ * 注：【EC 相关】标注的段仅适用于纠删码 pool（partial write、各分片水位等）
+ */
 void PeeringState::append_log(
   vector<pg_log_entry_t>&& logv,
   eversion_t trim_to,
@@ -4834,6 +4860,8 @@ void PeeringState::append_log(
    * While this is technically valid, there are a number of asserts which can
    * be avoided by refusing to roll forward beyond the head of the log.
    */
+  // 【EC 相关】EC 优化开启时，多个事务并发中最后一个可能是 partial write，会导致被告知的提交版本超过本地日志头；
+  // 这里钳制到日志头，避免后面前滚/提交边界的断言失败。（副本 pool 走不到这个分支）
   if (pool.info.allows_ecoptimizations()) {
     if (roll_forward_to > pg_log.get_head()) {
       roll_forward_to = pg_log.get_head();
@@ -4847,6 +4875,10 @@ void PeeringState::append_log(
    * write without remembering that it happened in an interval which went
    * active in epoch history.last_epoch_started.
    */
+  // primary 更新 history 的 info 消息可能尚未到达。
+  // 这里先把 last_epoch_started/last_interval_started 同步进 history，
+  // 保证"记住这次写"的同时也记住它发生在哪个已 active 的 interval——
+  // 否则 peering 时无法判断该写是否需要参与回退判定。
   if (info.last_epoch_started != info.history.last_epoch_started) {
     info.history.last_epoch_started = info.last_epoch_started;
   }
@@ -4855,6 +4887,7 @@ void PeeringState::append_log(
   }
   psdout(10) << "append_log " << pg_log.get_log() << " " << logv << dendl;
 
+  // 日志条目的对象级副作用（回滚/前滚/删除）通过 handler 回调到 PGBackend（PG::PGLogEntryHandler）。
   PGLog::LogEntryHandlerRef handler{pl->get_log_handler(t)};
   if (!transaction_applied) {
      /* We must be a backfill or async recovery peer, so it's ok if we apply
@@ -4866,10 +4899,14 @@ void PeeringState::append_log(
       * from the backend and we do not end up in a situation, where the
       * object is deleted before we can _merge_object_divergent_entries().
       */
+    // 本 shard 是 backfill/async recovery 目标：日志超前于本地数据，允许乱序 apply（不会参与 min last_update 的计算）。
+    // 只推进 crt 而不实际前滚对象，避免对象被提前清理、影响之后的日志合并。
     pg_log.skip_rollforward(&info, handler.get());
     /* Invalidate pwlc for this shard until the next interval when
      * it will be updated with the pwlc from another shard
      */
+    // 【EC 相关】乱序 apply 后本 shard 的 partial write 水位失效，置为无效区间，等下个 interval 从其他 shard 重新获取。
+    // （pwlc 记录 EC 各分片的 partial write 水位，副本 pool 不使用）
     for (auto & [shard, versionrange] :
 	   info.partial_writes_last_complete) {
       auto & [fromversion, toversion] = versionrange;
@@ -4881,16 +4918,23 @@ void PeeringState::append_log(
   }
 
   for (auto p = logv.begin(); p != logv.end(); ++p) {
+    // 逐条追加到内存日志（更新 log/dups/missing、标记 dirty 区间）。
     add_log_entry(*p, t, transaction_applied);
 
     /* We don't want to leave the rollforward artifacts around
      * here past last_backfill.  It's ok for the same reason as
      * above */
+    // 事务直接生效、且对象已越过 last_backfill（数据确定保留）时，
+    // 把该条目前滚到 backend：crt 之前未前滚的旧条目也一并清理，避免残留回滚产物。
     if (transaction_applied &&
 	p->soid > info.last_backfill) {
       pg_log.roll_forward(&info, handler.get());
     }
   }
+  // primary 随消息带来的前滚边界：把 crt 推进到 roll_forward_to，
+  // 将其之前所有可前滚条目一次性 apply 到 backend。
+  // （前滚/回滚主要服务于 EC partial write 和副本 stash 场景，
+  // replica pool 的普通 write 条目不可回滚，rollforward 大多是空操作）
   if (transaction_applied && roll_forward_to > pg_log.get_can_rollback_to()) {
     pg_log.roll_forward_to(
       roll_forward_to,
@@ -4912,14 +4956,18 @@ void PeeringState::append_log(
       (trim_to > pg_log.get_can_rollback_to())) {
     // An exceptionally long sequence of partial writes followed by a full
     // write can result in trim_to being ahead of crt
+    // 【EC 相关】同开头的 EC 钳制：partial write 序列可能导致 trim_to 超过 crt。（副本 pool 走不到这个分支）
     trim_to = pg_log.get_can_rollback_to();
   }
+  // 内存裁剪日志（被裁条目进 trimmed/trimmed_dups），受 trim_to 约束。
   pg_log.trim(trim_to, info, transaction_applied, async);
 
-  // update the local pg, pg log
+  // update the local pg, pg log info 已变化，
+  // write_if_dirty 会把 pg info 和日志的 dirty 区间编码进事务 t 持久化（PG::write_log_and_missing）。
   dirty_info = true;
   write_if_dirty(t);
 
+  // 副本记录 primary 告知的本次写提交水位，之后据此上报 last_complete_ondisk / 参与日志裁剪。
   if (!is_primary())
     pg_committed_to = pct;
 }
