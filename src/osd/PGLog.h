@@ -681,22 +681,19 @@ public:
       head = e.version;
 
       // to our index
-      // 按需更新三个哈希索引（indexed_data 是位掩码，标记哪些索引
-      // 当前有效——按需建索引，未开启时 O(1) 跳过）：
+      // 按需更新三个哈希索引（indexed_data 是位掩码，标记哪些索引当前有效——按需建索引，未开启时 O(1) 跳过）：
       // 对象索引：missing/恢复时按 soid 快速定位条目。
       if ((indexed_data & PGLOG_INDEXED_OBJECTS) && e.object_is_indexed()) {
         objects[e.soid] = &(log.back());
       }
-      // 客户端 reqid 索引：重复请求（dup）检测，同一 reqid 重试时
-      // 直接从这里找到原条目返回结果，不重做操作。
+      // 客户端 reqid 索引：重复请求（dup）检测，同一 reqid 重试时直接从这里找到原条目返回结果，不重做操作。
       if (indexed_data & PGLOG_INDEXED_CALLER_OPS) {
         if (e.reqid_is_indexed()) {
 	  caller_ops[e.reqid] = &(log.back());
         }
       }
 
-      // 子操作 reqid 索引：一次写可能拆出多个子请求
-      // （extra_reqids），multimap 支持一个 reqid 对多条。
+      // 子操作 reqid 索引：一次写可能拆出多个子请求（extra_reqids），multimap 支持一个 reqid 对多条。
       if (indexed_data & PGLOG_INDEXED_EXTRA_CALLER_OPS) {
         for (auto j = e.extra_reqids.begin();
 	     j != e.extra_reqids.end();

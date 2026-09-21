@@ -1,0 +1,257 @@
+@startuml OSD Class Overview
+title Ceph OSD core class overview
+
+hide methods
+
+skinparam classAttributeIconSize 0
+skinparam class {
+  BackgroundColor #FAFAFA
+  BorderColor #666666
+  ArrowColor #444444
+}
+
+package "Message / scheduling" {
+  class Messenger {
+  }
+
+  class Dispatcher {
+  }
+
+  class OSDShard {
+    +shard_id : unsigned
+    +pg_slots : unordered_map<spg_t, OSDShardPGSlot*>
+    +scheduler : OpSchedulerRef
+    +ec_extent_cache_lru : ECExtentCache::LRU
+  }
+
+  class OSDShardPGSlot {
+    +pg : PGRef
+    +to_process : deque<OpSchedulerItem>
+    +waiting : deque<OpSchedulerItem>
+    +num_running : int
+  }
+
+  interface OpScheduler {
+  }
+
+  class OpSchedulerItem {
+    +qitem : OpQueueable::Ref
+    +cost : int
+    +priority : unsigned
+  }
+}
+
+package "OSD lifecycle and services" {
+  class OSD {
+    +whoami : int
+    +state : atomic<int>
+    +shards : vector<OSDShard*>
+    +store : unique_ptr<ObjectStore>
+    +cluster_messenger : Messenger*
+    +client_messenger : Messenger*
+    +objecter_messenger : Messenger*
+    +monc : MonClient*
+    +mgrc : MgrClient
+    +objecter : unique_ptr<Objecter>
+  }
+
+  class OSDService {
+    +osd : OSD*
+    +whoami : const int
+    +store : ObjectStore* const
+    +osdmap : OSDMapRef
+    +superblock : OSDSuperblock
+  }
+
+  class MonClient
+  class MgrClient
+  class OSDMap {
+    +epoch : epoch_t
+    +pool : map<int64_t, pg_pool_t>
+  }
+}
+
+package "Placement group execution" {
+  abstract class PG {
+    +pg_id : spg_t
+    +pg_whoami : pg_shard_t
+    +coll : coll_t
+    +ch : CollectionHandle
+    +recovery_state : PeeringState
+    +pool : const PGPool&
+    +info : const pg_info_t&
+    +unstable_stats : object_stat_collection_t
+    +projected_log : PGLog::IndexedLog
+    +projected_last_update : eversion_t
+    +snap_trimq : interval_set<snapid_t>
+    +recovery_queued : bool
+    +recovery_ops_active : int
+    +heartbeat_peers : set<int>
+    +backfill_info : PrimaryBackfillInterval
+    +peer_backfill_info : map<pg_shard_t, ReplicaBackfillInterval>
+    +waiting_on_backfill : set<pg_shard_t>
+    +pg_stats_publish : optional<pg_stat_t>
+    +backoffs : map<hobject_t, set<BackoffRef>>
+  }
+
+  class PrimaryLogPG {
+    +pgbackend : scoped_ptr<PGBackend>
+    +object_contexts : SharedLRU<hobject_t, ObjectContext>
+    +snapset_contexts : map<hobject_t, SnapSetContext*>
+    +repop_queue : xlist<RepGather*>
+    +agent_state : scoped_ptr<TierAgentState>
+    +hit_set : HitSetRef
+    +m_dynamic_perf_stats : DynamicPerfStats
+  }
+
+  class OpContext {
+    +op : OpRequestRef
+    +reqid : osd_reqid_t
+    +ops : vector<OSDOp>*
+    +obs : const ObjectState*
+    +new_obs : ObjectState
+    +snapset : const SnapSet*
+    +new_snapset : SnapSet
+    +delta_stats : object_stat_sum_t
+    +modify : bool
+    +user_modify : bool
+    +cache_operation : bool
+    +ignore_cache : bool
+    +update_log_only : bool
+    +clean_regions : ObjectCleanRegions
+    +bytes_written : uint64_t
+    +bytes_read : uint64_t
+    +mtime : utime_t
+    +snapc : SnapContext
+    +op_t : PGTransactionUPtr
+  }
+
+  class ObjectContext {
+    +oi : object_info_t
+    +ssc : SnapSetContext*
+    +attr_cache : map<string, bufferlist>
+    +lock : ObcLockManager
+  }
+
+  class PeeringState {
+    +pool : PGPool
+    +info : pg_info_t
+    +past_intervals : PastIntervals
+    +pg_log : PGLog
+    +machine : PeeringMachine
+  }
+
+  interface PeeringListener
+  interface ECListener
+  interface PGBackendListener {
+  }
+
+  class PeeringState {
+    +pool : PGPool
+    +info : pg_info_t
+    +past_intervals : PastIntervals
+    +pg_log : PGLog
+    +machine : PeeringMachine
+    +update_stats(...), write_if_dirty(t)
+  }
+}
+
+package "Backends" {
+  abstract class PGBackend {
+    +store : ObjectStore*
+    +coll : const coll_t
+    +ch : CollectionHandle&
+  }
+
+  class ReplicatedBackend {
+    Replica pool backend
+    +push/pull based recovery
+  }
+
+  class ECSwitch {
+    Erasure-coded pool backend
+    +legacy : ECBackendL
+    +optimized : ECBackend
+    +is_optimized() : bool
+  }
+
+  class ECBackendL {
+    Legacy EC implementation
+  }
+
+  class ECBackend {
+    Optimized EC implementation
+  }
+
+  interface ECCommon
+}
+
+package "Storage" {
+  class ObjectStore {
+  }
+
+  class CollectionHandle
+}
+
+OSD ..|> Dispatcher
+OSD ..|> md_config_obs_t
+
+OSD "1" *-- "N" OSDShard
+OSD "1" o-- "1" ObjectStore
+OSD --> Messenger : cluster / client / objecter
+OSD --> MonClient : monitor operations
+OSD --> MgrClient : manager operations
+OSD --> Objecter : tiering I/O
+
+OSDService "1" o-- "1" OSD
+OSDService --> ObjectStore
+OSDService --> OSDMap
+OSDService ..|> Scrub::ScrubSchedListener
+
+OSDShard --> OpScheduler
+OpScheduler <|.. OpSchedulerItem
+OSDShard "1" o-- "N" OSDShardPGSlot
+OSDShardPGSlot "1" o-- "0..1" PG
+
+PG ..|> DoutPrefixProvider
+PG ..|> PeeringListener
+PG ..|> Scrub::PgScrubBeListener
+PG --> PeeringState
+PG "1" *-- "N" OSDShardPGSlot
+
+PrimaryLogPG --|> PG
+PrimaryLogPG ..|> PGBackendListener
+PrimaryLogPG ..|> ECListener
+PrimaryLogPG "1" *-- "1" PGBackend
+PrimaryLogPG --> Objecter : tiering / copy
+PrimaryLogPG "1" o-- "N" OpContext
+PrimaryLogPG "1" o-- "N" ObjectContext
+OpContext --> ObjectContext : obc
+OpContext --> PGTransaction : op_t / transaction draft
+OpContext --> PGBackend : submit transactions
+
+PGBackend "1" o-- "1" ObjectStore
+PGBackend ..|> ECCommon : EC backend variants
+
+PGBackend <|-- ReplicatedBackend
+PGBackend <|-- ECSwitch
+
+ECSwitch "1" *-- "1" ECBackendL
+ECSwitch "1" *-- "1" ECBackend
+ECBackend ..|> ECCommon
+ECBackendL ..|> ECCommon
+
+note right of PGBackend
+  PGBackend.cc chooses the implementation by pool type:
+  - TYPE_REPLICATED -> ReplicatedBackend
+  - TYPE_ERASURE    -> ECSwitch
+end note
+
+note right of ECSwitch
+  EC execution is selected by
+  pool.allows_ecoptimizations():
+  - false -> ECBackendL
+  - true  -> ECBackend
+end note
+
+@enduml

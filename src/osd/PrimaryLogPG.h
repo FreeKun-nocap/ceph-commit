@@ -706,6 +706,7 @@ public:
     ObjectState new_obs;  // resulting ObjectState
     SnapSet new_snapset;  // resulting SnapSet (in case of a write)
     //pg_stat_t new_stats;  // resulting Stats
+    // 当前 OpContext 记录的“本次操作造成的统计变化量
     object_stat_sum_t delta_stats;
 
     bool modify;          // (force) modification (even if op_t is empty)

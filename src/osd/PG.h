@@ -1103,6 +1103,9 @@ protected:
   void requeue_ops(std::list<OpRequestRef> &l);
 
   // stats that persist lazily
+  // 多次 delta_stats 的延迟落盘累计
+  // 纯读/no-op 不会落盘，先累积在 unstable_stats (内存)中，等到下次落盘时再写入
+  // 每次落盘后，unstable_stats 会清空
   object_stat_collection_t unstable_stats;
 
   // publish stats

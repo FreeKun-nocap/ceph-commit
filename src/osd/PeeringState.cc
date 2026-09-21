@@ -586,6 +586,10 @@ void PeeringState::update_heartbeat_peers()
   pl->update_heartbeat_peers(std::move(new_peers));
 }
 
+/**
+ * 把 PGInfo、PastIntervals、PGLog 和 missing 的 dirty 状态编码进当前事务。
+ * 这里只负责生成待持久化内容；事务真正提交时这些修改才随对象数据一起落盘。
+ */
 void PeeringState::write_if_dirty(ObjectStore::Transaction& t)
 {
   pl->prepare_write(
@@ -598,6 +602,8 @@ void PeeringState::write_if_dirty(ObjectStore::Transaction& t)
     last_persisted_osdmap < get_osdmap_epoch(),
     t);
   if (dirty_info || dirty_big_info) {
+    // prepare_write 事务编码成功后，同步刷新“已写入快照”和脏标记；
+    // 需要强制重写 info 时，也把当前 OSDMap epoch 记为已持久化。
     last_persisted_osdmap = get_osdmap_epoch();
     last_written_info = info;
     dirty_info = false;

@@ -951,6 +951,12 @@ void PG::upgrade(ObjectStore *store)
 #pragma GCC diagnostic pop
 #pragma GCC diagnostic warning "-Wpragmas"
 
+/**
+ * Prepare the PG metadata and PGLog changes for the transaction.
+ *
+ * 将 unstable stats 合入 PGInfo；info 变脏时生成 info omap keymap；
+ * 再把 PGLog/missing 的 dirty 区间写入或删除 omap key。
+ */
 void PG::prepare_write(
   pg_info_t &info,
   pg_info_t &last_written_info,
@@ -966,6 +972,7 @@ void PG::prepare_write(
   map<string,bufferlist> km;
   string key_to_remove;
   if (dirty_big_info || dirty_info) {
+    // 将 info、past intervals 以及 osdmap epoch 的差异编码成 pgmeta omap keymap。
     int ret = prepare_info_keymap(
       cct,
       &km,
@@ -984,8 +991,10 @@ void PG::prepare_write(
   pglog.write_log_and_missing(
     t, &km, coll, pgmeta_oid, pool.info.require_rollback());
   if (!km.empty())
+    // info keymap 和 PGLog 写入结果最终都落在 pgmeta 对象上。
     t.omap_setkeys(coll, pgmeta_oid, km);
   if (!key_to_remove.empty())
+    // 快速 info 的旧格式 key 不再需要时，随同一事务删除。
     t.omap_rmkey(coll, pgmeta_oid, key_to_remove);
 }
 

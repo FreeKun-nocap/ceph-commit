@@ -668,7 +668,12 @@ void PGLog::check() {
   }
 }
 
-// non-static
+/**
+ * Write dirty PGLog entries, dups and missing updates into the transaction.
+ *
+ * 检查 PGLog 是否有待写内容；有则把内存 dirty 水位和 trimmed 集合交给
+ * _write_log_and_missing() 生成 omap 写删操作，最后清除本层脏标记。
+ */
 void PGLog::write_log_and_missing(
   ObjectStore::Transaction& t,
   map<string,bufferlist> *km,
@@ -677,6 +682,7 @@ void PGLog::write_log_and_missing(
   bool require_rollback)
 {
   if (needs_write()) {
+    // 仅在存在日志/dups/missing 或删除标记时生成写事务动作，避免空 PGLog 反复 touch。
     dout(6) << "write_log_and_missing with: "
 	     << "dirty_to: " << dirty_to
 	     << ", dirty_from: " << dirty_from
@@ -702,6 +708,7 @@ void PGLog::write_log_and_missing(
       &may_include_deletes_in_missing_dirty,
       (pg_log_debug ? &log_keys_debug : nullptr),
       this);
+    // 静态写入函数只把内容放进 t/km；这里清空 dirty 区间、trimmed 等待写状态。
     undirty();
   } else {
     dout(10) << "log is not dirty" << dendl;
