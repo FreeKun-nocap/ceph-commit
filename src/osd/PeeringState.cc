@@ -3705,26 +3705,30 @@ void PeeringState::proc_replica_log(
 }
 
 /**
-* Update min_last_complete_ondisk to the minimum
-* last_complete_ondisk version informed by each peer.
-*/
+ * 计算 primary 与所有参与副本共同确认的最小落盘水位，
+ * 任一参与 shard 尚未上报时保留旧值，避免越过未确认副本裁剪日志。
+ */
 void PeeringState::calc_min_last_complete_ondisk() {
   ceph_assert(!acting_recovery_backfill.empty());
   eversion_t min = last_complete_ondisk;
   for (const auto& pg_shard : acting_recovery_backfill) {
     if (pg_shard == get_primary()) {
+      // primary 的水位已作为初始值，跳过重复比较。
       continue;
     }
     if (peer_last_complete_ondisk.count(pg_shard) == 0) {
+      // 任一副本尚未上报，本次不能推进安全裁剪水位。
       psdout(20) <<  "no complete info on: "
                  << pg_shard << dendl;
       return;
     }
     if (peer_last_complete_ondisk[pg_shard] < min) {
+      // 取所有已上报副本中的最小值，保证 trim 不越过最慢副本。
       min = peer_last_complete_ondisk[pg_shard];
     }
   }
   if (min != min_last_complete_ondisk) {
+    // 仅在共同确认水位变化时更新，供后续 calc_trim_to() 使用。
     psdout(20) << "last_complete_ondisk is "
                << "updated to: " << min
                << " from: " << min_last_complete_ondisk
@@ -5160,25 +5164,41 @@ void PeeringState::recovery_committed_to(eversion_t version)
   }
 }
 
+/**
+ * 记录一次复制写全部提交后 primary 的提交与本地完成水位，
+ * 再计算所有参与副本共同确认的最小落盘水位。
+ */
 void PeeringState::complete_write(eversion_t v, eversion_t lc)
 {
+  // 重点：v 是本次复制写全副本提交后可对外确认的 PG 版本。
   pg_committed_to = v;
+  // 记录 primary 本地完成边界快照。
   last_complete_ondisk = lc;
+  // 重点：汇总 primary 与所有参与副本的 last_complete_ondisk。
   calc_min_last_complete_ondisk();
 }
 
+/**
+ * 计算本次可安全裁剪到的 pg_trim_to。
+ * 上限取所有副本共同落盘水位与可回滚水位的较小值，并受批量配置限制。
+ */
 void PeeringState::calc_trim_to()
 {
+  // 重点：目标长度由配置折算，只有日志超过目标时才考虑裁剪。
   size_t target = pl->get_target_pg_log_entries();
 
+  // 重点：不能越过最慢副本的 min_last_complete_ondisk；
+  // 【EC/rollback】同时不能越过 can_rollback_to，本阅读重点是副本安全水位。
   eversion_t limit = std::min(
     min_last_complete_ondisk,
     pg_log.get_can_rollback_to());
   if (limit != eversion_t() &&
       limit != pg_trim_to &&
       pg_log.get_log().approx_size() > target) {
+    // 单次裁剪量不超过 osd_pg_log_trim_max。
     size_t num_to_trim = std::min(pg_log.get_log().approx_size() - target,
                              cct->_conf->osd_pg_log_trim_max);
+    // 未达到最小批量时暂不裁剪，避免频繁执行小批删除。
     if (num_to_trim < cct->_conf->osd_pg_log_trim_min &&
         cct->_conf->osd_pg_log_trim_max >= cct->_conf->osd_pg_log_trim_min) {
       return;
@@ -5186,6 +5206,7 @@ void PeeringState::calc_trim_to()
     auto it = pg_log.get_log().log.begin();
     eversion_t new_trim_to;
     for (size_t i = 0; i < num_to_trim; ++i) {
+      // 从旧到新寻找本批边界，碰到安全上限后立即钳制。
       new_trim_to = it->version;
       ++it;
       if (new_trim_to > limit) {
@@ -5195,6 +5216,7 @@ void PeeringState::calc_trim_to()
       }
     }
     psdout(10) << "calc_trim_to " << pg_trim_to << " -> " << new_trim_to << dendl;
+    // 重点：这里只更新裁剪目标，真正删除日志由 PGLog::trim() 完成。
     pg_trim_to = new_trim_to;
     ceph_assert(pg_trim_to <= pg_log.get_head());
     ceph_assert(pg_trim_to <= min_last_complete_ondisk);

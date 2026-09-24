@@ -1,5 +1,19 @@
 # osd_types.h 笔记
 
+## struct pg_info_t
+
+PG 的状态摘要，保存数据完整性、日志边界、backfill 进度、统计和历史等水位。peering 和副本协商优先交换 info，不需要传输完整 PG 日志。
+
+### 属性说明
+
+#### `eversion_t last_complete` — 最后完整版本
+
+表示 PG 已经完整到该版本：此前的写入均已应用，且不存在需要恢复的 missing 对象。它可以落后于 `last_update`；只有 missing 清空后才能推进到 `last_update`。日志裁剪不能越过 `info.last_complete`。
+
+#### `eversion_t log_tail` — 保留日志下边界
+
+表示当前仍保留 PG 日志范围的下边界，与 `PGLog::log.tail` 保持一致。日志裁剪会同步推进它；即使旧日志条目已经删除，其他 OSD 仍能根据该边界判断能否执行 log recovery，还是必须使用 backfill。
+
 ## struct pg_log_t
 
 PG 的增量日志结构

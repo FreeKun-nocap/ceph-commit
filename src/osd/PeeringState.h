@@ -2024,8 +2024,10 @@ public:
   void update_trim_to() {
     bool hard_limit = (get_osdmap()->test_flag(CEPH_OSDMAP_PGLOG_HARDLIMIT));
     if (hard_limit)
+      // hard limit 模式
       calc_trim_to_aggressive();
     else
+      // 普通模式
       calc_trim_to();
   }
 

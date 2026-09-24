@@ -53,6 +53,10 @@ void PGLog::IndexedLog::split_out_child(
   reset_rollback_info_trimmed_to_riter();
 }
 
+/**
+ * 将 primary/replica 共用的 IndexedLog 从旧端裁剪到 s，并同步维护各类索引。
+ * 同时输出普通日志、dup 的待删 key，以及新增 dup 的待重写起点。
+ */
 void PGLog::IndexedLog::trim(
   CephContext* cct,
   eversion_t s,
@@ -61,10 +65,13 @@ void PGLog::IndexedLog::trim(
   eversion_t *write_from_dups)
 {
   lgeneric_subdout(cct, osd, 10) << "IndexedLog::trim s=" << s << dendl;
+  // 【EC/rollback】裁剪边界不能越过仍可回滚的起点；副本日志也执行同一安全约束。
   ceph_assert(s <= can_rollback_to);
   if (complete_to != log.end())
     lgeneric_subdout(cct, osd, 20) << " complete_to " << complete_to->version << dendl;
 
+  // osd_pg_log_dups_tracked 表示为重复请求检测保留多长的版本历史，默认值：3000 个版本。
+  // 只为最近 osd_pg_log_dups_tracked 版本范围内的请求保留去重记录。
   auto earliest_dup_version =
     log.rbegin()->version.version < cct->_conf->osd_pg_log_dups_tracked
     ? 0u
@@ -73,20 +80,25 @@ void PGLog::IndexedLog::trim(
   lgeneric_subdout(cct, osd, 20) << "earliest_dup_version = " << earliest_dup_version << dendl;
   while (!log.empty()) {
     const pg_log_entry_t &e = *log.begin();
+    // 日志按版本递增排列，遇到第一个大于 s 的条目即可停止。
     if (e.version > s)
       break;
     lgeneric_subdout(cct, osd, 20) << "trim " << e << dendl;
+    // 记录普通日志待删版本，持久化阶段再转换为 PGMeta omap key。
     if (trimmed)
       trimmed->emplace(e.version);
 
-    unindex(e);         // remove from index,
+    // 重点：删除该条目的对象和请求 ID 索引，避免留下悬空索引。
+    unindex(e);
 
-    // add to dup list
+    // 仍在去重窗口内的普通条目转换为轻量 dup，继续支持重复请求判断。
     if (e.version.version >= earliest_dup_version) {
+      // 重点：记录新增 dup 的最老重写起点，持久化阶段重写该范围。
       if (write_from_dups != nullptr && *write_from_dups > e.version) {
 	lgeneric_subdout(cct, osd, 20) << "updating write_from_dups from " << *write_from_dups << " to " << e.version << dendl;
 	*write_from_dups = e.version;
       }
+      // 主请求和 extra_reqids 都需要进入 dup；后者保留各自的返回码。
       dups.push_back(pg_log_dup_t(e));
       index(dups.back());
       uint32_t idx = 0;
@@ -109,9 +121,11 @@ void PGLog::IndexedLog::trim(
     }
 
     bool reset_complete_to = false;
-    // we are trimming past complete_to, so reset complete_to
+    // recovery 遍历位置 complete_to 被裁掉时，稍后重置到剩余日志开头。
     if (complete_to != log.end() && e.version >= complete_to->version)
       reset_complete_to = true;
+    // rollback_info_trimmed_to_riter 是 log 链表的反向迭代器缓存
+    // 重点：移除旧端条目时同步维护 rollback_info_trimmed_to 的反向迭代位置。
     if (rollback_info_trimmed_to_riter == log.rend() ||
 	e.version == rollback_info_trimmed_to_riter->version) {
       log.pop_front();
@@ -120,7 +134,7 @@ void PGLog::IndexedLog::trim(
       log.pop_front();
     }
 
-    // reset complete_to to the beginning of the log
+    // 将 recovery 进度指针移到裁剪后的第一条日志；日志为空则自然指向 end()。
     if (reset_complete_to) {
       complete_to = log.begin();
       if (complete_to != log.end()) {
@@ -145,13 +159,14 @@ void PGLog::IndexedLog::trim(
        max_dups_to_trim--) {
     const auto& e = *dups.begin();
     lgeneric_subdout(cct, osd, 20) << "trim dup " << e << dendl;
+    // 记录 dup 待删 key，并同步删除对应的请求 ID 索引。
     if (trimmed_dups)
       trimmed_dups->insert(e.get_key_name());
     unindex(e);
     dups.pop_front();
   }
 
-  // raise tail?
+  // 推进内存日志下边界；PGLog::trim() 随后用它同步 info.log_tail。
   if (tail < s)
     tail = s;
   lgeneric_subdout(cct, osd, 20) << "IndexedLog::trim after trim"
@@ -198,6 +213,17 @@ void PGLog::clear_info_log(
   t->remove(coll, pgid.make_pgmeta_oid());
 }
 
+/**
+ * 将 PGLog 内存日志裁剪到 trim_to，并同步 info.log_tail。
+ * trimmed/trimmed_dups 记录后续需要随持久化事务删除的日志 key。
+ *
+ * PGLog::log          → IndexedLog 实例
+ * PGLog::log.log      → 实际日志条目链表
+ *
+ * info 是 PG 状态和日志水位的摘要，log 是实际保留的日志内容及索引。
+ * info：告诉别人“这个 PG 现在处于什么状态、保留日志的边界在哪里”
+ * log ：保存“具体发生了哪些操作，以及如何恢复/回滚”
+ */
 void PGLog::trim(
   eversion_t trim_to,
   pg_info_t &info,
@@ -205,16 +231,18 @@ void PGLog::trim(
   bool async)
 {
   dout(10) << __func__ << " proposed trim_to = " << trim_to << dendl;
-  // trim?
+  // 只有新裁剪边界越过当前 log.tail 时才有实际工作。
   if (trim_to > log.tail) {
     dout(10) << __func__ << " missing = " << missing.num_missing() << dendl;
-    // Don't assert for async_recovery_targets or backfill_targets
-    // or whenever there are missing items
+    // 副本已正常应用且无 missing 时，不能越过 info.last_complete；
+    // async recovery/backfill 目标或仍有 missing 的副本允许继续推进日志边界。
     if (transaction_applied && !async && (missing.num_missing() == 0))
       ceph_assert(trim_to <= info.last_complete);
 
     dout(10) << "trim " << log << " to " << trim_to << dendl;
+    // 重点：IndexedLog::trim() 从内存删除条目，并记录待删除的持久化 key。
     log.trim(cct, trim_to, &trimmed, &trimmed_dups, &write_from_dups);
+    // 裁剪后 PGInfo 中的 log_tail 必须与内存日志边界一致。
     info.log_tail = log.tail;
     if (log.complete_to != log.log.end())
       dout(10) << " after trim complete_to " << log.complete_to->version << dendl;
@@ -673,6 +701,12 @@ void PGLog::check() {
  *
  * 检查 PGLog 是否有待写内容；有则把内存 dirty 水位和 trimmed 集合交给
  * _write_log_and_missing() 生成 omap 写删操作，最后清除本层脏标记。
+ *
+ * @param t 接收 omap 写删操作的 ObjectStore 事务。
+ * @param km 待写入 pgmeta omap 的 key/value；由 PG::prepare_write() 最终提交。
+ * @param coll PG 对应的 collection。
+ * @param log_oid 保存 PGLog/missing 元数据的 pgmeta 对象。
+ * @param require_rollback EC/rollback 池为 true，需要持久化回滚边界。
  */
 void PGLog::write_log_and_missing(
   ObjectStore::Transaction& t,
@@ -891,6 +925,41 @@ void PGLog::_write_log_and_missing_wo_missing(
   ldpp_dout(dpp, 10) << "end of " << __func__ << dendl;
 }
 
+/**
+ * 把指定 dirty 区间内的 PGLog、dups 和 missing 变化编码成 pgmeta omap 写删操作。
+ *
+ * 本函数不提交事务：条目先写入调用方提供的 keymap，删除操作直接追加到 t；
+ * 最终由 PG meta 事务随对象数据一起持久化。
+ *
+ * @param t 接收 omap 删除和 touch 操作的事务。
+ * @param km 接收 log/dup/missing 新值的 omap keymap。
+ * @param log 当前要持久化的 PGLog。
+ * @param coll PG 对应的 collection。
+ * @param log_oid 保存 PGLog/missing 元数据的 pgmeta 对象。
+ * @param dirty_to 需要删除并重写 `[0, dirty_to]` 的普通日志区间。
+ * @param dirty_from 需要删除并重写 `[dirty_from, head]` 的普通日志区间。
+ * @param writeout_from 只需要重写、不必先清空的尾部日志起点。
+ * @param trimmed 已从内存裁剪、盘上 key 还需删除的普通日志版本集合。
+ * @param trimmed_dups 已从内存裁剪、盘上 key 还需删除的 dup key 集合。
+ * @param missing 逐对象持久化/删除 missing 条目。
+ * @param touch_log 为 true 时先确保 pgmeta 对象存在。
+ * @param require_rollback 为 true 时持久化 can_rollback_to / rollback_info_trimmed_to。
+ * @param clear_divergent_priors 为 true 时删除旧的 divergent_priors key。
+ * @param dirty_to_dups 需要删除并重写 `[0, dirty_to_dups]` 的 dup 区间。
+ * @param dirty_from_dups 需要删除并重写 `[dirty_from_dups, head]` 的 dup 区间。
+ * @param write_from_dups 只需要重写、不必先清空的 dup 起点。
+ * @param may_include_deletes_in_missing_dirty missing 的 delete 语义标记是否脏。
+ * @param log_keys_debug 调试用 key 集合；非调试路径可为空。
+ * @param dpp 日志输出前缀提供者。
+ *
+ * dirty_to       = 旧端脏区间，先删再重写
+ * dirty_from     = 新端脏区间，先删再重写
+ * writeout_from  = 新增内容写入起点，通常只写
+
+ * dirty_to_dups       = dup 旧端脏区间
+ * dirty_from_dups     = dup 新端脏区间
+ * write_from_dups     = 新增 dup 写入起点
+ */
 // static
 void PGLog::_write_log_and_missing(
   ObjectStore::Transaction& t,
@@ -920,6 +989,8 @@ void PGLog::_write_log_and_missing(
 		     << " trimmed_dups.size()=" << trimmed_dups.size() << dendl;
   set<string> to_remove;
   to_remove.swap(trimmed_dups);
+  // trimmed/trimmed_dups 记录的是已经从内存删除、但盘上 key 还需清除的条目；
+  // 先统一转成待删除 key 列表。
   for (auto& t : trimmed) {
     string key = t.get_key_name();
     if (log_keys_debug) {
@@ -934,6 +1005,7 @@ void PGLog::_write_log_and_missing(
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
+    // 头部脏区间：先删除旧 key，再重新写入 <= dirty_to 的日志条目。
     t.omap_rmkeyrange(
       coll, log_oid,
       eversion_t().get_key_name(), dirty_to.get_key_name());
@@ -942,6 +1014,7 @@ void PGLog::_write_log_and_missing(
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
     ldpp_dout(dpp, 10) << "write_log_and_missing, clearing from "
 		       << dirty_from << dendl;
+    // 尾部脏区间：覆盖回退、追加或裁剪导致的“从 dirty_from 到头”的变化。
     t.omap_rmkeyrange(
       coll, log_oid,
       dirty_from.get_key_name(), eversion_t::max().get_key_name());
@@ -951,6 +1024,7 @@ void PGLog::_write_log_and_missing(
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
+    // 正向补写头部脏区间内的普通日志条目。
     bufferlist bl(sizeof(*p) * 2);
     p->encode_with_checksum(bl);
     (*km)[p->get_key_name()] = std::move(bl);
@@ -961,6 +1035,7 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
+    // 反向补写尾部脏区间；dirty_to/max 作为边界，防止重复重写无关区间。
     bufferlist bl(sizeof(*p) * 2);
     p->encode_with_checksum(bl);
     (*km)[p->get_key_name()] = std::move(bl);
@@ -980,6 +1055,7 @@ void PGLog::_write_log_and_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
+    // dup 头部脏区间同样采用“先删旧范围，再重写新内容”。
     pg_log_dup_t min, dirty_to_dup;
     dirty_to_dup.version = dirty_to_dups;
     ldpp_dout(dpp, 10) << __func__ << " remove dups min=" << min.get_key_name()
@@ -989,6 +1065,7 @@ void PGLog::_write_log_and_missing(
       min.get_key_name(), dirty_to_dup.get_key_name());
   }
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
+    // dup 尾部脏区间对应 reqid 重放记录的追加、回退或清理。
     pg_log_dup_t max, dirty_from_dup;
     max.version = eversion_t::max();
     dirty_from_dup.version = dirty_from_dups;
@@ -1005,6 +1082,7 @@ void PGLog::_write_log_and_missing(
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
+    // 正向写入 dirty_to_dups 之前仍然保留的 dup 条目。
     bufferlist bl;
     encode(entry, bl);
     (*km)[entry.get_key_name()] = std::move(bl);
@@ -1017,6 +1095,7 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
+    // 反向写入尾部 dirty/write 区间内的 dup 条目。
     bufferlist bl;
     encode(*p, bl);
     (*km)[p->get_key_name()] = std::move(bl);
@@ -1025,6 +1104,7 @@ void PGLog::_write_log_and_missing(
 		     << log.dups.size() << dendl;
 
   if (clear_divergent_priors) {
+    // 分叉前序索引已失效或已并入主日志时，删除其整体持久化 key。
     ldpp_dout(dpp, 10) << "write_log_and_missing: writing divergent_priors"
 		       << dendl;
     to_remove.insert("divergent_priors");
@@ -1032,11 +1112,13 @@ void PGLog::_write_log_and_missing(
   // since we encode individual missing items instead of a whole
   // missing set, we need another key to store this bit of state
   if (*may_include_deletes_in_missing_dirty) {
+    // missing 集合是否允许包含 delete 是独立标记，变化时随本事务同步。
     (*km)["may_include_deletes_in_missing"] = bufferlist();
     *may_include_deletes_in_missing_dirty = false;
   }
   missing.get_changed(
     [&](const hobject_t &obj) {
+      // missing 是逐对象持久化的：仍 missing 的对象重写 key，已恢复的对象删除 key。
       string key = string("missing/") + obj.to_str();
       pg_missing_item item;
       if (!missing.is_missing(obj, &item)) {
@@ -1046,6 +1128,7 @@ void PGLog::_write_log_and_missing(
       }
     });
   if (require_rollback) {
+    // EC/rollback 池必须持久化回滚边界，重启后才能安全恢复部分写状态。
     encode(
       log.get_can_rollback_to(),
       (*km)["can_rollback_to"]);

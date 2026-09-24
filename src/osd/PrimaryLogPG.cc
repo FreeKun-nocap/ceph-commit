@@ -11807,6 +11807,11 @@ public:
   }
 };
 
+/**
+ * 标记一次复制写聚合（RepGather）已经完成全部提交确认；
+ * 未中止时先让 PeeringState 更新本地持久化水位，
+ * 再进入 eval_repop() 完成客户端回复、日志 trim 计算等收尾。
+ */
 void PrimaryLogPG::repop_all_committed(RepGather *repop)
 {
   dout(10) << __func__ << ": repop tid " << repop->rep_tid << " all committed "
@@ -11814,8 +11819,11 @@ void PrimaryLogPG::repop_all_committed(RepGather *repop)
   repop->all_committed = true;
   if (!repop->rep_aborted) {
     if (repop->v != eversion_t()) {
+      // 重点：把本次写版本交给 PeeringState，内部会更新 last_complete_ondisk，
+      // 并计算 primary/所有 acting 副本的最小落盘水位。
       recovery_state.complete_write(repop->v, repop->pg_local_last_complete);
     }
+    // 重点：进入写收尾评估，通常在此路径继续触发 eval_repop 的回复/trim 逻辑。
     eval_repop(repop);
   }
 }
