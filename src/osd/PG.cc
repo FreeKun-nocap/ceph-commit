@@ -1511,14 +1511,22 @@ Context* PG::on_clean()
   return finish_recovery();
 }
 
+/**
+ * 将当前 OSDMap 增量中的快照删除进度同步到 active PG。
+ *
+ * primary 侧把新删除的快照登记到 snap_trimq，并根据集群已完成清理的快照更新 info.purged_snaps；
+ * 实际 clone 删除随后由 SnapTrim 复制到副本。
+ */
 void PG::on_active_advmap(const OSDMapRef &osdmap)
 {
+  // 重点调用：取出本 epoch 新加入 removed_snaps 的待清理快照。
   const auto& new_removed_snaps = osdmap->get_new_removed_snaps();
   auto i = new_removed_snaps.find(get_pgid().pool());
   if (i != new_removed_snaps.end()) {
     bool bad = false;
     for (auto j : i->second) {
       if (snap_trimq.intersects(j.first, j.second)) {
+	// snap_trimq 已包含相同范围，说明本地待裁剪状态与地图增量有重叠。
 	decltype(snap_trimq) added, overlap;
 	added.insert(j.first, j.second);
 	overlap.intersection_of(snap_trimq, added);
@@ -1527,6 +1535,7 @@ void PG::on_active_advmap(const OSDMapRef &osdmap)
 	bad = true;
 	snap_trimq.union_of(added);
       } else {
+	// 登记新删除的 snapid 范围，后续由 kick_snap_trim() 启动清理。
 	snap_trimq.insert(j.first, j.second);
       }
     }
@@ -1535,17 +1544,20 @@ void PG::on_active_advmap(const OSDMapRef &osdmap)
     ceph_assert(!bad || !cct->_conf->osd_debug_verify_cached_snaps);
   }
 
+  // 重点调用：取出本 epoch 已从 Pool removed_snaps 中清除的快照。
   const auto& new_purged_snaps = osdmap->get_new_purged_snaps();
   auto j = new_purged_snaps.find(get_pgid().pgid.pool());
   if (j != new_purged_snaps.end()) {
     bool bad = false;
     for (auto k : j->second) {
       if (!recovery_state.get_info().purged_snaps.contains(k.first, k.second)) {
+	// 地图与本 PG 的 purged_snaps 不一致时，仅清理可能重叠的本地记录。
 	interval_set<snapid_t> rm, overlap;
 	rm.insert(k.first, k.second);
 	overlap.intersection_of(recovery_state.get_info().purged_snaps, rm);
 	derr << __func__ << " purged_snaps does not contain "
 	     << rm << ", only " << overlap << dendl;
+	// 重点调用：通过 PeeringState 统一修改并标记 purged_snaps 待持久化。
 	recovery_state.adjust_purged_snaps(
 	  [&overlap](auto &purged_snaps) {
 	    purged_snaps.subtract(overlap);
@@ -1563,6 +1575,7 @@ void PG::on_active_advmap(const OSDMapRef &osdmap)
 	//    propagated.
 	//bad = true;
       } else {
+	// 集群已确认快照清理完成，从 PG 的已清理集合中移除对应范围。
 	recovery_state.adjust_purged_snaps(
 	  [&k](auto &purged_snaps) {
 	    purged_snaps.erase(k.first, k.second);
@@ -1596,22 +1609,31 @@ void PG::queue_snap_retrim(snapid_t snap)
   }
 }
 
+/**
+ * 执行 active primary 在 ActMap 生效后的后台工作调度。
+ *
+ * 根据最新 OSDMap 和 PG 状态启动 SnapTrim，并在 PG 尚未 clean 时
+ * 重新调度 recovery/backfill；副本不进入此入口。
+ */
 void PG::on_active_actmap()
 {
+  // 可选的 PG Log 一致性检查，仅在配置显式开启时扫描本地 ObjectStore。
   if (cct->_conf->osd_check_for_log_corruption)
     check_log_for_corruption(osd->store);
 
-
   if (recovery_state.is_active()) {
     dout(10) << "Active: kicking snap trim" << dendl;
+    // 重点调用：检查 snap_trimq 后进入 PrimaryLogPG::kick_snap_trim()。
     kick_snap_trim();
   }
 
+  // 新地图生效后 PG 可能重新 degraded；满足调度条件时恢复后台修复工作。
   if (recovery_state.is_peered() &&
       !recovery_state.is_clean() &&
       !recovery_state.get_osdmap()->test_flag(CEPH_OSDMAP_NOBACKFILL) &&
       (!recovery_state.get_osdmap()->test_flag(CEPH_OSDMAP_NOREBALANCE) ||
        recovery_state.is_degraded())) {
+    // 重点调用：把 recovery/backfill 任务重新放入 OSD 调度器。
     queue_recovery();
   }
 }

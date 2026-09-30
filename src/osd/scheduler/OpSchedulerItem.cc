@@ -39,12 +39,16 @@ void PGPeeringItem::run(
   osd->dequeue_peering_evt(sdata, pg.get(), evt, handle);
 }
 
+/**
+ * PGSnapTrim 调度项执行：持 PG 锁调用 snap_trimmer() 后释放锁。
+ */
 void PGSnapTrim::run(
   OSD *osd,
   OSDShard *sdata,
   PGRef& pg,
   ThreadPool::TPHandle &handle)
 {
+  // 重点调用：进入 SnapTrimmer 状态机（投递 DoSnapWork）。
   pg->snap_trimmer(epoch_queued);
   pg->unlock();
 }

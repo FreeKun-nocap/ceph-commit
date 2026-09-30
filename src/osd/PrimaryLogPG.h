@@ -1716,15 +1716,25 @@ private:
       boost::statechart::custom_reaction< SnapTrimTimerReady >
       > reactions;
     Context *wakeup = nullptr;
+    /**
+     * WaitTrimTimer 状态构造：批间节流，延迟后再裁下一批。
+     *
+     * 按 osd_snap_trim_sleep 延时注册定时器；未配置时直接投递
+     * SnapTrimTimerReady 立即继续。
+     */
     explicit WaitTrimTimer(my_context ctx)
       : my_base(ctx),
 	NamedState(nullptr, "Trimming/WaitTrimTimer") {
+      // 记录进入状态。
       context< SnapTrimmer >().log_enter(state_name);
+      // 进入节流等待时不允许有在飞裁剪事务。
       ceph_assert(context<Trimming>().in_flight.empty());
+      // 定时器回调：到点后向状态机投递 SnapTrimTimerReady 事件。
       struct OnTimer : Context {
 	PrimaryLogPGRef pg;
 	epoch_t epoch;
 	OnTimer(PrimaryLogPGRef pg, epoch_t epoch) : pg(pg), epoch(epoch) {}
+	// 重点回调：持 PG 锁并校验 epoch 未失效后投递事件。
 	void finish(int) override {
 	  pg->lock();
 	  if (!pg->pg_has_reset_since(epoch))
@@ -1733,13 +1743,16 @@ private:
 	}
       };
       auto *pg = context< SnapTrimmer >().pg;
+      // 读取节流间隔配置（秒）。
       float osd_snap_trim_sleep = pg->osd->osd->get_osd_snap_trim_sleep();
       if (osd_snap_trim_sleep > 0) {
+	// 重点调用：向 OSD 全局 sleep_timer 注册延时事件。
 	std::lock_guard l(pg->osd->sleep_lock);
 	wakeup = pg->osd->sleep_timer.add_event_after(
 	  osd_snap_trim_sleep,
 	  new OnTimer{pg, pg->get_osdmap_epoch()});
       } else {
+	// 未配置延时：立即投递事件，不做节流。
 	post_event(SnapTrimTimerReady());
       }
     }
@@ -1799,11 +1812,20 @@ private:
     void exit() {
       context< SnapTrimmer >().log_exit(state_name, enter_time);
     }
+    /**
+     * 处理一批裁剪事务全部落盘后的 RepopsComplete。
+     *
+     * 复核裁剪条件：仍满足则经 WaitTrimTimer 节流后继续下一批，
+     * 否则退回 NotTrimming 并补发 KickTrim 重新判断。
+     */
     boost::statechart::result react(const RepopsComplete&) {
+      // 重点调用：复核 clean/scrub/snap_trimq 条件。
       if (!context< SnapTrimmer >().can_trim()) {
+	// 条件失效：退回 NotTrimming，KickTrim 触发重新评估。
 	post_event(KickTrim());
 	return transit< NotTrimming >();
       } else {
+	// 重点状态转移：先等节流定时器，再继续下一批裁剪。
 	return transit< WaitTrimTimer >();
       }
     }
@@ -1844,17 +1866,27 @@ private:
     };
     ReservationCB *pending = nullptr;
 
+    /**
+     * WaitReservation 状态构造：向 OSD 全局 SnapTrim 资源池异步申请裁剪额度。
+     *
+     * 仅 active primary 会走到这里；申请完成后等待 SnapTrimReserved 事件继续。
+     */
     explicit WaitReservation(my_context ctx)
       : my_base(ctx),
 	NamedState(nullptr, "Trimming/WaitReservation") {
+      // 记录进入状态。
       context< SnapTrimmer >().log_enter(state_name);
+      // 进入 WaitReservation 时不应该有上一轮遗留的未完成裁剪事务
       ceph_assert(context<Trimming>().in_flight.empty());
       auto *pg = context< SnapTrimmer >().pg;
+      // 资源回调：拿到额度后向状态机投递 SnapTrimReserved 事件。
       pending = new ReservationCB(pg);
+      // 重点调用：向 OSD 全局 snap_reserver 排队申请裁剪资源。
       pg->osd->snap_reserver.request_reservation(
 	pg->get_pgid(),
 	pending,
 	0);
+      // 对外标记"等待裁剪资源"并发布 PG 统计。
       pg->state_set(PG_STATE_SNAPTRIM_WAIT);
       pg->publish_stats_to_osd();
     }

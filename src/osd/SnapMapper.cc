@@ -713,6 +713,11 @@ vector<hobject_t> SnapMapper::get_objects_by_prefixes(
   return out;
 }
 
+/**
+ * 从 SnapMapper 索引按 snapid 取出一批待裁剪对象。
+ *
+ * 返回 nullopt 表示该 snap 已无对象可裁，调用方据此收尾 snap_trimq/purged_snaps。
+ */
 std::optional<vector<hobject_t>> SnapMapper::get_next_objects_to_trim(
   snapid_t snap,
   unsigned max)
@@ -721,15 +726,19 @@ std::optional<vector<hobject_t>> SnapMapper::get_next_objects_to_trim(
 
   // if max would be 0, we return ENOENT and the caller would mistakenly
   // trim the snaptrim queue
+  // max 至少为 1，否则空结果会被误判为"裁剪完成"。
   ceph_assert(max > 0);
 
   // The prefix_itr is bound to a prefix_itr_snap so if we trim another snap
   // we must reset the prefix_itr (should not happen normally)
+  // prefix_itr 是绑定 snapid 的遍历游标；snap 变化时必须重置。
   if (prefix_itr_snap != snap) {
     if (prefix_itr_snap == CEPH_NOSNAP) {
+      // 重点调用：本 snap 开始裁剪，定位游标起点。
       reset_prefix_itr(snap, "Trim begins");
     }
     else {
+      // 异常情况：裁剪中途换了 snap，重置游标。
       reset_prefix_itr(snap, "Unexpected snap change");
     }
   }
@@ -741,8 +750,10 @@ std::optional<vector<hobject_t>> SnapMapper::get_next_objects_to_trim(
   // For more info see PG::filter_snapc()
   //
   // We still like to be extra careful and run one extra loop over all prefixes
+  // 重点调用：按 hash 前缀遍历索引，取出至多 max 个对象。
   auto objs = get_objects_by_prefixes(snap, max);
   if (unlikely(objs.size() == 0)) {
+    // 兜底二次扫描：防止开始裁剪后新增 clone（理论上不会发生）。
     reset_prefix_itr(snap, "Second pass trim");
     objs = get_objects_by_prefixes(snap, max);
 
@@ -750,10 +761,12 @@ std::optional<vector<hobject_t>> SnapMapper::get_next_objects_to_trim(
       derr << *this << __func__ << " New Clone-Objects were added to Snap " << snap
 	   << " after trimming was started" << dendl;
     }
+    // 二次扫描确认裁完：重置游标到 CEPH_NOSNAP 标记本轮结束。
     reset_prefix_itr(CEPH_NOSNAP, "Trim was completed successfully");
   }
 
   if (objs.size() == 0) {
+    // 该 snap 已无对象可裁。
     return std::nullopt;
   } else {
     return objs;

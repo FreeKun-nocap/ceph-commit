@@ -5205,10 +5205,18 @@ int PrimaryLogPG::trim_object(
   return 0;
 }
 
+/**
+ * 在条件满足时启动对象快照裁剪状态机。
+ *
+ * 此函数只负责发起 KickTrim，不执行对象删除；具体 clone 清理由
+ * SnapTrimmer 调度 trim_object()，并通过复制写事务同步到副本。
+ */
 void PrimaryLogPG::kick_snap_trim()
 {
+  // SnapTrim 只允许 active primary 发起。
   ceph_assert(is_active());
   ceph_assert(is_primary());
+  // 只有 PG clean、未准备 merge 且 snap_trimq 中存在待清理快照时才启动。
   if (is_clean() &&
       !state_test(PG_STATE_PREMERGE) &&
       !snap_trimq.empty()) {
@@ -5216,8 +5224,10 @@ void PrimaryLogPG::kick_snap_trim()
       dout(10) << __func__ << ": nosnaptrim set, not kicking" << dendl;
     } else {
       dout(10) << __func__ << ": clean and snaps to trim, kicking" << dendl;
+      // 重点调用：重置本轮对象清理统计并记录 SnapTrim 开始时间。
       reset_objects_trimmed();
       set_snaptrim_begin_stamp();
+      // 重点调用：向 SnapTrimmer 状态机投递 KickTrim，进入资源预留阶段。
       snap_trimmer_machine.process_event(KickTrim());
     }
   }
@@ -5231,15 +5241,21 @@ void PrimaryLogPG::snap_trimmer_scrub_complete()
   }
 }
 
+/**
+ * PGSnapTrim 工作项的执行入口：校验后向 SnapTrimmer 状态机投递 DoSnapWork 事件。
+ */
 void PrimaryLogPG::snap_trimmer(epoch_t queued)
 {
+  // PG 正在删除或已 reset 过，直接放弃本工作项。
   if (recovery_state.is_deleting() || pg_has_reset_since(queued)) {
     return;
   }
 
+  // SnapTrim 只在 primary 上执行。
   ceph_assert(is_primary());
 
   dout(10) << "snap_trimmer posting" << dendl;
+  // 重点调用：投递 DoSnapWork，由 AwaitAsyncWork::react 执行批量裁剪。
   snap_trimmer_machine.process_event(DoSnapWork());
   dout(10) << "snap_trimmer complete" << dendl;
   return;
@@ -16409,43 +16425,64 @@ void PrimaryLogPG::NotTrimming::exit()
   context< SnapTrimmer >().log_exit(state_name, enter_time);
 }
 
+/**
+ * 处理 SnapTrimmer 空闲状态下收到的 KickTrim。
+ *
+ * 重新校验 primary、active、clean 和待裁剪条件；
+ * 正在 scrub 时等待 scrub 完成，否则进入 Trimming，并自动落到初始子状态 WaitReservation。
+ */
 boost::statechart::result PrimaryLogPG::NotTrimming::react(const KickTrim&)
 {
   PrimaryLogPG *pg = context< SnapTrimmer >().pg;
   ldout(pg->cct, 10) << "NotTrimming react KickTrim" << dendl;
 
+  // SnapTrim 只由 active primary 驱动，其他角色直接丢弃事件。
   if (!(pg->is_primary() && pg->is_active())) {
     ldout(pg->cct, 10) << "NotTrimming not primary or active" << dendl;
     return discard_event();
   }
+  // PG 不再 clean 或待裁剪集合已清空时，不进入对象清理流程。
   if (!pg->is_clean() ||
       pg->snap_trimq.empty()) {
     ldout(pg->cct, 10) << "NotTrimming not clean or nothing to trim" << dendl;
     return discard_event();
   }
   if (pg->is_scrub_queued_or_active()) {
+    // scrub 与 SnapTrim 不并发；先转 WaitScrub，完成后重新接收 KickTrim。
     ldout(pg->cct, 10) << " scrubbing, will requeue snap_trimmer after" << dendl;
     return transit< WaitScrub >();
   } else {
+    // 重点状态转移：Trimming 的初始子状态 WaitReservation 会申请 SnapTrim 资源。
     return transit< Trimming >();
   }
 }
 
+/**
+ * 处理拿到 SnapTrim 资源额度后的 SnapTrimReserved 事件。
+ *
+ * 决定去向：条件不满足则退回 NotTrimming 并补发 KickTrim，
+ * 否则确定本轮裁剪的 snapid，转入 AwaitAsyncWork 开始批量删 clone。
+ */
 boost::statechart::result PrimaryLogPG::WaitReservation::react(const SnapTrimReserved&)
 {
   PrimaryLogPG *pg = context< SnapTrimmer >().pg;
   ldout(pg->cct, 10) << "WaitReservation react SnapTrimReserved" << dendl;
 
+  // 资源回调已被消费，防止退出时重复 cancel。
   pending = nullptr;
+  // 重点调用：复核 clean/scrub/snap_trimq 条件，防止等待期间状态变化。
   if (!context< SnapTrimmer >().can_trim()) {
+    // 条件失效：退回 NotTrimming，补发 KickTrim 以重新触发裁剪判断。
     post_event(KickTrim());
     return transit< NotTrimming >();
   }
 
+  // 取 snap_trimq 最旧的待裁剪 snapid 作为本轮目标。
   context<Trimming>().snap_to_trim = pg->snap_trimq.range_start();
   ldout(pg->cct, 10) << "NotTrimming: trimming "
 		     << pg->snap_trimq.range_start()
 		     << dendl;
+  // 重点状态转移：真正的对象裁剪在 AwaitAsyncWork 中异步执行。
   return transit< AwaitAsyncWork >();
 }
 
@@ -16464,14 +16501,23 @@ PrimaryLogPG::AwaitAsyncWork::AwaitAsyncWork(my_context ctx)
   pg->publish_stats_to_osd();
 }
 
+/**
+ * 处理 DoSnapWork 事件：SnapTrim 核心执行体，按批删除本轮 snapid 的对象 clone。
+ *
+ * 由后台队列 PGSnapTrim 唤醒执行一批；
+ * 裁完一个 snapid 后更新 snap_trimq/purged_snaps 并回到 NotTrimming 继续下一个。
+ */
 boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
 {
   PrimaryLogPGRef pg = context< SnapTrimmer >().pg;
   snapid_t snap_to_trim = context<Trimming>().snap_to_trim;
   auto &in_flight = context<Trimming>().in_flight;
+  // 上一批裁剪事务必须全部完成，才能开始新一批。
   ceph_assert(in_flight.empty());
 
+  // 裁剪只在 active primary 上执行。
   ceph_assert(pg->is_primary() && pg->is_active());
+  // 重点调用：复核裁剪条件，失效则退回 NotTrimming 并补发 KickTrim。
   if (!context< SnapTrimmer >().can_trim()) {
     ldout(pg->cct, 10) << "something changed, reverting to NotTrimming" << dendl;
     post_event(KickTrim());
@@ -16480,27 +16526,33 @@ boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
 
   ldout(pg->cct, 10) << "AwaitAsyncWork: trimming snap " << snap_to_trim << dendl;
 
+  // 每批最多并发裁剪的对象数（osd_pg_max_concurrent_snap_trims）。
   unsigned max = pg->cct->_conf->osd_pg_max_concurrent_snap_trims;
   // we need to look for at least 1 snaptrim, otherwise we'll misinterpret
   // the ENOENT below and erase snap_to_trim.
   ceph_assert(max > 0);
 
+  // 重点调用：从 SnapMapper 索引取出本批待裁剪对象。
   auto to_trim =
       pg->snap_mapper.get_next_objects_to_trim(snap_to_trim, max);
   if (!to_trim.has_value()) {
     // Done!
     ldout(pg->cct, 10) << "no more entries to trim" << dendl;
 
+    // 本轮 snapid 已裁完，从 snap_trimq 移除。
     pg->snap_trimq.erase(snap_to_trim);
 
     if (pg->snap_trimq_repeat.count(snap_to_trim)) {
+      // 标记过重复裁剪的 snapid 只清标记，不写入 purged_snaps。
       ldout(pg->cct, 10) << " removing from snap_trimq_repeat" << dendl;
       pg->snap_trimq_repeat.erase(snap_to_trim);
     } else {
+      // 正常收尾：snapid 记入 purged_snaps 并持久化。
       ldout(pg->cct, 10) << "adding snap " << snap_to_trim
 			 << " to purged_snaps"
 			 << dendl;
       ObjectStore::Transaction t;
+      // 重点调用：更新 info.purged_snaps。
       pg->recovery_state.adjust_purged_snaps(
 	[snap_to_trim](auto &purged_snaps) {
 	  purged_snaps.insert(snap_to_trim);
@@ -16511,9 +16563,11 @@ boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
 			 << pg->info.purged_snaps << ", snap_trimq now "
 			 << pg->snap_trimq << dendl;
 
+      // 持久化 purged_snaps，并把新水位同步给副本。
       int tr = pg->osd->store->queue_transaction(pg->ch, std::move(t), NULL);
       ceph_assert(tr == 0);
 
+      // 重点调用：向副本同步 info.purged_snaps。
       pg->recovery_state.share_pg_info();
     }
     post_event(KickTrim());
@@ -16521,10 +16575,12 @@ boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
     return transit< NotTrimming >();
   }
 
+  // 批量循环：逐个构造并提交对象裁剪事务。
   for (auto &&object: *to_trim) {
     // Get next
     ldout(pg->cct, 10) << "AwaitAsyncWork react trimming " << object << dendl;
     OpContextUPtr ctx;
+    // 重点调用：构造删除 clone 的事务（含 SnapSet/SnapMapper 更新），走复制写路径。
     int error = pg->trim_object(in_flight.empty(), object, snap_to_trim, &ctx);
     if (error) {
       if (error == -ENOLCK) {
@@ -16546,7 +16602,10 @@ boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
       return transit< NotTrimming >();
     }
 
+    // 记录在飞对象，等 on_success 全部完成后才推进状态机。
     in_flight.insert(object);
+    // 重点回调：单个对象裁剪落盘后从 in_flight 摘除；
+    // 全部清空后投递 RepopsComplete（或出错时 Reset）。
     ctx->register_on_success(
       [pg, object, &in_flight]() {
 	ceph_assert(in_flight.find(object) != in_flight.end());
@@ -16560,9 +16619,11 @@ boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
 	}
       });
 
+    // 重点调用：提交本次裁剪事务（复制写路径，同步到副本）。
     pg->simple_opc_submit(std::move(ctx));
   }
 
+  // 批内事务已全部提交，转 WaitRepops 等待全部落盘。
   return transit< WaitRepops >();
 }
 

@@ -646,13 +646,22 @@ void PeeringState::advance_map(
   last_require_osd_release = osdmap->require_osd_release;
 }
 
+/**
+ * 在一批 OSDMap 逐 epoch 推进后统一执行 ActMap 激活动作。
+ *
+ * 事件由当前 PeeringState 分发：primary 进入 active 地图后续处理，
+ * 副本则按需刷新并向 primary 发送 notify；同时保存延迟更新的 PG info。
+ */
 void PeeringState::activate_map(PeeringCtx &rctx)
 {
   psdout(10) << dendl;
   ActMap evt;
+  // 重点调用：Active::react(ActMap) 会通知 PG 启动快照清理，
+  // ReplicaActive::react(ActMap) 则处理副本侧的地图激活。
   handle_event(evt, &rctx);
   if (osdmap_ref->get_epoch() - last_persisted_osdmap >
     cct->_conf->osd_pg_epoch_persisted_max_stale) {
+    // PG info 长时间未随地图持久化时标记为脏，避免重启后地图水位过度落后。
     psdout(20) << ": Dirtying info: last_persisted is "
 	      << last_persisted_osdmap
 	      << " while current is " << osdmap_ref->get_epoch() << dendl;
@@ -662,9 +671,11 @@ void PeeringState::activate_map(PeeringCtx &rctx)
 	      << last_persisted_osdmap
 	      << " while current is " << osdmap_ref->get_epoch() << dendl;
   }
+  // 重点调用：把 dirty_info/dirty_big_info 对应的 PG 元数据加入本批事务。
   write_if_dirty(rctx.transaction);
 
   if (get_osdmap()->check_new_blocklist_entries()) {
+    // 新增 blocklist 可能使现有 watch 失效，需要让 PG 检查并清理。
     pl->check_blocklisted_watchers();
   }
 }
@@ -6978,22 +6989,31 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
   return forward_event();
 }
 
+/**
+ * 处理 active primary 收到 ActMap 后的本批地图激活收尾。
+ *
+ * 先通知 PG 启动依赖 clean 状态的后台工作（如 SnapTrim），
+ * 再重新检查 unfound 对象，避免新地图改变可恢复源后继续使用旧结论。
+ */
 boost::statechart::result PeeringState::Active::react(const ActMap&)
 {
   DECLARE_LOCALS;
   psdout(10) << "Active: handling ActMap" << dendl;
   ceph_assert(ps->is_primary());
 
+  // 重点调用：PG::on_active_actmap() 会按 PG 状态启动快照清理和 recovery。
   pl->on_active_actmap();
 
   if (ps->have_unfound()) {
     // object may have become unfound
+    // 重点调用：新地图可能改变 peer 集合，重新发现 missing 对象的候选来源。
     ps->discover_all_missing(context<PeeringMachine>().get_recovery_ctx().msgs);
   }
 
   uint64_t unfound = ps->missing_loc.num_unfound();
   if (unfound > 0 &&
       ps->all_unfound_are_queried_or_lost(ps->get_osdmap())) {
+    // 所有候选来源均已查询或判定丢失时，只记录告警；自动标记 lost 尚未实现。
     if (ps->cct->_conf->osd_auto_mark_unfound_lost) {
       pl->get_clog_error() << context< PeeringMachine >().spgid.pgid << " has " << unfound
 			    << " objects unfound and apparently lost, would automatically "
