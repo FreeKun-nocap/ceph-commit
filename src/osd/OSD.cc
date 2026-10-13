@@ -6671,16 +6671,25 @@ void OSD::tick()
   tick_timer.add_event_after(get_tick_interval(), new C_Tick(this));
 }
 
+/**
+ * 周期 tick 的免 osd_lock 部分：刷新统计、心跳/mon 上报、触发 Scrub 调度。
+ *
+ * 由 SafeTimer 到点回调 C_Tick_WithoutOSDLock::finish() 调用，
+ * 末尾自我续期形成周期循环。
+ */
 void OSD::tick_without_osd_lock()
 {
+  // 运行在定时器线程，只持有 tick_timer_lock。
   ceph_assert(ceph_mutex_is_locked(tick_timer_lock));
   dout(10) << "tick_without_osd_lock" << dendl;
 
+  // 刷新 CRC 相关统计计数。
   logger->set(l_osd_cached_crc, ceph::buffer::get_cached_crc());
   logger->set(l_osd_cached_crc_adjusted, ceph::buffer::get_cached_crc_adjusted());
   logger->set(l_osd_missed_crc, ceph::buffer::get_missed_crc());
 
   // refresh osd stats
+  // 重点调用：采集磁盘用量/告警并更新 OSD 统计。
   struct store_statfs_t stbuf;
   osd_alert_list_t alerts;
   int r = store->statfs(&stbuf, &alerts);
@@ -6691,6 +6700,7 @@ void OSD::tick_without_osd_lock()
   // might change when doing the monitor report
   if (is_active() || is_waiting_for_healthy()) {
     {
+      // 重点调用：检查心跳超时，判定故障 OSD。
       std::lock_guard l{heartbeat_lock};
       heartbeat_check();
     }
@@ -6698,6 +6708,7 @@ void OSD::tick_without_osd_lock()
     std::lock_guard l(mon_report_lock);
 
     // mon report?
+    // 周期性或满载状态变化时向 mon 上报（副本状态汇总经由此处）。
     utime_t now = ceph_clock_now();
     if (service.need_fullness_update() ||
 	now - last_mon_report > cct->_conf->osd_mon_report_interval) {
@@ -6707,6 +6718,7 @@ void OSD::tick_without_osd_lock()
     }
     map_lock.unlock_shared();
 
+    // 若有 shard 在等更新的 epoch，主动订阅新 osdmap。
     epoch_t max_waiting_epoch = 0;
     for (auto s : shards) {
       max_waiting_epoch = std::max(max_waiting_epoch,
@@ -6720,14 +6732,17 @@ void OSD::tick_without_osd_lock()
   }
 
   if (is_active()) {
+    // 重点调用：触发 Scrub 调度（本阅读路径入口），从 ScrubQueue 挑到期 PG 巡检。
     service.get_scrub_services().initiate_scrub(service.is_recovery_active());
     service.promote_throttle_recalibrate();
     resume_creating_pg();
     maybe_send_beacon();
   }
 
+  // 上报 mgr 健康指标；踢一脚 recovery 队列。
   mgrc.update_daemon_health(get_health_metrics());
   service.kick_recovery_queue();
+  // 自我续期：注册下一个 tick，形成周期循环。
   tick_timer_without_osd_lock.add_event_after(get_tick_interval(),
 					      new C_Tick_WithoutOSDLock(this));
 }

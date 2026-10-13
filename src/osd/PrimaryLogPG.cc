@@ -4923,6 +4923,12 @@ void PrimaryLogPG::do_backfill_remove(OpRequestRef op)
   ceph_assert(r == 0);
 }
 
+/**
+ * 为单个对象 clone 构造快照裁剪事务（删除 clone 或改写其归属快照集）。
+ *
+ * 只在 primary 执行：new_snaps 为空则删除 clone 并把 clone_overlap 并入更老 clone，否则仅更新归属；
+ * 最后存回 head 的 SnapSet。事务和日志由调用方经复制写路径同步到副本。
+ */
 int PrimaryLogPG::trim_object(
   bool first, const hobject_t &coid, snapid_t snap_to_trim,
   PrimaryLogPG::OpContextUPtr *ctxp)
@@ -4930,6 +4936,7 @@ int PrimaryLogPG::trim_object(
   *ctxp = NULL;
 
   // load clone info
+  // 重点调用：取 clone 的 ObjectContext（含 SnapSetContext）。
   bufferlist bl;
   ObjectContextRef obc = get_object_context(coid, false, NULL);
   if (!obc || !obc->ssc || !obc->ssc->exists) {
@@ -4938,6 +4945,7 @@ int PrimaryLogPG::trim_object(
     return -ENOENT;
   }
 
+  // 重点调用：取 head 对象上下文（SnapSet 保存在 head 上）。
   hobject_t head_oid = coid.get_head();
   ObjectContextRef head_obc = get_object_context(head_oid, false);
   if (!head_obc) {
@@ -4948,6 +4956,7 @@ int PrimaryLogPG::trim_object(
 
   SnapSet& snapset = obc->ssc->snapset;
 
+  // clone 的归属快照集记录在 head 的 SnapSet.clone_snaps 中。
   object_info_t &coi = obc->obs.oi;
   auto citer = snapset.clone_snaps.find(coid.snap);
   if (citer == snapset.clone_snaps.end()) {
@@ -4968,6 +4977,7 @@ int PrimaryLogPG::trim_object(
     return -ENOENT;
   }
 
+  // 计算剩余快照集：排除待裁剪 snap 和删除队列中的 snap。
   set<snapid_t> new_snaps;
   const OSDMapRef& osdmap = get_osdmap();
   for (set<snapid_t>::iterator i = old_snaps.begin();
@@ -4982,6 +4992,7 @@ int PrimaryLogPG::trim_object(
   vector<snapid_t>::iterator p = snapset.clones.end();
 
   if (new_snaps.empty()) {
+    // 整个 clone 将被删除：在 snapset.clones 中定位它。
     p = std::find(snapset.clones.begin(), snapset.clones.end(), coid.snap);
     if (p == snapset.clones.end()) {
       osd->clog->error() << "Snap " << coid.snap << " not in clones";
@@ -4989,9 +5000,12 @@ int PrimaryLogPG::trim_object(
     }
   }
 
+  // 重点调用：创建 OpContext，承载事务、日志和统计增量。
   OpContextUPtr ctx = simple_opc_create(obc);
   ctx->head_obc = head_obc;
 
+  // 重点调用：对 clone 和 head 分别取写锁；
+  // 拿不到返回 -ENOLCK，调用方转 WaitRWLock 等锁释放。
   if (!ctx->lock_manager.get_snaptrimmer_write(
 	coid,
 	obc,
@@ -5010,6 +5024,7 @@ int PrimaryLogPG::trim_object(
     return -ENOLCK;
   }
 
+  // 分配本次裁剪的 PGLog 版本号。
   ctx->at_version = get_next_version();
 
   PGTransaction *t = ctx->op_t.get();
@@ -5018,6 +5033,7 @@ int PrimaryLogPG::trim_object(
 
   if (new_snaps.empty()) {
     // remove clone
+    // 分支一：归属快照全部删除，整个 clone 删除。
     dout(10) << coid << " snaps " << old_snaps << " -> "
 	     << new_snaps << " ... deleting" << dendl;
 
@@ -5029,6 +5045,7 @@ int PrimaryLogPG::trim_object(
 
     if (p != snapset.clones.begin()) {
       // not the oldest... merge overlap into next older clone
+      // 不是最老 clone：把重叠区间并入更老 clone，保持覆盖信息连续。
       vector<snapid_t>::iterator n = p - 1;
       hobject_t prev_coid = coid;
       prev_coid.snap = *n;
@@ -5043,6 +5060,7 @@ int PrimaryLogPG::trim_object(
       if (adjust_prev_bytes)
 	ctx->delta_stats.num_bytes += snapset.get_clone_bytes(*n);
     }
+    // 同步统计计数（对象/clone/whiteout/manifest 等）。
     ctx->delta_stats.num_objects--;
     if (coi.is_dirty())
       ctx->delta_stats.num_objects_dirty--;
@@ -5061,11 +5079,13 @@ int PrimaryLogPG::trim_object(
     }
     obc->obs.exists = false;
 
+    // 从 SnapSet 删除该 clone 的全部记录。
     snapset.clones.erase(p);
     snapset.clone_overlap.erase(last);
     snapset.clone_size.erase(last);
     snapset.clone_snaps.erase(last);
 
+    // 写 DELETE 日志；重点调用：事务移除 clone 并更新 SnapMapper 索引。
     ctx->log.push_back(
       pg_log_entry_t(
 	pg_log_entry_t::DELETE,
@@ -5088,6 +5108,7 @@ int PrimaryLogPG::trim_object(
     ctx->at_version.version++;
   } else {
     // save adjusted snaps for this object
+    // 分支二：clone 保留，只缩小归属快照集。
     dout(10) << coid << " snaps " << old_snaps << " -> " << new_snaps << dendl;
     snapset.clone_snaps[coid.snap] =
       vector<snapid_t>(new_snaps.rbegin(), new_snaps.rend());
@@ -5113,6 +5134,7 @@ int PrimaryLogPG::trim_object(
       );
     ctx->at_version.version++;
 
+    // 重点调用：更新 SnapMapper 中该 clone 的 snap 归属。
     t->update_snaps(
       coid,
       old_snaps,
@@ -5120,6 +5142,7 @@ int PrimaryLogPG::trim_object(
   }
 
   // save head snapset
+  // 存回 head 的 SnapSet：clone 清空且 head 仅是 whiteout 时连 head 一起删。
   dout(10) << coid << " new snapset " << snapset << " on "
 	   << head_obc->obs.oi << dendl;
   if (snapset.clones.empty() &&
@@ -5163,8 +5186,10 @@ int PrimaryLogPG::trim_object(
     }
     head_obc->obs.exists = false;
     head_obc->obs.oi = object_info_t(head_oid);
+    // 重点调用：事务移除 head。
     t->remove(head_oid);
   } else {
+    // head 仍有 clone：写回更新后的 SnapSet 和 object_info。
     dout(10) << coid << " writing updated snapset on " << head_oid
 	     << ", snapset is " << snapset << dendl;
     ctx->log.push_back(
@@ -5184,6 +5209,7 @@ int PrimaryLogPG::trim_object(
 
     map <string, bufferlist, less<>> attrs;
     bl.clear();
+    // 重点调用：SS_ATTR 存 SnapSet、OI_ATTR 存 object_info。
     encode(snapset, bl);
     attrs[SS_ATTR] = std::move(bl);
 
@@ -5195,12 +5221,14 @@ int PrimaryLogPG::trim_object(
   }
 
   // Stats reporting - Set number of objects trimmed
+  // 统计本次实际删除的 clone 数。
   if (num_objects_before_trim > ctx->delta_stats.num_objects) {
     int64_t num_objects_trimmed =
       num_objects_before_trim - ctx->delta_stats.num_objects;
     add_objects_trimmed_count(num_objects_trimmed);
   }
 
+  // 交还调用方（DoSnapWork）提交，经复制写路径同步到副本。
   *ctxp = std::move(ctx);
   return 0;
 }
@@ -12050,23 +12078,41 @@ void PrimaryLogPG::remove_repop(RepGather *repop)
   osd->logger->dec(l_osd_op_wip);
 }
 
+/**
+ * 为内部操作（如 SnapTrim）创建 OpContext 及空的 PGTransaction。
+ *
+ * 无客户端请求，用集群 msgr 名和新 tid 构造 reqid 保证幂等去重。
+ */
 PrimaryLogPG::OpContextUPtr PrimaryLogPG::simple_opc_create(ObjectContextRef obc)
 {
   dout(20) << __func__ << " " << obc->obs.oi.soid << dendl;
+  // 重点调用：分配复制事务 tid，作为 reqid 的唯一标识。
   ceph_tid_t rep_tid = osd->get_tid();
   osd_reqid_t reqid(osd->get_cluster_msgr_name(), 0, rep_tid);
+  // 构造 OpContext（无 OpRequest），承载后续事务、日志和统计增量。
   OpContextUPtr ctx(new OpContext(OpRequestRef(), reqid, nullptr, obc, this));
+  // 创建空 PGTransaction，由调用方填操作，提交时翻译成 ObjectStore 事务。
   ctx->op_t.reset(new PGTransaction());
   ctx->mtime = ceph_clock_now();
   return ctx;
 }
 
+/**
+ * 提交 simple_opc_create/内部操作构造好的事务（如 SnapTrim 裁剪）。
+ *
+ * 走与客户端写相同的复制写路径：发副本、本地提交、等聚合回调。
+ */
 void PrimaryLogPG::simple_opc_submit(OpContextUPtr ctx)
 {
+  // 重点调用：创建 RepGather，登记本次复制写。
   RepGather *repop = new_repop(ctx.get(), ctx->reqid.tid);
   dout(20) << __func__ << " " << repop << dendl;
+  // 重点调用：发 MOSDRepOp 给副本并提交本地事务（复制写路径）。
   issue_repop(repop, ctx.get());
+  // 首次调用时 all_committed == false，基本直接返回；
+  // 真正收尾在所有副本落盘后的 repop_all_committed()。
   eval_repop(repop);
+  // 重点调用：推进日志裁剪水位（calc_min_last_complete_ondisk/calc_trim_to）。
   recovery_state.update_trim_to();
   repop->put();
 }

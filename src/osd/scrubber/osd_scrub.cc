@@ -95,8 +95,14 @@ void OsdScrub::debug_log_all_jobs() const
 }
 
 
+/**
+ * 每次 tick 的 Scrub 调度入口：检查 OSD 级环境限制，挑一个到期 PG 启动巡检。
+ *
+ * 由 OSD::tick_without_osd_lock() 调用；一次 tick 最多发起一个 scrub。
+ */
 void OsdScrub::initiate_scrub(bool is_recovery_active)
 {
+  // 有 PG 因对象锁被阻塞时提示资源可能不足（不阻断本次调度）。
   if (auto blocked_pgs = get_blocked_pgs_count(); blocked_pgs > 0) {
     // some PGs managed by this OSD were blocked by a locked object during
     // scrub. This means we might not have the resources needed to scrub now.
@@ -112,6 +118,7 @@ void OsdScrub::initiate_scrub(bool is_recovery_active)
   // check the OSD-wide environment conditions (scrub resources, time, etc.).
   // These may restrict the type of scrubs we are allowed to start, or just
   // prevent us from starting any non-operator-initiated scrub at all.
+  // 重点调用：汇总 OSD 级限制（recovery 活跃/并发上限/时间窗/随机退避）。
   const auto env_restrictions =
       restrictions_on_scrubbing(is_recovery_active, scrub_time);
 
@@ -127,6 +134,7 @@ void OsdScrub::initiate_scrub(bool is_recovery_active)
     debug_log_all_jobs();
   }
 
+  // 重点调用：从 ScrubQueue 弹出第一个满足条件的到期 PG（ScrubJob）。
   auto candidate = m_queue.pop_ready_entry(
       is_sched_target_eligible, env_restrictions, scrub_time);
   if (!candidate) {
@@ -134,11 +142,13 @@ void OsdScrub::initiate_scrub(bool is_recovery_active)
     return;
   }
 
+  // 重点调用：对该 PG 发起 scrub（内部入队 PGScrub 工作项）。
   switch (initiate_a_scrub(*candidate, env_restrictions)) {
     case schedule_result_t::target_specific_failure:
     case schedule_result_t::osd_wide_failure:
       // No scrub this tick.
       // someone else will requeue the target, if needed.
+      // 本次 tick 不发起；目标由后续 tick 重新排队。
       break;
 
     case schedule_result_t::scrub_initiated:
