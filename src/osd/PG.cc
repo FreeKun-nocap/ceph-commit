@@ -1319,6 +1319,11 @@ unsigned int PG::scrub_requeue_priority(Scrub::scrub_prio_t with_priority, unsig
 // SCRUB
 
 
+/**
+ * PG 级 scrub 启动复核：汇总本 PG/Pool 的巡检许可条件后转交 scrubber。
+ *
+ * OSD 级限制由调用方传入，这里补充 NOSCRUB/自动 repair 等 PG 级开关。
+ */
 Scrub::schedule_result_t PG::start_scrubbing(
     const Scrub::SchedEntry& candidate,
     Scrub::OSDRestrictions osd_restrictions)
@@ -1331,6 +1336,7 @@ Scrub::schedule_result_t PG::start_scrubbing(
   ceph_assert(ceph_mutex_is_locked(_lock));
   ceph_assert(m_scrubber);
 
+  // 汇总 PG 级前置条件：osdmap/pool 的 NOSCRUB 标志和自动 repair 开关。
   Scrub::ScrubPGPreconds pg_cond{};
   pg_cond.allow_shallow =
       !(get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
@@ -1342,6 +1348,8 @@ Scrub::schedule_result_t PG::start_scrubbing(
       (cct->_conf->osd_scrub_auto_repair &&
        get_pgbackend()->auto_repair_supported());
 
+  // 重点调用：交给 PgScrubber 复核并启动
+  //（内部经 PgScrubber::start_scrub_session() 入队 PGScrub 工作项）。
   return m_scrubber->start_scrub_session(
       candidate.level, osd_restrictions, pg_cond);
 }

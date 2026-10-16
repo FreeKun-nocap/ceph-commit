@@ -227,6 +227,11 @@ Scrub::OSDRestrictions OsdScrub::restrictions_on_scrubbing(
 }
 
 
+/**
+ * 对选中的排期条目发起一次 scrub：加锁定位 PG 后转交 PG 层启动。
+ *
+ * 条目已从队列弹出；能否真正开始由 PG::start_scrubbing() 复核决定。
+ */
 Scrub::schedule_result_t OsdScrub::initiate_a_scrub(
     const Scrub::SchedEntry& candidate,
     Scrub::OSDRestrictions restrictions)
@@ -238,6 +243,7 @@ Scrub::schedule_result_t OsdScrub::initiate_a_scrub(
   // we have a candidate to scrub. We need some PG information to
   // know if scrubbing is allowed
 
+  // 重点调用：给目标 PG 加锁（RAII 包装，失败说明 PG 已被移出队列）。
   auto locked_pg = m_osd_svc.get_locked_pg(candidate.pgid);
   if (!locked_pg) {
     // the PG was dequeued in the short timespan between querying the
@@ -250,6 +256,8 @@ Scrub::schedule_result_t OsdScrub::initiate_a_scrub(
   // was already dequeued. The "original" scrub job cannot be accessed from
   // here directly. Thus - we leave it to start_scrubbing() (via a call
   // to PgScrubber::start_scrub_session()) to mark it as dequeued.
+  // 重点调用：转交 PG 层复核条件并启动 scrub
+  //（内部经 PgScrubber::start_scrub_session() 入队 PGScrub 工作项）。
   return locked_pg->pg()->start_scrubbing(candidate, restrictions);
 }
 

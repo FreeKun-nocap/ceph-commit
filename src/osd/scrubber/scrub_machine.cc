@@ -184,6 +184,11 @@ void PrimaryIdle::clear_state(const FullReset&) {
 
 // ----------------------- Session -----------------------------------------
 
+/**
+ * Session 外层状态构造：记录一次巡检会话的起点并初始化性能计数。
+ *
+ * 作为 ReservingReplicas 等子状态的父状态，进入时先于子状态构造。
+ */
 Session::Session(my_context ctx)
     : my_base(ctx)
     , NamedSimply(context<ScrubMachine>().m_scrbr, "PrimaryActive/Session")
@@ -191,8 +196,10 @@ Session::Session(my_context ctx)
   dout(10) << "-- state -->> PrimaryActive/Session" << dendl;
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
 
+  // 记录会话开始时间。
   machine.m_session_started_at = ScrubClock::now();
 
+  // 初始化会话/OSD 级性能计数。
   m_perf_set = scrbr->get_labeled_counters();
   m_osd_counters = scrbr->get_osd_perf_counters();
   m_counters_idx = &scrbr->get_unlabeled_counters();
@@ -251,6 +258,12 @@ std::optional<pg_scrubbing_status_t> Session::get_reservation_status() const
 
 // ----------------------- ReservingReplicas ---------------------------------
 
+/**
+ * ReservingReplicas 状态构造：向 actingset 内各副本发起 scrub 资源预留申请。
+ *
+ * 重点调用 m_reservations.emplace() 向副本发 MOSDScrubReserve；
+ * 无副本（size==1）时直接投递 RemotesReserved 继续。
+ */
 ReservingReplicas::ReservingReplicas(my_context ctx)
     : my_base(ctx)
     , NamedSimply(context<ScrubMachine>().m_scrbr, "Session/ReservingReplicas")
@@ -260,12 +273,14 @@ ReservingReplicas::ReservingReplicas(my_context ctx)
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
 
   // initiate the reservation process
+  // 重点调用：创建预留请求管理器，逐个向副本发送预留申请。
   session.m_reservations.emplace(
       *scrbr, context<PrimaryActive>().last_request_sent_nonce,
       *session.m_counters_idx);
 
   if (!session.m_reservations->get_last_sent()) {
     // no replicas to reserve
+    // 无副本可预留：不能在构造中直接转移，投递事件稍后进入 ActiveScrubbing。
     dout(10) << "no replicas to reserve" << dendl;
     // can't transit directly from here
     post_event(RemotesReserved{});
@@ -781,11 +796,17 @@ void ReplicaActive::exit()
  * would possibly treat 'reservation' & 'scrubbing' as (almost)
  * totally orthogonal.
  */
+/**
+ * 副本侧处理 primary 发来的 scrub 预留申请（MOSDScrubReserve REQUEST）。
+ *
+ * 若已有旧预留（异常情况）先清除，再向本地资源池申请额度。
+ */
 sc::result ReplicaActive::react(const ReplicaReserveReq& ev)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   dout(10) << "ReplicaActive::react(const ReplicaReserveReq&)" << dendl;
 
+  // 已有预留（granted 或 pending）属异常：先清掉，避免旧预留泄漏。
   if (m_reservation_status != reservation_status_t::unreserved) {
     // we are not expected to be in this state when a new request arrives.
     // Clear the existing reservation - be it granted or pending.
@@ -796,9 +817,11 @@ sc::result ReplicaActive::react(const ReplicaReserveReq& ev)
 		   "reservation (was granted?:{}). Incoming request: {}",
 		   reservation_granted, m)
 	    << dendl;
+    // 重点调用：撤销已有预留（含向本地资源池退订）。
     clear_remote_reservation(true);
   }
 
+  // 重点调用：向本地 AsyncReserver 申请 scrub 额度，成功后投递 ReserverGranted。
   handle_reservation_request(ev);
   return discard_event();
 }
@@ -814,12 +837,19 @@ sc::result ReplicaActive::react(const ReplicaReserveReq& ev)
  *   - send grant/reject to the requesting primary;
  *   - update 'reservation_granted'
  */
+/**
+ * 处理预留申请：向本地 scrub 资源池（AsyncReserver）申请额度。
+ *
+ * 异步模式挂回调排队（拿到额度后投递 ReserverGranted 再回复 GRANT）；
+ * 立即模式当场成败，直接回复 GRANT/REJECT。
+ */
 void ReplicaActive::handle_reservation_request(const ReplicaReserveReq& ev)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   const auto& m = *(ev.m_op->get_req<MOSDScrubReserve>());
 
   // should we handle the request asynchronously, using the reserver?
+  // 是否异步：消息要求排队等待且配置未禁用。
   const auto async_disabled = scrbr->get_pg_cct()->_conf.get_val<bool>(
       "osd_scrub_disable_reservation_queuing");
   const bool async_request = !async_disabled && m.wait_for_resources;
@@ -829,10 +859,12 @@ void ReplicaActive::handle_reservation_request(const ReplicaReserveReq& ev)
 		  async_request)
 	   << dendl;
 
+  // 重点调用：取 OSD 级 scrub 资源池。
   auto& reserver = m_osds->get_scrub_reserver();
 
   if (async_request) {
     // the request is to be handled asynchronously
+    // 异步分支：注册回调后挂入资源池排队，暂不回复。
     AsyncScrubResData request_details{
 	pg_id, ev.m_from, ev.m_op->sent_epoch, m.reservation_nonce};
     dout(15) << fmt::format(
@@ -841,13 +873,16 @@ void ReplicaActive::handle_reservation_request(const ReplicaReserveReq& ev)
 	     << dendl;
 
     pending_reservation_nonce = m.reservation_nonce;
+    // 重点调用：RtReservationCB 到点（拿到额度）投递 ReserverGranted 事件。
     const auto reservation_cb = new RtReservationCB(m_pg, request_details);
     reserver.request_reservation(pg_id, reservation_cb, /*prio=*/0, nullptr);
     m_reservation_status = reservation_status_t::requested_or_granted;
 
   } else {
     // an immediate yes/no is required
+    // 立即分支：当场申请，成败立刻回复。
     Message* reply{nullptr};
+    // 重点调用：拿不到额度立即失败（不排队）。
     reservation_granted = reserver.request_reservation_or_fail(pg_id);
     if (reservation_granted) {
       dout(10) << fmt::format("{}: reserved? yes", __func__) << dendl;
@@ -863,6 +898,7 @@ void ReplicaActive::handle_reservation_request(const ReplicaReserveReq& ev)
 	  MOSDScrubReserve::REJECT, m_pg->pg_whoami, m.reservation_nonce);
     }
 
+    // 回复 primary（GRANT 或 REJECT）。
     m_osds->send_message_osd_cluster(
 	reply, ev.m_op->get_req()->get_connection());
   }

@@ -2318,6 +2318,12 @@ void PgScrubber::requeue_penalized(
 }
 
 
+/**
+ * 启动一次 scrub 会话的最终复核：逐项检查 PG 状态/标志/资源，
+ * 全部通过后提交巡检参数并把 PGScrub 工作项排入 OSD 队列。
+ *
+ * 复核失败大多经 requeue_penalized() 把目标重新排期（带惩罚延迟）。
+ */
 Scrub::schedule_result_t PgScrubber::start_scrub_session(
     scrub_level_t s_or_d,
     Scrub::OSDRestrictions osd_restrictions,
@@ -2331,8 +2337,10 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
 	   << dendl;
   // mark our target as not-in-queue. If any error is encountered - that
   // target must be requeued!
+  // 先摘除排期标记；后续任何失败都要负责重新排期。
   trgt.queued = false;
 
+  // 已有巡检在排期/进行中，本次放弃（无需重排）。
   if (is_queued_or_active()) {
     dout(10) << __func__ << ": scrub already in progress" << dendl;
     // no need to requeue
@@ -2343,6 +2351,7 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
   // is requeued.
   auto clock_now = ceph_clock_now();
 
+  // 非 active primary 不该出现在队列里，直接放弃不重排。
   if (!is_primary() || !m_pg->is_active()) {
     // the PG is not expected to be 'registered' in this state. And we should
     // not attempt to queue it.
@@ -2353,16 +2362,19 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
 
   // for all other failures - we must reinstate our entry in the Scrub Queue.
   // For some of the failures, we will also delay the 'other' target.
+  // PG 不 clean（recovery/backfill 未完）：重排并惩罚延迟。
   if (!m_pg->is_clean()) {
     dout(10) << fmt::format(
 		    "{}: cannot scrub (not clean). Registered?{:c}", __func__,
 		    m_scrub_job->is_registered() ? 'Y' : 'n')
 	     << dendl;
+    // 重点调用：重新排期并施加延迟惩罚（delay_both_targets 连带另一级别）。
     requeue_penalized(
 	s_or_d, delay_both_targets_t::yes, delay_cause_t::pg_state, clock_now);
     return schedule_result_t::target_specific_failure;
   }
 
+  // 与 SnapTrim 互斥的另一侧：snap-trim 进行中不巡检（对照第 18 条 WaitScrub）。
   if (state_test(PG_STATE_SNAPTRIM) || state_test(PG_STATE_SNAPTRIM_WAIT)) {
     // note that the trimmer checks scrub status when setting 'snaptrim_wait'
     // (on the transition from NotTrimming to Trimming/WaitReservation),
@@ -2376,6 +2388,7 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
 
   // is there a 'no-scrub' flag set for the initiated scrub level? note:
   // won't affect operator-initiated (and some other types of) scrubs.
+  // NOSCRUB/NODEEP_SCRUB 标志复核（管理员触发的巡检不受影响）。
   if (ScrubJob::observes_noscrub_flags(trgt.urgency())) {
     if (trgt.is_shallow()) {
       if (!pg_cond.allow_shallow) {
@@ -2396,6 +2409,7 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
 
   // try to reserve the local OSD resources. If failing: no harm. We will
   // be retried by the OSD later on.
+  // 重点调用：预留本地 OSD scrub 并发资源，失败由后续 tick 重试。
   if (!reserve_local(trgt)) {
     dout(10) << __func__ << ": failed to reserve locally" << dendl;
     requeue_penalized(
@@ -2410,9 +2424,11 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
   // An interrupted recovery repair could leave this set.
   state_clear(PG_STATE_REPAIR);
 
+  // 提交本次巡检参数：记录活动目标、配置 op 参数。
   m_active_target = trgt;
   set_op_parameters(pg_cond);
   // dequeue the PG's "other" target
+  // 把该 PG 另一级别的排期一并移出 OSD 队列，避免重复启动。
   m_osds->get_scrub_services().remove_from_osd_queue(m_pg_id);
   m_scrub_job->clear_both_targets_queued();
 
@@ -2421,6 +2437,7 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
   trgt.reset();
 
   // using the OSD queue, as to not execute the scrub code as part of the tick.
+  // 重点调用：把 PGScrub 工作项排入 OSD 队列异步执行（不在 tick 上下文直接跑）。
   dout(10) << __func__ << ": queueing" << dendl;
   m_osds->queue_for_scrub(m_pg, Scrub::scrub_prio_t::low_priority);
   return schedule_result_t::scrub_initiated;

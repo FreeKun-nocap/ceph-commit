@@ -29,6 +29,11 @@ static std::ostream& _prefix_fn(std::ostream* _dout, T* t, std::string fn = "")
 
 namespace Scrub {
 
+/**
+ * 副本预留管理器构造：收集 actingset 内的副本并向第一个副本发送 MOSDScrubReserve(REQUEST)。
+ *
+ * 预留是串行的：收到当前副本 grant 才发下一个；高优先级（管理员触发）巡检跳过预留。
+ */
 ReplicaReservations::ReplicaReservations(
     ScrubMachineListener& scrbr,
     reservation_nonce_t& nonce,
@@ -45,6 +50,7 @@ ReplicaReservations::ReplicaReservations(
   // order. This is done to reduce the chance of having two PGs that share some
   // of their acting-set OSDs, consistently interfering with each other's
   // reservation process.
+  // 收集副本列表（按 pg_shard_t 排序、排除自己），固定申请顺序避免互相干扰。
   auto acting = m_pg->get_actingset();
   m_sorted_secondaries.reserve(acting.size());
   std::copy_if(
@@ -58,11 +64,13 @@ ReplicaReservations::ReplicaReservations(
   m_next_to_request = m_sorted_secondaries.cbegin();
   if (m_scrubber.is_reservation_required()) {
     // send out the 1'st request (unless we have no replicas)
+    // 重点调用：向第一个副本发送预留申请；无副本时直接回调完成。
     m_process_started_at = ScrubClock::now();
     send_next_reservation_or_complete();
   } else {
     // for high-priority scrubs (i.e. - user-initiated), no reservations are
     // needed. Note: not perf-counted as either success or failure.
+    // 高优先级（管理员触发）：不需要副本预留。
     dout(10) << "high-priority scrub - no reservations needed" << dendl;
     m_osds->logger->inc(m_perf_indices.rsv_skipped_cnt);
   }
@@ -182,16 +190,23 @@ bool ReplicaReservations::handle_reserve_grant(
   return send_next_reservation_or_complete();
 }
 
+/**
+ * 向下一个副本发送 MOSDScrubReserve(REQUEST)，或确认全部副本已预留完成。
+ *
+ * 返回 true 表示所有副本都已 grant（含无副本）；false 表示还有待回复的申请。
+ */
 bool ReplicaReservations::send_next_reservation_or_complete()
 {
   if (m_next_to_request == m_sorted_secondaries.cend()) {
     // granted by all replicas
+    // 全部副本已同意：记录成功耗时，返回 true 触发后续 RemotesReserved。
     dout(10) << "remote reservation complete" << dendl;
     log_success_and_duration();
     return true;  // done
   }
 
   // send the next reservation request
+  // 重点调用：构造并发送预留申请（nonce 防止旧回复串扰）。
   const auto peer = *m_next_to_request;
   const auto epoch = m_pg->get_osdmap_epoch();
   m_last_request_sent_nonce++;
@@ -199,6 +214,7 @@ bool ReplicaReservations::send_next_reservation_or_complete()
   auto m = make_message<MOSDScrubReserve>(
       spg_t{m_pgid, peer.shard}, epoch, MOSDScrubReserve::REQUEST, m_pg->pg_whoami,
       m_last_request_sent_nonce);
+  // 发给副本 OSD（集群消息通道）。
   m_pg->send_cluster_message(peer.osd, m, epoch, false);
   m_last_request_sent_at = ScrubClock::now();
   dout(10) << fmt::format(
@@ -206,6 +222,7 @@ bool ReplicaReservations::send_next_reservation_or_complete()
 		  *m_next_to_request, active_requests_cnt() + 1,
 		  m_sorted_secondaries.size(), epoch, m_last_request_sent_nonce)
 	   << dendl;
+  // 游标后移：下一个 grant 到来时再申请再下一个。
   m_next_to_request++;
   return false;
 }
