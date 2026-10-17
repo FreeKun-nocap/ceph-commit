@@ -74,6 +74,12 @@ class AsyncReserver {
     preempt_by_prio.erase(preempt_by_prio.begin());
   }
 
+  /**
+   * 重新分配额度：先回收被抢占/超限的在授予项，再按优先级把空位授予等待队列。
+   *
+   * 每次 request_reservation/cancel_reservation/调整优先级或额度后都会调用。
+   * 授予时经 Finisher（f->queue）异步执行 grant 回调。
+   */
   void do_queues() {
     rdout(20) << __func__ << ":\n";
     ceph::JSONFormatter jf(true);
@@ -84,29 +90,36 @@ class AsyncReserver {
     *_dout << dendl;
 
     // in case min_priority was adjusted up or max_allowed was adjusted down
+    // 额度/优先级门槛变化后：抢占回收超额或低于门槛的在授予项。
     while (!preempt_by_prio.empty() &&
 	   (in_progress.size() > max_allowed ||
 	    preempt_by_prio.begin()->first < min_priority)) {
+      // 重点调用：撤销一个在授予项（触发其 on_preempt 回调）。
       preempt_one();
     }
 
     while (!queues.empty()) {
       // choose highest priority queue
+      // 选优先级最高的等待队列。
       auto it = queues.end();
       --it;
       ceph_assert(!it->second.empty());
+      // 低于优先级门槛的不授予。
       if (it->first < min_priority) {
 	break;
       }
+      // 有更高优先级在等待且已满：抢占低优先级的在授予项腾位置。
       if (in_progress.size() >= max_allowed &&
 	  !preempt_by_prio.empty() &&
 	  it->first > preempt_by_prio.begin()->first) {
 	preempt_one();
       }
+      // 仍无空位：本轮结束，剩余的继续排队。
       if (in_progress.size() >= max_allowed) {
 	break; // no room
       }
       // grant
+      // 授予：出队登记为在授予项。
       Reservation p = it->second.front();
       rdout(10) << __func__ << " grant " << p << dendl;
       queue_pointers.erase(p.item);
@@ -114,11 +127,14 @@ class AsyncReserver {
       if (it->second.empty()) {
 	queues.erase(it);
       }
+      // 重点调用：把授予回调丢给 Finisher 异步执行
+      //（即 RtReservationCB::finish() → process_event(ReserverGranted)）。
       if (p.grant) {
 	f->queue(p.grant);
 	p.grant = nullptr;
       }
       in_progress[p.item] = p;
+      // 记录可被抢占的项（仅带 on_preempt 回调的）。
       if (p.preempt) {
 	preempt_by_prio.insert(std::make_pair(p.prio, p.item));
       }
@@ -253,6 +269,12 @@ public:
    * with no locks held.  cancel_reservation must be called to release the
    * reservation slot.
    */
+  /**
+   * 向资源池登记一次额度申请：加入优先级队列后尝试立即授予。
+   *
+   * 额度不足时挂队等待；有空位时 do_queues() 授予，
+   * 授予动作经 Finisher 异步执行 on_reserved 回调。
+   */
   void request_reservation(
     T item,                   ///< [in] reservation key
     Context *on_reserved,     ///< [in] callback to be called on reservation
@@ -260,13 +282,17 @@ public:
     Context *on_preempt = 0   ///< [in] callback to be called if we are preempted (optional)
     ) {
     std::lock_guard l(lock);
+    // 构造登记项：item 为键，on_reserved 为授予时的回调。
     Reservation r(item, prio, on_reserved, on_preempt);
     rdout(10) << __func__ << " queue " << r << dendl;
+    // 同一 item 不允许重复申请（排队中和已授予都算）。
     ceph_assert(!queue_pointers.count(item) &&
 	   !in_progress.count(item));
+    // 按优先级入队并登记索引（指向队列迭代器，便于撤销/调整优先级）。
     queues[prio].push_back(r);
     queue_pointers.insert(std::make_pair(item,
 				    std::make_pair(prio,--(queues[prio]).end())));
+    // 重点调用：尝试立即授予——有空位则出队并经 Finisher 触发回调。
     do_queues();
   }
 

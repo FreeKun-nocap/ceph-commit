@@ -905,6 +905,11 @@ void ReplicaActive::handle_reservation_request(const ReplicaReserveReq& ev)
 }
 
 
+/**
+ * 异步预留拿到额度后的回调事件：向 primary 回复 MOSDScrubReserve(GRANT)。
+ *
+ * 由 RtReservationCB 在资源池授予额度时投递。
+ */
 sc::result ReplicaActive::react(const ReserverGranted& ev)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
@@ -923,6 +928,7 @@ sc::result ReplicaActive::react(const ReserverGranted& ev)
    * As canceled reservations may still be triggered, this is not
    * necessarily a bug.
    */
+  // nonce 不匹配说明是已取消预留的迟到回调，丢弃（不算错误）。
   if (reservation.nonce != pending_reservation_nonce) {
     dout(5) << fmt::format(
 		   "ReplicaActive::react(const ReserverGranted&):  "
@@ -932,10 +938,12 @@ sc::result ReplicaActive::react(const ReserverGranted& ev)
     return discard_event();
   }
 
+  // 标记已获得预留，清 pending nonce。
   reservation_granted = true;
   pending_reservation_nonce = 0;  // no longer pending
 
   // notify the primary
+  // 重点调用：回复 GRANT，primary 收到后串行申请下一个副本。
   auto grant_msg = make_message<MOSDScrubReserve>(
       spg_t(pg_id.pgid, m_pg->get_primary().shard), reservation.request_epoch,
       MOSDScrubReserve::GRANT, m_pg->pg_whoami, pending_reservation_nonce);
