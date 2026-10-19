@@ -287,6 +287,11 @@ ReservingReplicas::ReservingReplicas(my_context ctx)
   }
 }
 
+/**
+ * primary 侧收到副本 GRANT 回复：记录同意并串行推进预留。
+ *
+ * 全部副本收齐后转入 ActiveScrubbing 开始正式巡检。
+ */
 sc::result ReservingReplicas::react(const ReplicaGrant& ev)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
@@ -295,10 +300,14 @@ sc::result ReservingReplicas::react(const ReplicaGrant& ev)
 
   auto& session = context<Session>();
   ceph_assert(session.m_reservations);
+  // 重点调用：校验回复有效性并推进下一个副本；
+  // 返回 true 表示全部副本已同意。
   if (session.m_reservations->handle_reserve_grant(*m, ev.m_from)) {
     // we are done with the reservation process
+    // 重点状态转移：进入正式巡检工作状态。
     return transit<ActiveScrubbing>();
   }
+  // 尚有副本未回复：继续在本状态等待下一个 ReplicaGrant/ReplicaReject。
   return discard_event();
 }
 
@@ -333,6 +342,11 @@ sc::result ReservingReplicas::react(const ReplicaReject& ev)
 
 // ----------------------- ActiveScrubbing -----------------------------------
 
+/**
+ * ActiveScrubbing 外层状态构造：正式巡检开始，初始化 scrubber 工作会话。
+ *
+ * 子状态从 PendingTimer 起步（分块循环前的节流等待）。
+ */
 ActiveScrubbing::ActiveScrubbing(my_context ctx)
     : my_base(ctx)
     , NamedSimply(context<ScrubMachine>().m_scrbr, "Session/ActiveScrubbing")
@@ -341,10 +355,12 @@ ActiveScrubbing::ActiveScrubbing(my_context ctx)
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   auto& session = context<Session>();
 
+  // 巡检启动计数与集群日志。
   session.m_osd_counters->inc(session.m_counters_idx->active_started_cnt);
   scrbr->get_clog()->debug()
       << fmt::format("{} {} starts", pg_id.pgid, scrbr->get_op_mode_text());
 
+  // 重点调用：初始化 PgScrubber 的本轮工作状态。
   scrbr->on_init();
 }
 
@@ -434,6 +450,11 @@ sc::result RangeBlocked::react(const RangeBlockedAlarm&)
 /**
  *  Sleeping till timer reactivation - or just requeuing
  */
+/**
+ * PendingTimer 状态构造：分块循环前的节流等待（类似 SnapTrim 的 WaitTrimTimer）。
+ *
+ * 按 osd_scrub_sleep 配置延时投递 SleepComplete；未配置则立即调度下一块。
+ */
 PendingTimer::PendingTimer(my_context ctx)
     : my_base(ctx)
     , NamedSimply(context<ScrubMachine>().m_scrbr, "Session/Act/PendingTimer")
@@ -441,6 +462,7 @@ PendingTimer::PendingTimer(my_context ctx)
   dout(10) << "-- state -->> Session/Act/PendingTimer" << dendl;
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
 
+  // 读取分块间歇配置。
   auto sleep_time = scrbr->get_scrub_sleep_time();
   if (sleep_time.count()) {
     // the following log line is used by osd-scrub-test.sh
@@ -448,9 +470,11 @@ PendingTimer::PendingTimer(my_context ctx)
 
     dout(20) << "PgScrubber: " << scrbr->get_spgid()
 	     << " sleeping for " << sleep_time << dendl;
+    // 重点调用：注册定时事件，到点投递 SleepComplete。
     m_sleep_timer = machine.schedule_timer_event_after<SleepComplete>(
       sleep_time);
   } else {
+    // 不延时：立即调度事件，直接进入 NewChunk。
     scrbr->queue_for_scrub_resched(Scrub::scrub_prio_t::high_priority);
   }
 }

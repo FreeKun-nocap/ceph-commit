@@ -355,10 +355,17 @@ void PgScrubber::send_scrub_is_finished(epoch_t epoch_queued)
   dout(10) << "scrubber event --<< " << __func__ << dendl;
 }
 
+/**
+ * 资源池授予额度的回调入口（Finisher 线程经 RtReservationCB::finish 调用）。
+ *
+ * 复核 epoch 未变化后，向 scrub 状态机投递 ReserverGranted 事件。
+ */
 void PgScrubber::send_granted_by_reserver(const AsyncScrubResData& req)
 {
   dout(10) << "scrubber event -->> granted_by_reserver" << dendl;
+  // 重点调用：校验 PG interval 未变（防止旧预留在重启 interval 后串扰）。
   if (check_interval(req.request_epoch)) {
+    // 重点调用：投递 ReserverGranted，由 ReplicaActive::react 处理。
     m_fsm->process_event(Scrub::ReserverGranted{req});
   }
   dout(10) << "scrubber event --<< granted_by_reserver" << dendl;

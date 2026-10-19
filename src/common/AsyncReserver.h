@@ -90,6 +90,8 @@ class AsyncReserver {
     *_dout << dendl;
 
     // in case min_priority was adjusted up or max_allowed was adjusted down
+    // in_progress      全部已授予项
+    // preempt_by_prio  其中"允许被抢"的子集（带 on_preempt 回调），按优先级排队等待当受害者
     // 额度/优先级门槛变化后：抢占回收超额或低于门槛的在授予项。
     while (!preempt_by_prio.empty() &&
 	   (in_progress.size() > max_allowed ||

@@ -145,10 +145,16 @@ bool ReplicaReservations::is_msg_source_correct(pg_shard_t from) const
   return exp_source && from == *exp_source;
 }
 
+/**
+ * 处理一个副本的 GRANT 回复：校验 nonce/来源后推进串行预留。
+ *
+ * 返回 true 表示全部副本已收齐（见 send_next_reservation_or_complete）。
+ */
 bool ReplicaReservations::handle_reserve_grant(
     const MOSDScrubReserve& msg,
     pg_shard_t from)
 {
+  // nonce 不匹配：是旧请求（如超时后）的迟到回复，忽略。
   if (!is_reservation_response_relevant(msg.reservation_nonce)) {
     // this is a stale response to a previous request (e.g. one that
     // timed-out). See m_last_request_sent_nonce for details.
@@ -166,6 +172,7 @@ bool ReplicaReservations::handle_reserve_grant(
   // grant message with a correct nonce can arrive from the wrong peer.
   // (we would not abort for arriving messages with nonce 0, as those
   // are legacy messages, for which the nonce was not verified).
+  // 来源校验：nonce 正确却来自非预期副本视为 bug，直接 abort。
   if (!is_msg_source_correct(from)) {
     const auto error_text = fmt::format(
 	"unexpected reservation grant from {} vs. the expected {} (e:{} "
@@ -187,6 +194,7 @@ bool ReplicaReservations::handle_reserve_grant(
 		  active_requests_cnt(), m_sorted_secondaries.size(),
 		  duration_cast<milliseconds>(elapsed).count())
 	   << dendl;
+  // 重点调用：推进下一个副本的申请；全部完成则返回 true。
   return send_next_reservation_or_complete();
 }
 
