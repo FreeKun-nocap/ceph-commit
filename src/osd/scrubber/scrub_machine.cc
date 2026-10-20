@@ -479,6 +479,9 @@ PendingTimer::PendingTimer(my_context ctx)
   }
 }
 
+/**
+ * 节流定时到点：重新调度 scrub 工作项，经 InternalSchedScrub 转入 NewChunk。
+ */
 sc::result PendingTimer::react(const SleepComplete&)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
@@ -488,6 +491,7 @@ sc::result PendingTimer::react(const SleepComplete&)
   dout(20) << "PgScrubber: " << scrbr->get_spgid()
 	   << " slept for " << slept_for << dendl;
 
+  // 重点调用：排入 scrub 重调度工作项，唤醒后投递 InternalSchedScrub 转 NewChunk。
   scrbr->queue_for_scrub_resched(Scrub::scrub_prio_t::low_priority);
   return discard_event();
 }

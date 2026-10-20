@@ -974,8 +974,14 @@ int PgScrubber::get_whoami() const
  * - std::nullopt if the range is blocked
  * - otherwise, the number of objects in the selected range
  */
+/**
+ * 选择下一个巡检块：划定 [m_start, m_end) 对象区间并检查是否被锁占用。
+ *
+ * 返回对象数表示选块成功；返回 nullopt 表示区间忙，稍后重试。
+ */
 std::optional<uint64_t> PgScrubber::select_range()
 {
+  // 重点调用：重置 backend 的块构建器（准备构建新 scrub map）。
   m_be->new_chunk();
 
   /* get the start and end of our scrub chunk
@@ -994,6 +1000,8 @@ std::optional<uint64_t> PgScrubber::select_range()
    * left end of the range if we are a tier because they may legitimately
    * not exist (see _scrub).
    */
+  // 块边界不能落在 head 上：head 必须和它紧邻的 clone 同块，否则会漏掉
+  // 两块之间新产生的 clone。
 
   const auto& conf = m_pg->get_cct()->_conf;
   dout(20) << fmt::format(
@@ -1005,11 +1013,13 @@ std::optional<uint64_t> PgScrubber::select_range()
 		  *osd_shallow_scrub_chunk_max)
 	   << dendl;
 
+  // 块大小取配置（深扫/浅扫各一套）。
   const int min_from_conf = static_cast<int>(size_from_conf(
       m_is_deep, conf, osd_scrub_chunk_min, osd_shallow_scrub_chunk_min));
   const int max_from_conf = static_cast<int>(size_from_conf(
       m_is_deep, conf, osd_scrub_chunk_max, osd_shallow_scrub_chunk_max));
 
+  // 最小块至少 3；被抢占过则按 chunk_divisor 缩小块，降低再次被抢占概率。
   const int min_chunk_sz = std::max(3, min_from_conf);
   const int divisor = static_cast<int>(preemption_data.chunk_divisor());
   const int max_chunk_sz = std::max(min_chunk_sz, max_from_conf / divisor);
@@ -1019,15 +1029,18 @@ std::optional<uint64_t> PgScrubber::select_range()
 		  max_chunk_sz, divisor)
 	   << dendl;
 
+  // 重点调用：列出起点起 [min,max] 个对象，返回候选终点。
   hobject_t start = m_start;
-  hobject_t candidate_end;
-  std::vector<hobject_t> objects;
+  hobject_t candidate_end;  // 本块区间的"候选终点"
+  std::vector<hobject_t> objects;  // 本块候选对象 key 列表
+  // 正常情况下 candidate_end 是 back 后面的那个位置
   int ret = m_pg->get_pgbackend()->objects_list_partial(
       start, min_chunk_sz, max_chunk_sz, &objects, &candidate_end);
   ceph_assert(ret >= 0);
 
   if (!objects.empty()) {
 
+    // 调整边界：候选终点不能落在 head 上，把 head 及其 clone 收进同一块。
     hobject_t back = objects.back();
     while (candidate_end.is_head() && candidate_end == back.get_head()) {
       candidate_end = back;
@@ -1051,7 +1064,7 @@ std::optional<uint64_t> PgScrubber::select_range()
 
   // is that range free for us? if not - we will be rescheduled later by whoever
   // triggered us this time
-
+  // 重点调用：检查区间内对象是否被在飞操作锁占用；忙则返回 nullopt 等待重试。
   if (!m_pg->_range_available_for_scrub(m_start, candidate_end)) {
     // we'll be requeued by whatever made us unavailable for scrub
     dout(10) << __func__ << ": scrub blocked somewhere in range "
@@ -1059,6 +1072,7 @@ std::optional<uint64_t> PgScrubber::select_range()
     return std::nullopt;
   }
 
+  // 选定：记录本块终点（m_max_end 跟踪历史最远进度）。
   m_end = candidate_end;
   if (m_end > m_max_end)
     m_max_end = m_end;
@@ -1067,6 +1081,7 @@ std::optional<uint64_t> PgScrubber::select_range()
 	   << " //// " << m_max_end << dendl;
 
   // debug: be 'blocked' if told so by the 'pg scrub_debug block' asok command
+  // 调试钩子：asok 强制模拟区间忙。
   if (m_debug_blockrange > 0) {
     m_debug_blockrange--;
     return std::nullopt;
@@ -1074,17 +1089,26 @@ std::optional<uint64_t> PgScrubber::select_range()
   return objects.size();
 }
 
+/**
+ * 选择下一个巡检块并按可用性通知状态机。
+ *
+ * 块空闲投递 SelectedChunkFree（进入建 map 流程），
+ * 被写锁占用则投递 ChunkIsBusy（转 RangeBlocked 等待）。
+ */
 void PgScrubber::select_range_n_notify()
 {
   get_labeled_counters()->inc(scrbcnt_chunks_selected);
+  // 重点调用：选定下一个对象区间，并检查区间内对象是否被锁占用。
   auto num_chunk_objects = select_range();
   if (num_chunk_objects.has_value()) {
     // the next chunk to handle is not blocked
+    // 空闲分支：按对象数计算代价，排入工作项投递 SelectedChunkFree。
     dout(20) << __func__ << ": selection OK" << dendl;
     auto cost = get_scrub_cost(num_chunk_objects.value());
     m_osds->queue_scrub_chunk_free(m_pg, Scrub::scrub_prio_t::low_priority, cost);
   } else {
     // we will wait for the objects range to become available for scrubbing
+    // 忙碌分支：排入工作项投递 ChunkIsBusy，等待对象锁释放后重试本块。
     dout(10) << __func__ << ": selected chunk is busy" << dendl;
     m_osds->queue_scrub_chunk_busy(m_pg, Scrub::scrub_prio_t::low_priority);
     get_labeled_counters()->inc(scrbcnt_chunks_busy);
