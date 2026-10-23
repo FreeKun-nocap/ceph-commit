@@ -184,6 +184,11 @@ ScrubMap& ScrubBackend::get_primary_scrubmap()
   return this_chunk->received_maps[m_pg_whoami];
 }
 
+/**
+ * 把各副本 map 中出现的对象 key 归并成全集（权威候选集合）。
+ *
+ * 只收集 key（不带内容），供后续确定权威版本和查缺失对象。
+ */
 void ScrubBackend::merge_to_authoritative_set()
 {
   dout(15) << __func__ << dendl;
@@ -202,6 +207,7 @@ void ScrubBackend::merge_to_authoritative_set()
   }
 
   // Construct the authoritative set of objects
+  // 重点调用：遍历各副本 map，把对象 key 并入 all_chunk_objects（去重全集）。
   for (const auto& map : this_chunk->received_maps) {
     std::transform(map.second.objects.begin(),
                    map.second.objects.end(),
@@ -250,6 +256,11 @@ std::vector<snap_mapper_fix_t> ScrubBackend::replica_clean_meta(
 //
 // /////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 比对各方 scrub map：归并出权威视图后做快照元数据和 SnapMapper 校验。
+ *
+ * 返回本块的不一致对象列表和 SnapMapper 修正列表，由调用方持久化/修复。
+ */
 objs_fix_list_t ScrubBackend::scrub_compare_maps(
   bool max_reached,
   SnapMapReaderI& snaps_getter)
@@ -259,17 +270,22 @@ objs_fix_list_t ScrubBackend::scrub_compare_maps(
 
   // construct authoritative scrub map for type-specific scrubbing
 
+  // 重点调用：把 primary 的 map 并入归并集，汇集各副本 map。
   m_cleaned_meta_map.insert(my_map());
   merge_to_authoritative_set();
 
+  // 重点调用：确定各对象的权威版本（多数一致者胜出）。
   update_authoritative();
+  // 重点调用：清洗出用于元数据校验的权威 map（剔除可解释差异）。
   auto for_meta_scrub = clean_meta_map(m_cleaned_meta_map, max_reached);
 
   // ok, do the pg-type specific scrubbing
 
   // (Validates consistency of the object info and snap sets)
+  // 重点调用：校验 object_info 与 SnapSet 一致性（head/clone 对账）。
   scrub_snapshot_metadata(for_meta_scrub, m_pg_whoami);
 
+  // 重点调用：校验 SnapMapper 索引与实际 clone 的偏差（修正列表）。
   return objs_fix_list_t{std::move(this_chunk->m_inconsistent_objs),
                          scan_snaps(for_meta_scrub, snaps_getter)};
 }
@@ -308,10 +324,16 @@ void ScrubBackend::collect_omap_stats(
  *  - m_cleaned_meta_map: replaces [obj] entry with:
  *     the relevant object in the scrub-map of that selected peer
  */
+/**
+ * 确定每个对象的权威版本：比对各副本 map，选一致方作为权威并替换清洗集内容。
+ *
+ * 单副本 PG 无需比对，只统计 omap 信息。
+ */
 void ScrubBackend::update_authoritative()
 {
   dout(10) << __func__ << dendl;
 
+  // 单副本：没有可比对的对象，只收 omap 统计。
   if (m_acting_but_me.empty()) {
     // nothing to fix. Just count OMAP stats
     // (temporary code - to be removed once scrub_compare_maps()
@@ -326,10 +348,14 @@ void ScrubBackend::update_authoritative()
     return;
   }
 
+  // 重点调用：逐对象比对各副本 map，产出 authoritative（对象→一致副本列表），
+  // 差异对象记入 m_inconsistent_objs 并上报集群日志。
   compare_smaps();  // note: might cluster-log errors
 
   // for each object in this chunk's authoritative map:
   // update the session-wide m_auth_peers with the selected auth peer
+  // 为每个对象选定权威副本（peers.back()），记录到 m_auth_peer，
+  // 并用权威版本替换 m_cleaned_meta_map 中的该对象（供后续元数据校验）。
   for (const auto& [obj, peers] : this_chunk->authoritative) {
     m_auth_peer.emplace(
 	obj, std::make_pair(
@@ -439,6 +465,11 @@ static inline int dcount(const object_info_t& oi)
   return (oi.is_data_digest() ? 1 : 0) + (oi.is_omap_digest() ? 1 : 0);
 }
 
+/**
+ * 为对象选出权威 shard：候选按 primary 优先排列，按版本/数据量择优。
+ *
+ * 同时记录各 shard 的可用性（shard_map）和数据摘要是否互相匹配（digest_match）。
+ */
 auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
                                                   stringstream& errstream)
 {
@@ -449,6 +480,7 @@ auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
   /// selecting best auth source below. Then - stopping on the first one
   /// that is auth eligible.
   /// This creates an issue with 'digest_match' that should be handled.
+  // 候选顺序：primary 排最前（其余条件相同时优先当权威）。
   std::list<pg_shard_t> shards;
 
   for (const auto& [srd, smap] : this_chunk->received_maps) {
@@ -464,9 +496,11 @@ auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
 
   for (auto& l : shards) {
 
+    // 重点调用：评估该 shard 的此对象能否作权威（含错误记录）。
     auto shard_ret = possible_auth_shard(ho, l, ret_auth.shard_map);
 
     // digest_match will only be true if computed digests are the same
+    // 各 shard 数据摘要不一致：标记 digest_match=false（深扫修复依据）。
     if (auth_version != eversion_t() &&
         ret_auth.auth->second.objects.at(ho).digest_present &&
         shard_ret.digest.has_value() &&
@@ -492,7 +526,7 @@ auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
       // Don't use this particular shard due to previous errors
       // XXX: For now we can't pick one shard for repair and another's object
       // info or snapset
-
+      // 不可用：该 shard 自身有错，记入错误流。
       ceph_assert(shard_ret.error_text.length());
       errstream << m_pg_id.pgid << " shard " << l << " soid " << ho << " : "
                 << shard_ret.error_text << "\n";
@@ -501,9 +535,11 @@ auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
                shard_as_auth_t::usable_t::not_found) {
 
       // do not emit the returned error message to the log
+      // 该 shard 上对象缺失（属正常差异，不算错误）。
       dout(15) << fmt::format("{}: {} not found on shard {}", __func__, ho, l)
                << dendl;
     } else if (shard_ret.possible_auth == shard_as_auth_t::usable_t::not_usable_no_err) {
+      // 无错误但不可用（如无对象信息），跳过。
       dout(20) << fmt::format("{}: skipping not_usable_no_err {} {} {}",
                         __func__,
                         l,
@@ -520,7 +556,8 @@ auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
                << dendl;
 
       // consider using this shard as authoritative. Is it more recent?
-
+      // 择优规则：版本新者胜；版本相同则有效数据计数（dcount）大者胜；
+      // 全等时保持先到者（primary 在前占优）。
       if (auth_version == eversion_t() || shard_ret.oi.version > auth_version ||
           (shard_ret.oi.version == auth_version &&
            dcount(shard_ret.oi) > dcount(ret_auth.auth_oi))) {
@@ -532,6 +569,7 @@ auth_selection_t ScrubBackend::select_auth_object(const hobject_t& ho,
                                 (void*)&shard_ret.oi)
                  << dendl;
 
+        // 更新当前权威候选。
         ret_auth.auth = shard_ret.auth_iter;
         ret_auth.auth_shard = ret_auth.auth->first;
         ret_auth.auth_oi = shard_ret.oi;
@@ -595,6 +633,12 @@ static inline bool test_error_cond(bool error_pred,
   return error_pred;
 }
 
+/**
+ * 评估一个 shard 的此对象能否作权威：逐项体检错误并解码关键属性。
+ *
+ * 有任何硬错误返回错误文本（不可用）；全好返回 object_info/摘要，
+ * EC 非 primary 分片标记为不可作权威（副本池不涉及）。
+ */
 shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
                                                   const pg_shard_t& srd,
                                                   shard_info_map_t& shard_map)
@@ -605,6 +649,7 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
   //  'shard_map' - the one created in select_auth_object()
   //     - used to access the 'shard_info'
 
+  // 该 shard map 中无此对象：返回 not_found（不算错误）。
   const auto j = this_chunk->received_maps.find(srd);
   const auto& j_shard = j->first;
   const auto& j_smap = j->second;
@@ -614,6 +659,7 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
   }
   const auto& smap_obj = i->second;
 
+  // 登记该 shard 的检查结果；标记是否 primary。
   auto& shard_info = shard_map[j_shard];
   if (j_shard == m_pg_whoami) {
     shard_info.primary = true;
@@ -621,6 +667,8 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
 
   stringstream errstream;  // for this shard
 
+  // 逐项错误体检：dup_error_cond 记录错误并追加错误描述。
+  // 读错/摘要错/大小错：属硬错误，记入 shard_info。
   bool err{false};
   dup_error_cond(err,
                  true,
@@ -659,6 +707,7 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
   // We won't pick an auth copy if the snapset is missing or won't decode.
   ceph_assert(!obj.is_snapdir());
 
+  // head 对象且非 EC 分片：校验 SS_ATTR（SnapSet 缺失/解码损坏）。
   if (obj.is_head() && !m_pg.get_is_nonprimary_shard(j_shard)) {
     auto k = smap_obj.attrs.find(SS_ATTR);
     if (dup_error_cond(err,
@@ -695,6 +744,7 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
     }
   }
 
+  // 【EC】EC 池校验 hinfo（条带哈希信息）缺失/损坏（副本池不涉及）。
   if (m_pg.get_is_hinfo_required()) {
     auto k = smap_obj.attrs.find(ECLegacy::ECUtilL::get_hinfo_key());
     if (dup_error_cond(err,
@@ -724,6 +774,7 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
   object_info_t oi;
 
   {
+    // 校验 OI_ATTR（object_info）：缺失/解码损坏/soid 不匹配都不可作权威。
     auto k = smap_obj.attrs.find(OI_ATTR);
     if (!dup_error_cond(err,
                         false,
@@ -763,6 +814,7 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
     }
   }
 
+  // 大小一致性：实际大小须等于 object_info 推算的应有大小。
   uint64_t ondisk_size = logical_to_ondisk_size(oi.size, srd.shard,
     smap_obj.attrs.contains(ECUtil::get_hinfo_key()),
     smap_obj.size);
@@ -773,11 +825,13 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
               << ondisk_size << " mismatch";
   }
 
+  // 提取该 shard 计算出的数据摘要（深扫用）。
   std::optional<uint32_t> digest;
   if (smap_obj.digest_present) {
     digest = smap_obj.digest;
   }
 
+  // 有任何错误：返回错误文本 + 摘要（不可作权威）。
   if (shard_info.errors) {
     ceph_assert(err);
     return shard_as_auth_t{errstream.str(), digest};
@@ -788,20 +842,29 @@ shard_as_auth_t ScrubBackend::possible_auth_shard(const hobject_t& obj,
   // for a successful shard selection.
   // Non-primary shards cannot be used as authoritative, but this is not
   // considered a failure.
+  // 全好：返回 object_info/迭代器/摘要；【EC】非 primary 分片标记不可作权威。
   return shard_as_auth_t{oi, j, errstream.str(), digest,
                          m_pg.get_is_nonprimary_shard(j_shard)};
 }
 
 // re-implementation of PGBackend::be_compare_scrubmaps()
+/**
+ * 对全集中每个对象逐个比对各副本 map，发现不一致上报集群日志。
+ *
+ * 比对结果（authoritative 映射 / 不一致列表）记录在 this_chunk 中。
+ */
 void ScrubBackend::compare_smaps()
 {
   dout(10) << __func__
            << ": authoritative-set #: " << this_chunk->all_chunk_objects.size()
            << dendl;
 
+  // 遍历全集，lambda 内逐对象比对；C++17 if 初始化语句承接返回值。
   std::for_each(this_chunk->all_chunk_objects.begin(),
                 this_chunk->all_chunk_objects.end(),
                 [this](const auto& ho) {
+                  // 重点调用：比对该对象在各副本 map 中的差异，
+                  // 一致的进 authoritative，不一致的返回错误描述。
                   if (auto maybe_clust_err = compare_obj_in_maps(ho);
                       maybe_clust_err) {
                     clog.error() << *maybe_clust_err;
@@ -960,12 +1023,19 @@ void ScrubBackend::setup_ec_digest_map(auth_selection_t& auth_selection,
   }
 }
 
+/**
+ * 单个对象的 map 比对：选出权威版本，逐 shard 分类一致/不一致/缺失。
+ *
+ * 返回错误描述（nullopt 表示各 shard 一致）；差异登记进 this_chunk 供修复。
+ */
 std::optional<std::string> ScrubBackend::compare_obj_in_maps(
   const hobject_t& ho)
 {
   // clear per-object data:
+  // 清上一个对象的比对临时状态。
   m_current_obj = object_scrub_data_t{};
 
+  // 重点调用：从各 shard 中选出权威版本（多数/最新者），收集候选期错误。
   stringstream candidates_errors;
   auto auth_res = select_auth_object(ho, candidates_errors);
   if (candidates_errors.str().size()) {
@@ -974,11 +1044,13 @@ std::optional<std::string> ScrubBackend::compare_obj_in_maps(
     clog.error() << candidates_errors.str();
   }
 
+  // 【EC】EC 池另行设置分片摘要比对数据（副本池不涉及）。
   if (!m_is_replicated) {
     setup_ec_digest_map(auth_res, ho);
   }
 
   inconsistent_obj_wrapper object_error{ho};
+  // 分支一：选不出权威（各 shard 都不可用/全坏）。
   if (!auth_res.is_auth_available) {
     // no auth selected
     object_error.set_version(0);
@@ -1005,6 +1077,7 @@ std::optional<std::string> ScrubBackend::compare_obj_in_maps(
   auto& auth = auth_res.auth;
 
   // an auth source was selected
+  // 取权威 shard 的该对象作为比对基准。
   const ScrubMap::object& auth_object = auth->second.objects.at(ho);
 
   // collect some OMAP statistics based on the selected version of the object
@@ -1013,9 +1086,11 @@ std::optional<std::string> ScrubBackend::compare_obj_in_maps(
   object_error.set_version(auth_res.auth_oi.user_version);
   ceph_assert(!m_current_obj.fix_digest);
 
+  // 重点调用：逐 shard 与权威比对，分出一致列表 auths 和出错集合 objerrs。
   auto [auths, objerrs] =
     match_in_shards(ho, auth_res, object_error, errstream);
 
+  // 重点调用：兜底——全 shard 出错时也保一个作 auth，避免无基准。
   auto opt_ers =
     for_empty_auth_list(std::move(auths),
                         std::move(objerrs),
@@ -1027,6 +1102,7 @@ std::optional<std::string> ScrubBackend::compare_obj_in_maps(
 
     // At this point auth_list is populated, so we add the object error
     // shards as inconsistent.
+    // 重点调用：登记缺失/不一致 shard，需要时标记 digest 修复。
     inconsistents(ho,
                   auth_object,
                   auth_res.auth_oi,
@@ -1038,12 +1114,14 @@ std::optional<std::string> ScrubBackend::compare_obj_in_maps(
     errstream << m_pg_id << " soid " << ho << " : empty auth list\n";
   }
 
+  // 累计本对象的浅/深错误计数。
   if (object_error.has_deep_errors()) {
     this_chunk->m_error_counts.deep_errors++;
   } else if (object_error.has_shallow_errors()) {
     this_chunk->m_error_counts.shallow_errors++;
   }
 
+  // 有差异则记入本块不一致列表（供 persist_scrub_results 持久化）。
   if (object_error.errors || object_error.union_shards.errors) {
     this_chunk->m_inconsistent_objs.push_back(std::move(object_error));
   }

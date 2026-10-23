@@ -1634,32 +1634,44 @@ void PgScrubber::apply_snap_mapper_fixes(
   }
 }
 
+/**
+ * 本块收尾：比对 primary/副本的 scrub map，持久化差异修复并推进到下一块。
+ *
+ * 深扫时比对结果含数据摘要差异，不一致对象走 repair 事务同步副本。
+ */
 void PgScrubber::maps_compare_n_cleanup()
 {
   m_pg->add_objects_scrubbed_count(std::ssize(m_be->get_primary_scrubmap().objects));
 
+  // 重点调用：三方 map 逐对象比对，返回不一致对象和 SnapMapper 修正列表。
   auto required_fixes =
     m_be->scrub_compare_maps(m_end.is_max(), get_snap_mapper_accessor());
   if (!required_fixes.inconsistent_objs.empty()) {
     if (state_test(PG_STATE_REPAIR)) {
+      // 本次就是 repair 模式扫描：结果不再另行上报。
       dout(10) << __func__ << ": discarding scrub results (repairing)" << dendl;
     } else {
       // perform the ordered scrub-store I/O:
+      // 重点调用：把不一致记录写入 scrub 结果存储（供上报/修复依据）。
       persist_scrub_results(std::move(required_fixes.inconsistent_objs));
     }
   }
 
   // actuate snap-mapper changes:
+  // 重点调用：应用 SnapMapper 索引修正（map 比对发现的索引偏差）。
   apply_snap_mapper_fixes(required_fixes.snap_fix_list);
 
+  // 累计本块浅扫/深扫错误计数。
   auto chunk_err_counts = m_be->get_error_counts();
   m_shallow_errors += chunk_err_counts.shallow_errors;
   m_deep_errors += chunk_err_counts.deep_errors;
 
+  // 块推进：下一块从本块终点继续；执行注册的块完成回调。
   m_start = m_end;
   run_callbacks();
 
   // requeue the writes from the chunk that just finished
+  // 重排扫描期间被挡在本块区间上的写请求。
   requeue_waiting();
 }
 

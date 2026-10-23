@@ -519,12 +519,19 @@ NewChunk::NewChunk(my_context ctx)
   scrbr->select_range_n_notify();
 }
 
+/**
+ * 块空闲确认：记录本块的日志水位后转入 WaitPushes。
+ *
+ * 水位用于扫描期间的并发写对账（解释 map 差异）。
+ */
 sc::result NewChunk::react(const SelectedChunkFree&)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   dout(10) << "NewChunk::react(const SelectedChunkFree&)" << dendl;
 
+  // 重点调用：查 PG log 记录本块区间内的更新水位（subset_last_update）。
   scrbr->set_subset_last_update(scrbr->search_log_for_updates());
+  // 重点状态转移：等在飞 push 清零后进入建 map 流程。
   return transit<WaitPushes>();
 }
 
@@ -575,15 +582,23 @@ WaitLastUpdate::WaitLastUpdate(my_context ctx)
  *  last_update_applied (the replica side, even on EC, is still safe
  *  since the actual transaction will already be readable by commit time.
  */
+/**
+ * 原地检查本块更新是否全部应用（in_state_reaction，可被多次唤醒）。
+ *
+ * 全部应用后投递 InternalAllUpdates 转入收 map 流程。
+ */
 void WaitLastUpdate::on_new_updates(const UpdatesApplied&)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   dout(10) << "WaitLastUpdate::on_new_updates(const UpdatesApplied&)" << dendl;
 
+  // 重点调用：检查 last_update_applied 水位是否已到本次更新。
   if (scrbr->has_pg_marked_new_updates()) {
+    // 全部应用：投递事件，由 react(InternalAllUpdates) 转 BuildMap。
     post_event(InternalAllUpdates{});
   } else {
     // will be requeued by op_applied
+    // 【EC】primary 的读改写要多一轮读，等 op_applied 再次唤醒本函数。
     dout(10) << "wait for EC read/modify/writes to queue" << dendl;
   }
 }
@@ -591,17 +606,29 @@ void WaitLastUpdate::on_new_updates(const UpdatesApplied&)
 /*
  *  request maps from the replicas in the acting set
  */
+/**
+ * 全部更新已应用：向副本请求各自构建 scrub map，同时转入本地建 map。
+ */
 sc::result WaitLastUpdate::react(const InternalAllUpdates&)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   dout(10) << "WaitLastUpdate::react(const InternalAllUpdates&)" << dendl;
 
+  // 重点调用：向 actingset 各副本发 MOSDRepScrub 请它们建 map 回传
+  //（副本侧行动的起点；可抢占标志随请求带上）。
   scrbr->get_replicas_maps(scrbr->get_preemptor().is_preemptable());
+  // 重点状态转移：本地并行构建 scrub map。
   return transit<BuildMap>();
 }
 
 // ----------------------- BuildMap -----------------------------------
 
+/**
+ * BuildMap 状态构造：构建本地 scrub map。
+ *
+ * 三分支：已被抢占则标记本地 map 就绪并投递 IntBmPreempted；
+ * 构建中（-EINPROGRESS）等 backend 回调重入；完成则投递 IntLocalMapDone。
+ */
 BuildMap::BuildMap(my_context ctx)
     : my_base(ctx)
     , NamedSimply(context<ScrubMachine>().m_scrbr, "Session/Act/BuildMap")
@@ -613,9 +640,11 @@ BuildMap::BuildMap(my_context ctx)
   // no need to check for an epoch change, as all possible flows that brought
   // us here have a check_interval() verification of their final event.
 
+  // 分支一：建 map 前已被抢占（本地或副本侧）。
   if (scrbr->get_preemptor().was_preempted()) {
 
     // we were preempted, either directly or by a replica
+    // 标记本地 map 已就绪（不再构建），转 DrainReplMaps 收尾。
     dout(10) << __func__ << " preempted!!!" << dendl;
     scrbr->mark_local_map_ready();
     post_event(IntBmPreempted{});
@@ -625,14 +654,17 @@ BuildMap::BuildMap(my_context ctx)
 
     // note that build_primary_map_chunk() may return -EINPROGRESS, but no
     // other error value (as those errors would cause it to crash the OSD).
+    // 重点调用：按块构建本地 map（读对象元数据/数据摘要）。
     if (scrbr->build_primary_map_chunk() == -EINPROGRESS) {
       // must wait for the backend to finish. No specific event provided.
       // build_primary_map_chunk() has already requeued us.
+      // 分支二：异步构建中，backend 完成后重新入队唤醒。
       dout(20) << "waiting for the backend..." << dendl;
 
     } else {
 
       // the local map was created
+      // 分支三：本地 map 已建好，通知可以进入比对阶段。
       post_event(IntLocalMapDone{});
     }
   }
@@ -698,28 +730,39 @@ WaitReplicas::WaitReplicas(my_context ctx)
  * "classic" OSD, here too maps_compare_n_cleanup() is responsible for
  * signalling the completion of the processing.
  */
+/**
+ * 收副本 map 的进度检查（自投递 + 每收到一份 map 唤醒一次）。
+ *
+ * 全部收齐后调用 maps_compare_n_cleanup() 比对修复；被抢占则本块作废重试。
+ */
 sc::result WaitReplicas::react(const GotReplicas&)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   dout(10) << "WaitReplicas::react(const GotReplicas&)" << dendl;
 
+  // all_maps_already_called 防止比对被重复触发（比对可能异步完成）。
   if (!all_maps_already_called && scrbr->are_all_maps_available()) {
     dout(10) << "WaitReplicas::react(const GotReplicas&) got all" << dendl;
 
     all_maps_already_called = true;
 
     // were we preempted?
+    // test&set：清抢占标志并返回是否被抢过。
     if (scrbr->get_preemptor().disable_and_test()) {  // a test&set
 
 
+      // 被抢占：本块放弃，回 PendingTimer/ NewChunk 重试。
       dout(10) << "WaitReplicas::react(const GotReplicas&) PREEMPTED!" << dendl;
       return transit<PendingTimer>();
 
     } else {
+      // 重点调用：三方 map 逐对象比对，发现不一致走 repair。
       scrbr->maps_compare_n_cleanup();
+      // 重点状态转移：等 digest 更新完成后收尾本块。
       return transit<WaitDigestUpdate>();
     }
   } else {
+    // 未收齐（或比对已发起）：等下一份副本 map 到来再查。
     return discard_event();
   }
 }
