@@ -2178,6 +2178,11 @@ void PgScrubber::scrub_finish()
 }
 
 
+/**
+ * 本块 digest 更新全部完成后决定去向：还有对象则取下一块，否则收尾会话。
+ *
+ * 由 DigestUpdate 事件链路唤醒；未完时直接返回等新回执。
+ */
 void PgScrubber::on_digest_updates()
 {
   dout(10) << __func__ << " #pending: " << num_digest_updates_pending << " "
@@ -2185,6 +2190,7 @@ void PgScrubber::on_digest_updates()
 	   << (is_queued_or_active() ? "" : " ** not marked as scrubbing **")
 	   << dendl;
 
+  // digest 更新未全部完成：等下一次回执再查。
   if (num_digest_updates_pending > 0) {
     // do nothing for now. We will be called again when new updates arrive
     return;
@@ -2192,9 +2198,11 @@ void PgScrubber::on_digest_updates()
 
   // got all updates, and finished with this chunk. Any more?
   if (m_end.is_max()) {
+    // 已扫到对象空间末尾：投递工作项触发 ScrubFinished 收尾。
     m_osds->queue_scrub_is_finished(m_pg);
   } else {
     // go get a new chunk (via "requeue")
+    // 重点调用：清抢占标记，排入取下一块的工作项（块循环回环）。
     preemption_data.reset();
     m_osds->queue_scrub_next_chunk(m_pg, m_pg->is_scrub_blocking_ops());
   }

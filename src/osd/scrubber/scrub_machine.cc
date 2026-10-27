@@ -806,22 +806,29 @@ sc::result WaitDigestUpdate::react(const DigestUpdate&)
   return discard_event();
 }
 
+/**
+ * 全部块扫描完成：统计会话耗时，收尾清理后回到空闲态 PrimaryIdle。
+ */
 sc::result WaitDigestUpdate::react(const ScrubFinished&)
 {
   DECLARE_LOCALS;  // 'scrbr' & 'pg_id' aliases
   dout(10) << "WaitDigestUpdate::react(const ScrubFinished&)" << dendl;
   auto& session = context<Session>();
 
+  // 成功会话计数。
   session.m_osd_counters->inc(session.m_counters_idx->successful_cnt);
 
   // set the 'scrub duration'
+  // 记录会话耗时并复位会话起点。
   auto duration = machine.get_time_scrubbing();
   scrbr->set_scrub_duration(ceil<milliseconds>(duration));
   machine.m_session_started_at.reset();
   session.m_osd_counters->tinc(
       session.m_counters_idx->successful_elapsed, duration);
 
+  // 重点调用：收尾（上报结果/清 scrub 状态/恢复 snap-trim 与被挡写）。
   scrbr->scrub_finish();
+  // 重点状态转移：会话结束，回到 PrimaryIdle 等下一轮排期。
   return transit<PrimaryIdle>();
 }
 
