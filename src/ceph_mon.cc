@@ -250,6 +250,10 @@ entity_addrvec_t make_mon_addrs(entity_addr_t a)
   return addrs;
 }
 
+/**
+ * ceph-mon 进程入口：参数解析、mkfs/数据目录处理、守护化、
+ * 创建 Monitor 与 Messenger，最后 mon->init() 进入 Monitor 初始化。
+ */
 int main(int argc, const char **argv)
 {
   // reset our process name, in case we did a respawn, so that it's not
@@ -310,6 +314,7 @@ int main(int argc, const char **argv)
   // don't try to get config from mon cluster during startup
   flags |= CINIT_FLAG_NO_MON_CONFIG;
 
+  // 重点调用：全局初始化（mon 专属默认值；启动期不向 mon 集群拉配置）。
   auto cct = global_init(&defaults, args,
 			 CEPH_ENTITY_TYPE_MON, CODE_ENVIRONMENT_DAEMON,
 			 flags);
@@ -360,9 +365,11 @@ int main(int argc, const char **argv)
     exit(1);
   }
 
+  // mon 数据目录的 KV 存储（MonitorDBStore）。
   MonitorDBStore store(g_conf()->mon_data);
 
   // -- mkfs --
+  // 初始化分支：创建 monfs（生成/导入 monmap、写初始数据）后退出。
   if (mkfs) {
 
     int err = check_mon_data_exists();
@@ -540,6 +547,7 @@ int main(int argc, const char **argv)
     return 0;
   }
 
+  // 常规启动前置检查：mon_data 必须已 mkfs（存在且非空）。
   err = check_mon_data_exists();
   if (err < 0 && err == -ENOENT) {
     derr << "monitor data directory at '" << g_conf()->mon_data << "'"
@@ -583,6 +591,7 @@ int main(int argc, const char **argv)
     }
   }
 
+  // 守护进程化：fork 后台运行并脱离终端。
   Preforker prefork;
   if (!(flags & CINIT_FLAG_NO_DAEMON_ACTIONS)) {
     if (global_init_prefork(g_ceph_context) >= 0) {
@@ -697,6 +706,7 @@ int main(int argc, const char **argv)
   }
 
   // monmap?
+  // 从 store 读取 monmap（obtain_monmap）；--extract-monmap 导出后退出。
   MonMap monmap;
   {
     // note that even if we don't find a viable monmap, we should go ahead
@@ -789,6 +799,7 @@ int main(int argc, const char **argv)
   // bind
   int rank = monmap.get_rank(g_conf()->name.get_id());
   std::string public_msgr_type = g_conf()->ms_public_type.empty() ? g_conf().get_val<std::string>("ms_type") : g_conf()->ms_public_type;
+  // 重点调用：创建 Messenger，配置各实体消息策略与客户端/守护流量限流。
   Messenger *msgr = Messenger::create(g_ceph_context, public_msgr_type,
 				      entity_name_t::MON(rank), "mon", 0);
   if (!msgr)
@@ -847,6 +858,7 @@ int main(int argc, const char **argv)
     prefork.exit(1);
   }
 
+  // 重点调用：构造 Monitor（绑定 store/msgr/monmap）。
   mon = new Monitor(g_ceph_context, g_conf()->name.get_id(), &store,
 		    msgr, mgr_msgr, &monmap);
 
@@ -863,6 +875,7 @@ int main(int argc, const char **argv)
     *_dout << dendl;
   }
 
+  // 重点调用：preinit 启动前准备（校验 store/monmap 状态）。
   err = mon->preinit();
   if (err < 0) {
     derr << "failed to initialize" << dendl;
@@ -875,6 +888,7 @@ int main(int argc, const char **argv)
     derr << "done compacting" << dendl;
   }
 
+  // 绑定地址、守护化，启动两个 Messenger（对集群 + 对 mgr）。
   // bind
   err = msgr->bindv(bind_addrs, public_addrs);
   if (err < 0) {
@@ -891,6 +905,8 @@ int main(int argc, const char **argv)
   mgr_msgr->start();
 
   mon->set_mon_crush_location(crush_loc);
+  // 重点调用：进入 Monitor 初始化（init_paxos、boot/probing/选举），
+  // 本阅读路径的下一层入口。
   mon->init();
 
   register_async_signal_handler_oneshot(SIGINT, handle_mon_signal);
@@ -900,6 +916,7 @@ int main(int argc, const char **argv)
   if (g_conf()->inject_early_sigterm)
     kill(getpid(), SIGTERM);
 
+  // 主线程阻塞在 messenger wait（事件循环），直到退出信号到来。
   msgr->wait();
   mgr_msgr->wait();
 

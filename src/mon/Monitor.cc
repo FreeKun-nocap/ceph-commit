@@ -952,32 +952,44 @@ int Monitor::preinit()
   return 0;
 }
 
+/**
+ * Monitor 初始化：启动定时器/线程池、注册消息分发，进入 PROBING 启动流程。
+ *
+ * bootstrap() 是 boot/probing/选举链路的入口（本阅读路径下一层）。
+ */
 int Monitor::init()
 {
   dout(2) << "init" << dendl;
   std::lock_guard l(lock);
 
+  // 启动 finisher 线程（异步回调执行器）。
   finisher.start();
 
   // start ticker
+  // 启动周期定时器并注册第一个 tick。
   timer.init();
   new_tick();
 
+  // 启动 CPU 线程池（后台计算任务）。
   cpu_tp.start();
 
   // i'm ready!
+  // 重点调用：把自己挂入 messenger 分发链，开始接收消息。
   messenger->add_dispatcher_tail(this);
 
   // kickstart pet mgrclient
+  // 启动 mgr 客户端（向 mgr 上报/取服务）。
   mgr_client.init();
   mgr_messenger->add_dispatcher_tail(&mgr_client);
   mgr_messenger->add_dispatcher_tail(this);  // for auth ms_* calls
   mgrmon()->prime_mgr_client();
 
+  // 进入 PROBING 状态并启动 bootstrap（探测其他 mon、准备选举/加入集群）。
   state = STATE_PROBING;
-
+  // 重点调用：boot/probing/选举链路的起点。
   bootstrap();
 
+  // 选举历史记录有脏数据（旧版本 bug 遗留）时清掉。
   if (!elector.peer_tracker_is_clean()){
     dout(10) << "peer_tracker looks inconsistent"
       << " previous bad logic, clearing ..." << dendl;
@@ -985,6 +997,7 @@ int Monitor::init()
   }
 
   // add features of myself into feature_map
+  // 记录自身支持的特性到会话特性表。
   session_map.feature_map.add_mon(con_self->get_features());
   return 0;
 }
