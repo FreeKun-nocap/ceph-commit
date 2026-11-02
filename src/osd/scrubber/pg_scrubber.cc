@@ -2425,7 +2425,7 @@ Scrub::schedule_result_t PgScrubber::start_scrub_session(
     return schedule_result_t::target_specific_failure;
   }
 
-  // 与 SnapTrim 互斥的另一侧：snap-trim 进行中不巡检（对照第 18 条 WaitScrub）。
+  // 与 SnapTrim 互斥的另一侧：snap-trim 进行中不巡检（SnapTrim 侧见 WaitScrub）。
   if (state_test(PG_STATE_SNAPTRIM) || state_test(PG_STATE_SNAPTRIM_WAIT)) {
     // note that the trimmer checks scrub status when setting 'snaptrim_wait'
     // (on the transition from NotTrimming to Trimming/WaitReservation),

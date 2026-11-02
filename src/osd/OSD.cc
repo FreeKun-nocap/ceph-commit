@@ -6732,7 +6732,7 @@ void OSD::tick_without_osd_lock()
   }
 
   if (is_active()) {
-    // 重点调用：触发 Scrub 调度（本阅读路径入口），从 ScrubQueue 挑到期 PG 巡检。
+    // 重点调用：触发 Scrub 调度，从 ScrubQueue 挑到期 PG 巡检。
     service.get_scrub_services().initiate_scrub(service.is_recovery_active());
     service.promote_throttle_recalibrate();
     resume_creating_pg();

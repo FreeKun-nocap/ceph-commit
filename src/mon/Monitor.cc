@@ -955,7 +955,7 @@ int Monitor::preinit()
 /**
  * Monitor 初始化：启动定时器/线程池、注册消息分发，进入 PROBING 启动流程。
  *
- * bootstrap() 是 boot/probing/选举链路的入口（本阅读路径下一层）。
+ * bootstrap() 是 boot/probing/选举链路的入口。
  */
 int Monitor::init()
 {
@@ -1207,20 +1207,27 @@ void Monitor::respawn()
   ceph_abort();
 }
 
+/**
+ * 启动引导：清理上次运行状态、校正自身 rank/地址，
+ * 单 mon 直接赢得选举，否则向其他 mon 发 MMonProbe 进入 PROBING 探测。
+ */
 void Monitor::bootstrap()
 {
   dout(10) << "bootstrap" << dendl;
+  // 等待未完成的 paxos 写落盘，并清掉探测超时/同步等遗留状态。
   wait_for_paxos_write();
 
   sync_reset_requester();
   unregister_cluster_logger();
   cancel_probe_timeout();
 
+  // seed monmap（epoch 0）没有 rank，退回旧算法计算。
   if (monmap->get_epoch() == 0) {
     dout(10) << "reverting to legacy ranks for seed monmap (epoch 0)" << dendl;
     monmap->calc_legacy_ranks();
   }
   dout(10) << "monmap " << *monmap << dendl;
+  // 版本升级检查：不允许从过新的 monmap 降级启动。
   {
     auto from_release = monmap->min_mon_release;
     ostringstream err;
@@ -1230,9 +1237,11 @@ void Monitor::bootstrap()
     }
   }
   // note my rank
+  // 校正自身 rank：被移出 monmap 则退出；地址变了则暂存新 monmap 并 respawn。
   int newrank = monmap->get_rank(messenger->get_myaddrs());
   if (newrank < 0 && rank >= 0) {
     // was i ever part of the quorum?
+    // 曾加入过集群却被移除：自杀退出（由外部清理）。
     if (has_ever_joined) {
       dout(0) << " removed from monmap, suicide." << dendl;
       exit(0);
@@ -1249,6 +1258,7 @@ void Monitor::bootstrap()
     if (monmap->get_epoch()) {
       // store this map in temp mon_sync location so that we use it on
       // our next startup
+      // 把新 monmap 暂存到 mon_sync，重启后生效。
       derr << " stashing newest monmap " << monmap->get_epoch()
 	   << " for next startup" << dendl;
       bufferlist bl;
@@ -1258,9 +1268,11 @@ void Monitor::bootstrap()
       store->apply_transaction(t);
     }
 
+    // 重点调用：重启自身进程以使用新地址。
     respawn();
   }
   if (newrank != rank) {
+    // rank 变更：改名并断开所有旧连接（否则 peer 会认错人）。
     dout(0) << " my rank is now " << newrank << " (was " << rank << ")" << dendl;
     messenger->set_myname(entity_name_t::MON(newrank));
     rank = newrank;
@@ -1272,10 +1284,11 @@ void Monitor::bootstrap()
 
   // reset
   state = STATE_PROBING;
-
+  // 重点调用：清空运行期状态（会话、提案、同步进度等）。
   _reset();
 
   // sync store
+  // 可选：bootstrap 时压缩 KV 存储。
   if (g_conf()->mon_compact_on_bootstrap) {
     dout(10) << "bootstrap -- triggering compaction" << dendl;
     store->compact();
@@ -1286,7 +1299,9 @@ void Monitor::bootstrap()
   set_elector_disallowed_leaders(false);
 
   // singleton monitor?
+  // 单 mon 集群：无须选举，直接赢得独立选举成为 leader。
   if (monmap->size() == 1 && rank == 0) {
+    // 重点调用：免选举直接入主。
     win_standalone_election();
     return;
   }
@@ -1298,6 +1313,8 @@ void Monitor::bootstrap()
     outside_quorum.insert(name);
 
   // probe monitors
+  // 重点调用：向 monmap 内其他 mon 和手工提示的 peer 发 MMonProbe(OP_PROBE)，
+  // 收集探测应答以决定加入 quorum 还是发起选举。
   dout(10) << "probing other monitors" << dendl;
   for (unsigned i = 0; i < monmap->size(); i++) {
     if ((int)i != rank)
@@ -1934,11 +1951,15 @@ void Monitor::probe_timeout(int r)
   bootstrap();
 }
 
+/**
+ * 探测消息分派：校验 fsid 后按 OP_PROBE/OP_REPLY 转给应答生产端/消费端。
+ */
 void Monitor::handle_probe(MonOpRequestRef op)
 {
   auto m = op->get_req<MMonProbe>();
   dout(10) << "handle_probe " << *m << dendl;
 
+  // fsid 不同：不是同一集群的 mon，忽略。
   if (m->fsid != monmap->fsid) {
     dout(0) << "handle_probe ignoring fsid " << m->fsid << " != " << monmap->fsid << dendl;
     return;
@@ -1946,14 +1967,17 @@ void Monitor::handle_probe(MonOpRequestRef op)
 
   switch (m->op) {
   case MMonProbe::OP_PROBE:
+    // 对方探测我：组织应答（版本/quorum 状态）回 OP_REPLY。
     handle_probe_probe(op);
     break;
 
   case MMonProbe::OP_REPLY:
+    // 我收到探测应答：比较版本后决策（同步/选举/加入）。
     handle_probe_reply(op);
     break;
 
   case MMonProbe::OP_MISSING_FEATURES:
+    // 对方告知我版本/特性不足，无法互通。
     derr << __func__ << " require release " << (int)m->mon_release << " > "
 	 << (int)ceph_release()
 	 << ", or missing features (have " << CEPH_FEATURES_ALL
@@ -1964,12 +1988,17 @@ void Monitor::handle_probe(MonOpRequestRef op)
   }
 }
 
+/**
+ * 应答生产端：处理其他 mon 的探测（OP_PROBE），
+ * 回 OP_REPLY 携带, 我的 quorum/leader/monmap/paxos 水位，供对方决策。
+ */
 void Monitor::handle_probe_probe(MonOpRequestRef op)
 {
   auto m = op->get_req<MMonProbe>();
 
   dout(10) << "handle_probe_probe " << m->get_source_inst() << " " << *m
 	   << " features " << m->get_connection()->get_features() << dendl;
+  // 门槛检查：对方版本低于 monmap 最低要求或缺特性，回 MISSING_FEATURES 拒绝。
   uint64_t missing = required_features & ~m->get_connection()->get_features();
   if ((m->mon_release != ceph_release_t::unknown &&
        m->mon_release < monmap->min_mon_release) ||
@@ -1992,6 +2021,7 @@ void Monitor::handle_probe_probe(MonOpRequestRef op)
     // quorum-to-be) but fail to join a quorum before it moves past
     // us.  We need to be kicked back to bootstrap so we can
     // synchonize, not keep calling elections.
+    // 对方 paxos 首版本已超前：我严重落后，回 bootstrap 转同步，避免空转选举。
     if (paxos->get_version() + 1 < m->paxos_first_version) {
       dout(1) << " peer " << m->get_source_addr() << " has first_committed "
 	      << "ahead of us, re-bootstrapping" << dendl;
@@ -2001,6 +2031,7 @@ void Monitor::handle_probe_probe(MonOpRequestRef op)
     }
   }
   
+  // 组装应答：quorum/leader/monmap/paxos 水位（消费端决策的依据）。
   MMonProbe *r;
   r = new MMonProbe(monmap->fsid, MMonProbe::OP_REPLY, name, has_ever_joined,
 		    ceph_release());
@@ -2013,6 +2044,7 @@ void Monitor::handle_probe_probe(MonOpRequestRef op)
   m->get_connection()->send_message(r);
 
   // did we discover a peer here?
+  // 顺带发现新 peer：不在 monmap 的地址记入 hints；已知 peer 开始 ping 探活。
   if (!monmap->contains(m->get_source_addr())) {
     dout(1) << " adding peer " << m->get_source_addrs()
 	    << " to list of hints" << dendl;
@@ -2025,6 +2057,12 @@ void Monitor::handle_probe_probe(MonOpRequestRef op)
   return;
 }
 
+/**
+ * 应答消费端：处理探测应答（OP_REPLY），决策去向。
+ *
+ * 依次：采纳更新的 monmap / 落后过多转 Synchronizing /
+ * 对方有 quorum 则发起选举或申请加入 / 无 quorum 则攒法定人数再选举。
+ */
 void Monitor::handle_probe_reply(MonOpRequestRef op)
 {
   auto m = op->get_req<MMonProbe>();
@@ -2033,11 +2071,13 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
   dout(10) << " monmap is " << *monmap << dendl;
 
   // discover name and addrs during probing or electing states.
+  // 仅探测/选举阶段处理应答，其他状态忽略。
   if (!is_probing() && !is_electing()) {
     return;
   }
 
   // newer map, or they've joined a quorum and we haven't?
+  // monmap 与对方不一致时，若对方已入过 quorum，且其版本更新或我从未入过 quorum，则采纳对方的 map。
   bufferlist mybl;
   monmap->encode(mybl, m->get_connection()->get_features());
   // make sure it's actually different; the checks below err toward
@@ -2060,6 +2100,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
         notify_new_monmap(false, false);
         elector.notify_clear_peer_state();
       }
+      // 重点调用：采纳新 monmap 后回 bootstrap 重新对齐自身状态。
       bootstrap();
       return;
     }
@@ -2067,6 +2108,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
   }
 
   // rename peer?
+  // seed 期（epoch 0）：把 noname- 占位的 peer 改为真名。
   string peer_name = monmap->get_name(m->get_source_addr());
   if (monmap->get_epoch() == 0 && peer_name.compare(0, 7, "noname-") == 0) {
     dout(10) << " renaming peer " << m->get_source_addr() << " "
@@ -2085,6 +2127,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
   }
 
   // new initial peer?
+  // seed 期学到初始 mon 的真实地址（原为空白）：写入 monmap 后重对齐。
   if (monmap->get_epoch() == 0 &&
       monmap->contains(m->name) &&
       monmap->get_addrs(m->name).front().is_blank_ip()) {
@@ -2110,6 +2153,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
 
   entity_addrvec_t other = m->get_source_addrs();
 
+  // paxos 版本比较：对方太旧忽略；我落后过多则转 Synchronizing 追数据。
   if (m->paxos_last_version < sync_last_committed_floor) {
     dout(10) << " peer paxos versions [" << m->paxos_first_version
 	     << "," << m->paxos_last_version << "] < my sync_last_committed_floor "
@@ -2124,6 +2168,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
 	       << " (too far ahead)"
 	       << dendl;
       cancel_probe_timeout();
+      // 我的日志起点都在对方区间之后：全量同步。
       sync_start(other, true);
       return;
     }
@@ -2133,6 +2178,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
 	       << " (too far ahead)"
 	       << dendl;
       cancel_probe_timeout();
+      // 版本漂移超过 paxos_max_join_drift：同步追平。
       sync_start(other, false);
       return;
     }
@@ -2156,6 +2202,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
   }
 
   // is there an existing quorum?
+  // 决策一：对方已有 quorum。
   if (m->quorum.size()) {
     dout(10) << " existing quorum " << m->quorum << dendl;
 
@@ -2174,8 +2221,10 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
 	!monmap->get_addrs(name).front().is_blank_ip() &&
 	(!need_set_crush_loc || (*map_crush_loc == crush_loc))) {
       // i'm part of the cluster; just initiate a new election
+      // 重点调用：我是正式成员，发起选举加入 quorum。
       start_election();
     } else {
+      // 不在 monmap/地址空白/位置不符：发 MMonJoin 申请加入集群。
       dout(10) << " ready to join, but i'm not in the monmap/"
 	"my addr is blank/location is wrong, trying to join" << dendl;
       send_mon_message(new MMonJoin(monmap->fsid, name,
@@ -2184,6 +2233,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
 		       m->leader);
     }
   } else {
+    // 决策二：对方也无 quorum（各自报到），攒够法定人数再选举。
     if (monmap->contains(m->name)) {
       dout(10) << " mon." << m->name << " is outside the quorum" << dendl;
       outside_quorum.insert(m->name);
@@ -2196,6 +2246,7 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
     dout(10) << " outside_quorum now " << outside_quorum << ", need " << need << dendl;
     if (outside_quorum.size() >= need) {
       if (outside_quorum.count(name)) {
+        // 重点调用：失联成员攒够法定人数且含我，发起选举重建 quorum。
         dout(10) << " that's enough to form a new quorum, calling election" << dendl;
         start_election();
       } else {
@@ -4519,6 +4570,11 @@ void Monitor::waitlist_or_zap_client(MonOpRequestRef op)
   }
 }
 
+/**
+ * mon 消息分发总入口：建立/校验会话后转 dispatch_op 按类型分派。
+ *
+ * 未鉴权客户端在同步期/离开 quorum 期间会被挂起或断开。
+ */
 void Monitor::_ms_dispatch(Message *m)
 {
   if (is_shutdown()) {
@@ -4526,14 +4582,17 @@ void Monitor::_ms_dispatch(Message *m)
     return;
   }
 
+  // 包装成 MonOpRequest（跟踪处理生命周期）。
   MonOpRequestRef op = op_tracker.create_request<MonOpRequest>(m);
   bool src_is_mon = op->is_src_mon();
   op->mark_event("mon:_ms_dispatch");
   MonSession *s = op->get_session();
+  // 会话已关闭：丢弃。
   if (s && s->closed) {
     return;
   }
 
+  // mon 来源：连接特性（features）变化时重建会话。
   if (src_is_mon && s) {
     ConnectionRef con = m->get_connection();
     if (con->get_messenger() && con->get_features() != s->con_features) {
@@ -4563,6 +4622,7 @@ void Monitor::_ms_dispatch(Message *m)
     // and considering that we are creating a new session it is safe to
     // assume that the sender hasn't authenticated yet, so we have no way
     // of assessing whether we should handle it or not.
+    // 新会话首消息必须是 AUTH/MON_GET_MAP/PING，否则视为迷途消息丢弃。
     if (!src_is_mon && (m->get_type() != CEPH_MSG_AUTH &&
 			m->get_type() != CEPH_MSG_MON_GET_MAP &&
 			m->get_type() != CEPH_MSG_PING)) {
@@ -4590,6 +4650,7 @@ void Monitor::_ms_dispatch(Message *m)
 
     if (src_is_mon) {
       // give it monitor caps; the peer type has been authenticated
+      // mon 来源已认证：直接授予 monitor 全权 caps。
       dout(5) << __func__ << " setting monitor caps on this connection" << dendl;
       if (!s->caps.is_allow_all()) // but no need to repeatedly copy
         s->caps = mon_caps;
@@ -4602,6 +4663,7 @@ void Monitor::_ms_dispatch(Message *m)
 
   ceph_assert(s);
 
+  // 会话超时续期；从 auth_handler 同步实体名/全局 id。
   s->session_timeout = ceph_clock_now();
   s->session_timeout += g_conf()->mon_session_timeout;
 
@@ -4615,20 +4677,27 @@ void Monitor::_ms_dispatch(Message *m)
 	   << " (" << s->global_id_status
 	   << ") caps " << s->caps.get_str() << dendl;
 
+  // stretch 模式下会话归属校验。
   if (!session_stretch_allowed(s, op)) {
     return;
   }
+  // 同步中/未鉴权且已离开 quorum：客户端消息挂起或断开（waitlist）。
   if ((is_synchronizing() ||
        (!s->authenticated && !exited_quorum.is_zero())) &&
       !src_is_mon &&
       m->get_type() != CEPH_MSG_PING) {
     waitlist_or_zap_client(op);
   } else {
+    // 重点调用：按消息类型分派到各处理函数。
     dispatch_op(op);
   }
   return;
 }
 
+/**
+ * 按消息类型分派：四段 switch 依次处理免鉴权消息、基础消息、
+ * 各 PaxosService 服务消息、mon 间消息（探测/选举/Paxos/同步）。
+ */
 void Monitor::dispatch_op(MonOpRequestRef op)
 {
   op->mark_event("mon:dispatch_op");
@@ -4643,6 +4712,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
   /* we will consider the default type as being 'monitor' until proven wrong */
   op->set_type_monitor();
   /* deal with all messages that do not necessarily need caps */
+  // 第一段：无需鉴权的消息（AUTH/PING/COMMAND）。
   switch (op->get_req()->get_type()) {
     // auth
     case MSG_MON_GLOBAL_ID:
@@ -4650,6 +4720,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
     case CEPH_MSG_AUTH:
       op->set_type_service();
       /* no need to check caps here */
+      // 重点调用：交给 AuthMonitor（PAXOS_AUTH）处理鉴权。
       paxos_service[PAXOS_AUTH]->dispatch(op);
       return;
 
@@ -4662,6 +4733,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
       return;
   }
 
+  // 未鉴权的消息到此为止，丢弃。
   if (!op->get_session()->authenticated) {
     dout(5) << __func__ << " " << op->get_req()->get_source_inst()
             << " is not authenticated, dropping " << *(op->get_req())
@@ -4697,6 +4769,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
     return;
   }
 
+  // 第二段：客户端可发的基础消息（取 monmap/配置/订阅）。
   switch (op->get_req()->get_type()) {
     case CEPH_MSG_MON_GET_MAP:
       handle_mon_get_map(op);
@@ -4715,6 +4788,8 @@ void Monitor::dispatch_op(MonOpRequestRef op)
   /* well, maybe the op belongs to a service... */
   op->set_type_service();
   /* deal with all messages which caps should be checked somewhere else */
+  // 第三段：按服务路由到各 PaxosService（OSDMap/MDSMap/Mgr/Log 等，
+  // caps 由各服务自行检查）。
   switch (op->get_req()->get_type()) {
 
     // OSDs
@@ -4776,6 +4851,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
   /* messages we, the Monitor class, need to deal with
    * but may be sent by clients. */
 
+  // 以下要求 mon 读权限。
   if (!op->get_session()->is_capable("mon", MON_CAP_R)) {
     dout(5) << __func__ << " " << op->get_req()->get_source_inst()
             << " not enough caps for " << *(op->get_req()) << " -- dropping"
@@ -4790,6 +4866,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
       return;
   }
 
+  // 非 mon 来源到此为止：以下都是 mon 间消息。
   if (!op->is_src_mon()) {
     dout(1) << __func__ << " unexpected monitor message from"
             << " non-monitor entity " << op->get_req()->get_source_inst()
@@ -4798,6 +4875,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
   }
 
   /* messages that should only be sent by another monitor */
+  // 第四段：mon 间消息（探测/同步/选举/Paxos/转发）。
   switch (op->get_req()->get_type()) {
 
     case MSG_ROUTE:
@@ -4805,6 +4883,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
       return;
 
     case MSG_MON_PROBE:
+      // 重点调用：探测消息分派（OP_PROBE 应答生产 / OP_REPLY 消费）。
       handle_probe(op);
       return;
 
@@ -4847,6 +4926,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
         }
 
         // sanitize
+        // epoch 更新的消息说明 monmap 变了，回 bootstrap 重新对齐。
         if (pm->epoch > get_epoch()) {
           bootstrap();
           return;
@@ -4855,6 +4935,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
           return;
         }
 
+        // 重点调用：交给 Paxos 状态机处理提案/表决消息。
         paxos->dispatch(op);
       }
       return;

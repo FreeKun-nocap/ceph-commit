@@ -905,8 +905,7 @@ int main(int argc, const char **argv)
   mgr_msgr->start();
 
   mon->set_mon_crush_location(crush_loc);
-  // 重点调用：进入 Monitor 初始化（init_paxos、boot/probing/选举），
-  // 本阅读路径的下一层入口。
+  // 重点调用：进入 Monitor 初始化（init_paxos、boot/probing/选举）。
   mon->init();
 
   register_async_signal_handler_oneshot(SIGINT, handle_mon_signal);
