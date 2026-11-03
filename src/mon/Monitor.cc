@@ -2268,17 +2268,23 @@ void Monitor::join_election()
   logger->inc(l_mon_num_elections);
 }
 
+/**
+ * 发起选举：清空运行状态转入 ELECTING，交给 Elector 收发选票。
+ */
 void Monitor::start_election()
 {
   dout(10) << "start_election" << dendl;
+  // 等未完成的 paxos 写落盘，再清运行期状态（会话/提案等）。
   wait_for_paxos_write();
   _reset();
   state = STATE_ELECTING;
 
+  // 选举统计计数。
   logger->inc(l_mon_num_elections);
   logger->inc(l_mon_election_call);
 
   clog->info() << "mon." << name << " calling monitor election";
+  // 重点调用：进入 Elector 选举流程（发 MMonElection 收集选票）。
   elector.call_election();
 }
 

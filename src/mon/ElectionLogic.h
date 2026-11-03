@@ -220,6 +220,7 @@ public:
    * If we are acked by ElectionOwner::paxos_size() peers, we will declare
    * victory.
    */
+  // 我的票箱——本选举周期里已经投了我的 mon 集合（set<int>，元素是 rank）
   std::set<int> acked_me;
 
   ElectionLogic(ElectionOwner *e, election_strategy es, ConnectionTracker *t,

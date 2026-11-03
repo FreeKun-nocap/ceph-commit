@@ -119,32 +119,44 @@ void ElectionLogic::connectivity_bump_epoch_in_election(epoch_t mepoch)
   }
 }
 
+/**
+ * 发起选举：自己成为候选，清票箱自投一票后向所有 mon 发 PROPOSE 宣战。
+ *
+ * 选举用奇数 epoch 标识（偶数则 bump 到奇数）。
+ */
 void ElectionLogic::start()
 {
+  // participating 是 ElectionLogic 里的一个布尔标志：本 mon 是否参与选举（既不竞选，也不投票）。
+  // 不参与选举（stop_participating 过）：直接退出。
   if (!participating) {
     ldout(cct, 0) << "not starting new election -- not participating" << dendl;
     return;
   }
   ldout(cct, 5) << "start -- can i be leader?" << dendl;
 
+  // 清空票箱并重置选举逻辑状态。
   acked_me.clear();
   init();
   
   // start by trying to elect me
+  // epoch 约定：奇数 = 选举周期；偶数先 +1，已是奇数则校验持久化状态。
   if (epoch % 2 == 0) {
     bump_epoch(epoch+1);  // odd == election cycle
   } else {
     elector->validate_store();
   }
+  // 自投一票，并宣布自己为候选。
   acked_me.insert(elector->get_my_rank());
   clear_live_election_state();
   reset_stable_tracker();
   electing_me = true;
 
+  // CONNECTIVITY 策略附带连通性追踪表，供对方评估投谁。
   bufferlist bl;
   if (strategy == CONNECTIVITY) {
     stable_peer_tracker->encode(bl);
   }
+  // 重点调用：向各 mon 发 OP_PROPOSE 宣战；_start 登记自身信息并启动超时定时器。
   elector->propose_to_peers(epoch, bl);
   elector->_start();
 }
@@ -226,14 +238,19 @@ bool ElectionLogic::propose_classic_prefix(int from, epoch_t mepoch)
   return false;
 }
 
+/**
+ * 收到 PROPOSE 的决策入口：过滤自发消息后按选举策略分派（让贤/反宣）。
+ */
 void ElectionLogic::receive_propose(int from, epoch_t mepoch,
 				    const ConnectionTracker *ct)
 {
   ldout(cct, 20) << __func__ << " from " << from << dendl;
+  // 收到自己 rank 的 PROPOSE 属异常（启动竞态），丢弃。
   if (from == elector->get_my_rank()) {
     lderr(cct) << "I got a propose from my own rank, hopefully this is startup weirdness,dropping" << dendl;
     return;
   }
+  // 按策略分派到各自的优先级比较处理器。
   switch (strategy) {
   case CLASSIC:
     propose_classic_handler(from, mepoch);
@@ -249,17 +266,24 @@ void ElectionLogic::receive_propose(int from, epoch_t mepoch,
   }
 }
 
+/**
+ * DISALLOW 策略决策：CLASSIC 的 rank 比较 + 黑名单（disallowed_leaders 不可当 leader）。
+ */
 void ElectionLogic::propose_disallow_handler(int from, epoch_t mepoch)
 {
+  // 重点调用：共用前置处理（epoch 校验等）。
   if (propose_classic_prefix(from, mepoch)) {
     return;
   }
+  // 双方是否在领导黑名单上。
   const set<int>& disallowed_leaders = elector->get_disallowed_leaders();
   int my_rank = elector->get_my_rank();
   bool me_disallowed = disallowed_leaders.count(my_rank);
   bool from_disallowed = disallowed_leaders.count(from);
+  // 我赢：我没被禁，且（我 rank 更小或对方被禁）。
   bool my_win = !me_disallowed && // we are allowed to lead
     (my_rank < from || from_disallowed); // we are a better choice than them
+  // 对方赢：对方没被禁，比我或已 ack 的人选都更优。
   bool their_win = !from_disallowed && // they are allowed to lead
     (my_rank > from || me_disallowed) && // they are a better choice than us
     (leader_acked < 0 || leader_acked >= from); // they are a better choice than our previously-acked choice
@@ -268,10 +292,12 @@ void ElectionLogic::propose_disallow_handler(int from, epoch_t mepoch)
   if (my_win) {
     // i would win over them.
     if (leader_acked >= 0) {        // we already acked someone
+      // 已让贤给更优者：维持决定。
       ceph_assert(leader_acked < from || from_disallowed);  // and they still win, of course
       ldout(cct, 5) << "no, we already acked " << leader_acked << dendl;
     } else {
       // wait, i should win!
+      // 未让贤过：反宣。
       if (!electing_me) {
 	elector->trigger_new_election();
       }
@@ -279,6 +305,7 @@ void ElectionLogic::propose_disallow_handler(int from, epoch_t mepoch)
   } else {
     // they would win over me
     if (their_win) {
+      // 重点调用：让贤，回 OP_ACK。
       defer(from);
     } else {
       // ignore them!
@@ -287,30 +314,40 @@ void ElectionLogic::propose_disallow_handler(int from, epoch_t mepoch)
   }
 }
 
+/**
+ * CLASSIC 策略决策：按 rank 比较优先级，决定让贤（defer）还是反宣（trigger_new_election）。
+ */
 void ElectionLogic::propose_classic_handler(int from, epoch_t mepoch)
 {
+  // 重点调用：共用前置处理（epoch 校验等），返回 true 表示已处理完。
   if (propose_classic_prefix(from, mepoch)) {
     return;
   }
   if (elector->get_my_rank() < from) {
     // i would win over them.
+    // 我 rank 更小：按规则我该赢。
     if (leader_acked >= 0) {        // we already acked someone
+      // 已让贤过更小 rank 的候选：维持原决定，不理睬此人。
       ceph_assert(leader_acked < from);  // and they still win, of course
       ldout(cct, 5) << "no, we already acked " << leader_acked << dendl;
     } else {
       // wait, i should win!
+      // 还没让贤过：我才是赢家——未参选则发起反宣。
       if (!electing_me) {
 	elector->trigger_new_election();
       }
     }
   } else {
     // they would win over me
+    // 对方 rank 更小：对方该赢。
     if (leader_acked < 0 || // haven't acked anyone yet, or
 	leader_acked > from ||   // they would win over who you did ack, or
 	leader_acked == from) {  // this is the guy we're already deferring to
+      // 重点调用：让贤——回 OP_ACK 认可对方（记入对方票箱）。
       defer(from);
     } else {
       // ignore them!
+      // 已让贤给更小 rank 的人：忽略此人。
       ldout(cct, 5) << "no, we already acked " << leader_acked << dendl;
     }
   }
@@ -334,6 +371,12 @@ double ElectionLogic::connectivity_election_score(int rank)
   return score;
 }
 
+/**
+ * CONNECTIVITY 策略决策：黑名单 + 连通性评分比较（平分看 rank）。
+ *
+ * 让贤前须确认已 ack 的 leader 也会让给对方（保持传递性）；
+ * 评分有分歧时 bump epoch 重新选举。
+ */
 void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
 						 const ConnectionTracker *ct)
 {
@@ -341,11 +384,13 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
     << mepoch << " epoch: " << epoch << dendl;
   ldout(cct, 30) << "last_election_winner: " << last_election_winner << dendl;
   // ignore proposal from marked down mons if we are the tiebreaker
+  // stretch 仲裁者忽略已被标记宕机 mon 的 PROPOSE。
   if (elector->is_tiebreaker(elector->get_my_rank()) &&
       elector->is_stretch_marked_down_mons(from)) {
     ldout(cct, 10) << "Ignoring proposal from marked down mon " << from << dendl;
     return;
   }
+  // 防抖动：稳定期非 quorum 成员的 PROPOSE，若不会改变我的投票则丢弃。
   if ((epoch % 2 == 0) &&
       last_election_winner != elector->get_my_rank() &&
       !elector->is_current_member(from)) {
@@ -395,6 +440,7 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
     return;
   }
 
+  // 三方评分：我、对方、已让贤对象（分数 -1 表示不可当 leader）。
   int my_rank = elector->get_my_rank();
   double my_score = connectivity_election_score(my_rank);
   double from_score = connectivity_election_score(from);
@@ -412,6 +458,7 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
 		 << ",leader_score=" << leader_score
      << ",disallowed_leaders=" << elector->get_disallowed_leaders() << dendl;
 
+  // 胜负规则：评分高者胜，平分看 rank；分数 <0（被禁）不参与。
   bool my_win = (my_score >= 0) && // My score is non-zero; I am allowed to lead
     ((my_rank < from && my_score >= from_score) || // We have same scores and I have lower rank, or
      (my_score > from_score)); // my score is higher
@@ -442,6 +489,7 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
       if (leader_acked >= 0 && from != leader_acked) {
 	// we have to make sure our acked leader will ALSO defer to them, or else
 	// we can't, to maintain guarantees!
+	// 换票前须确认已让贤的 leader 也会让给对方，保证胜者传递性。
   ldout(cct, 10) << " make sure acked leader defer to: " << from << dendl;
 	double leader_from_score;
 	int leader_from_liveness;
@@ -455,9 +503,10 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
 				     &leader_leader_liveness);
 	if ((from < leader_acked && leader_from_score >= leader_leader_score) ||
 	    (leader_from_score > leader_leader_score)) {
-    ldout(cct, 10) << "defering to " << from << dendl;
-	  defer(from);
-	  leader_peer_tracker.reset(new ConnectionTracker(*ct));
+	ldout(cct, 10) << "defering to " << from << dendl;
+	// 重点调用：让贤给对方，并记下对方的连通性视图。
+	defer(from);
+	leader_peer_tracker.reset(new ConnectionTracker(*ct));
 	} else { // we can't defer to them *this* round even though they should win...
 	  double cur_leader_score, cur_from_score;
 	  int cur_leader_live, cur_from_live;
@@ -466,8 +515,9 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
 	  if ((from < leader_acked && cur_from_score >= cur_leader_score) ||
 	      (cur_from_score > cur_leader_score)) {
 	    ldout(cct, 5) << "Bumping epoch and starting new election; acked "
-			  << leader_acked << " should defer to " << from
-			  << " but there is score disagreement!" << dendl;
+	  << leader_acked << " should defer to " << from
+	  << " but there is score disagreement!" << dendl;
+	    // 双方评分视图分歧：bump epoch 重选打破僵局。
 	    bump_epoch(epoch+1);
 	    start();
 	  } else {

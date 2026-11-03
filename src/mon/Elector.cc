@@ -273,6 +273,9 @@ void Elector::message_victory(const std::set<int>& quorum)
 }
 
 
+/**
+ * 收到其他 mon 的 PROPOSE 宣战：版本/特性门槛检查后转交 ElectionLogic 决策（让贤或反宣）。
+ */
 void Elector::handle_propose(MonOpRequestRef op)
 {
   op->mark_event("elector:handle_propose");
@@ -280,6 +283,7 @@ void Elector::handle_propose(MonOpRequestRef op)
   dout(5) << "handle_propose from " << m->get_source() << dendl;
   int from = m->get_source().num();
 
+  // 选举消息必须用奇数 epoch（选举周期约定）。
   ceph_assert(m->epoch % 2 == 1); // election
   uint64_t required_features = mon->get_required_features();
   mon_feature_t required_mon_features = mon->get_required_mon_features();
@@ -290,6 +294,7 @@ void Elector::handle_propose(MonOpRequestRef op)
            << " " << m->mon_features
            << dendl;
 
+  // 门槛三连检查：缺特性/版本过旧/缺 mon 特性者不配当候选，回 NAK 拒绝。
   if ((required_features ^ m->get_connection()->get_features()) &
       required_features) {
     dout(5) << " ignoring propose from mon" << from
@@ -311,10 +316,12 @@ void Elector::handle_propose(MonOpRequestRef op)
             << dendl;
     nak_old_peer(op);
   }
+  // 解析对方附带的连通性追踪表（CONNECTIVITY 策略用）。
   ConnectionTracker *oct = NULL;
   if (m->sharing_bl.length()) {
     oct = new ConnectionTracker(m->sharing_bl, mon->cct);
   }
+  // 重点调用：转交选举逻辑决策（让贤回 ACK / 自己更高则反宣 PROPOSE）。
   logic.receive_propose(from, m->epoch, oct);
   delete oct;
 }
