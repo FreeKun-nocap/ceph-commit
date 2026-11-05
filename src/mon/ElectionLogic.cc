@@ -161,8 +161,12 @@ void ElectionLogic::start()
   elector->_start();
 }
 
+/**
+ * 让贤：放弃竞选（若在选）并记下投票对象，经 _defer_to 回 OP_ACK 投出这一票。
+ */
 void ElectionLogic::defer(int who)
 {
+  // 断言让贤对象确实更优：CLASSIC 看 rank，另两种看黑名单。
   if (strategy == CLASSIC) {
       ldout(cct, 5) << "defer to " << who << dendl;
       ceph_assert(who < elector->get_my_rank());
@@ -173,12 +177,15 @@ void ElectionLogic::defer(int who)
 
   if (electing_me) {
     // drop out
+    // 我本是候选：退选，清空票箱。
     acked_me.clear();
     electing_me = false;
   }
 
   // ack them
+  // 记下投票对象（leader_acked），并投出这一票。
   leader_acked = who;
+  // 重点调用：发 OP_ACK 给对方（进入对方的 acked_me 票箱）。
   elector->_defer_to(who);
 }
 
@@ -201,19 +208,26 @@ void ElectionLogic::end_election_period()
 }
 
 
+/**
+ * 宣胜：票箱转为新 quorum，epoch 回偶数（选举结束），交给 Elector 广播 OP_VICTORY。
+ */
 void ElectionLogic::declare_victory()
 {
   ldout(cct, 5) << "I win! acked_me=" << acked_me << dendl;
+  // 记录本次胜者（供防抖动等判断参考）。
   last_election_winner = elector->get_my_rank();
   last_voted_for = last_election_winner;
   clear_live_election_state();
 
+  // 票箱即新 quorum 成员集（投我的 + 我自己）。
   set<int> new_quorum;
   new_quorum.swap(acked_me);
   
+  // epoch +1 回到偶数：选举周期结束，进入稳定期。
   ceph_assert(epoch % 2 == 1);  // election
   bump_epoch(epoch+1);     // is over!
 
+  // 重点调用：向所有 mon 广播 OP_VICTORY（附新 quorum）。
   elector->message_victory(new_quorum);
 }
 
@@ -287,8 +301,7 @@ void ElectionLogic::propose_disallow_handler(int from, epoch_t mepoch)
   bool their_win = !from_disallowed && // they are allowed to lead
     (my_rank > from || me_disallowed) && // they are a better choice than us
     (leader_acked < 0 || leader_acked >= from); // they are a better choice than our previously-acked choice
-    
-  
+
   if (my_win) {
     // i would win over them.
     if (leader_acked >= 0) {        // we already acked someone
@@ -538,9 +551,15 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
   }
 }
 
+/**
+ * 计票：收下这一票，票数达法定人数即 declare_victory 当选。
+ *
+ * 已退选者忽略选票；收到更新 epoch 说明重启过，重新参选。
+ */
 void ElectionLogic::receive_ack(int from, epoch_t from_epoch)
 {
   ceph_assert(from_epoch % 2 == 1); // sender in an election epoch
+  // 对方 epoch 更新：说明我重启丢过状态，bump 后重新发起选举。
   if (from_epoch > epoch) {
     ldout(cct, 5) << "woah, that's a newer epoch, i must have rebooted.  bumping and re-starting!" << dendl;
     bump_epoch(from_epoch);
@@ -549,13 +568,16 @@ void ElectionLogic::receive_ack(int from, epoch_t from_epoch)
   }
   // is that _everyone_?
   if (electing_me) {
+    // 票入箱；收齐法定人数（paxos_size）直接宣胜。
     acked_me.insert(from);
     if (acked_me.size() == elector->paxos_size()) {
       // if yes, shortcut to election finish
+      // 重点调用：发 OP_VICTORY 宣胜并结束选举。
       declare_victory();
     }
   } else {
     // ignore, i'm deferring already.
+    // 我已退选（让贤给别人）：选票无意义，忽略。
     ceph_assert(leader_acked >= 0);
   }
 }

@@ -2334,6 +2334,10 @@ void Monitor::_finish_svc_election()
   }
 }
 
+/**
+ * leader 就职：记录 quorum 后初始化 Paxos leader 侧，
+ * 先由 monmon 敲定 monmap（第一个提案），再收尾选举并启动健康/时钟检查。
+ */
 void Monitor::win_election(epoch_t epoch, const set<int>& active, uint64_t features,
                            const mon_feature_t& mon_features,
 			   ceph_release_t min_mon_release,
@@ -2343,8 +2347,9 @@ void Monitor::win_election(epoch_t epoch, const set<int>& active, uint64_t featu
 	   << " features " << features
            << " mon_features " << mon_features
 	   << " min_mon_release " << min_mon_release
-           << dendl;
+	   << dendl;
   ceph_assert(is_electing());
+  // 转入 LEADER 状态，记录 quorum 成员/公共能力/成员元数据。
   state = STATE_LEADER;
   leader_since = ceph_clock_now();
   quorum_since = mono_clock::now();
@@ -2361,12 +2366,15 @@ void Monitor::win_election(epoch_t epoch, const set<int>& active, uint64_t featu
 
   set_leader_commands(get_local_commands(mon_features));
 
+  // 重点调用：Paxos leader 侧初始化。
   paxos->leader_init();
   // NOTE: tell monmap monitor first.  This is important for the
   // bootstrap case to ensure that the very first paxos proposal
   // codifies the monmap.  Otherwise any manner of chaos can ensue
   // when monitors are call elections or participating in a paxos
   // round without agreeing on who the participants are.
+  // 重点调用：必须先让 monmon（MonMapMonitor）敲定 monmap——
+  // 首个提案必须固化成员表，否则后续 Paxos 各方对参与者没有共识。
   monmon()->election_finished();
   _finish_svc_election();
 
@@ -2387,13 +2395,16 @@ void Monitor::win_election(epoch_t epoch, const set<int>& active, uint64_t featu
     // FIXME: This is a bit sloppy because we aren't guaranteed to submit
     // a new transaction immediately after the election finishes.  We should
     // do that anyway for other reasons, though.
+    // 把成员元数据写入首个待提交事务。
     MonitorDBStore::TransactionRef t = paxos->get_pending_transaction();
     bufferlist bl;
     encode(m, bl);
     t->put(MONITOR_STORE_PREFIX, "last_metadata", bl);
   }
   elector.process_pending_pings();
+  // 重点调用：选举收尾（提交状态、恢复正常服务）。
   finish_election();
+  // 多 mon 且非 seed 期：启动时钟校验和健康上报。
   if (monmap->size() > 1 &&
       monmap->get_epoch() > 0) {
     timecheck_start();
@@ -2421,11 +2432,17 @@ void Monitor::win_election(epoch_t epoch, const set<int>& active, uint64_t featu
   }
 }
 
+/**
+ * peon 就职：记录 leader/quorum 后初始化 Paxos peon 侧并收尾选举。
+ *
+ * 与 win_election 对称（那边是 leader 就职）。
+ */
 void Monitor::lose_election(epoch_t epoch, set<int> &q, int l,
                             uint64_t features,
                             const mon_feature_t& mon_features,
 			    ceph_release_t min_mon_release)
 {
+  // 转入 PEON 状态，记录新 leader 和 quorum 成员/公共能力。
   state = STATE_PEON;
   leader_since = utime_t();
   quorum_since = mono_clock::now();
@@ -2441,11 +2458,14 @@ void Monitor::lose_election(epoch_t epoch, set<int> &q, int l,
 	   << " min_mon_release " << min_mon_release
            << dendl;
 
+  // 重点调用：Paxos peon 侧初始化（准备接受 leader 的提案）。
   paxos->peon_init();
+  // 通知各 PaxosService 选举结束。
   _finish_svc_election();
 
   logger->inc(l_mon_election_lose);
   elector.process_pending_pings();
+  // 重点调用：选举收尾（提交状态、恢复正常服务）。
   finish_election();
 }
 

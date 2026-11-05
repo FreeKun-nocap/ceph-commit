@@ -172,8 +172,12 @@ void Elector::_start()
   reset_timer();
 }
 
+/**
+ * 让贤动作的消息出口：向候选 mon 发 OP_ACK（带上自身特性/版本/元数据供其汇总）。
+ */
 void Elector::_defer_to(int who)
 {
+  // 构造 ACK：携带连通性追踪表和选举策略信息。
   MMonElection *m = new MMonElection(MMonElection::OP_ACK, get_epoch(),
 				     peer_tracker.get_encoded_bl(),
 				     logic.strategy, mon->monmap);
@@ -184,6 +188,7 @@ void Elector::_defer_to(int who)
   mon->send_mon_message(m, who);
   
   // set a timer
+  // 加超时定时器：给候选多留 1 秒宣胜，超时未胜则后续处理。
   reset_timer(1.0);  // give the leader some extra time to declare victory
 }
 
@@ -228,8 +233,12 @@ void Elector::assimilate_connection_reports(const bufferlist& tbl)
   peer_tracker.receive_peer_report(pct);
 }
 
+/**
+ * 宣胜广播：汇总新 quorum 的公共能力和元数据，向成员发 OP_VICTORY，并本地就职。
+ */
 void Elector::message_victory(const std::set<int>& quorum)
 {
+  // 汇总 quorum 能力：特性取交集，版本取最低，收集各成员元数据。
   uint64_t cluster_features = CEPH_FEATURES_ALL;
   mon_feature_t mon_features = ceph::features::mon::get_supported();
   map<int,Metadata> metadata;
@@ -247,10 +256,12 @@ void Elector::message_victory(const std::set<int>& quorum)
     }
   }
 
+  // 选举结束，取消超时定时器。
   cancel_timer();
   
 
   // tell everyone!
+  // 向其他 quorum 成员广播 OP_VICTORY（附 quorum 与公共能力）。
   for (set<int>::iterator p = quorum.begin();
        p != quorum.end();
        ++p) {
@@ -267,6 +278,7 @@ void Elector::message_victory(const std::set<int>& quorum)
   }
 
   // tell monitor
+  // 重点调用：本地就职为 leader（进入 Paxos leader 初始化）。
   mon->win_election(get_epoch(), quorum,
                     cluster_features, mon_features, min_mon_release,
 		    metadata);
@@ -326,6 +338,9 @@ void Elector::handle_propose(MonOpRequestRef op)
   delete oct;
 }
 
+/**
+ * 收到让贤方的 OP_ACK：门槛检查后登记对方信息，转交 ElectionLogic 计票。
+ */
 void Elector::handle_ack(MonOpRequestRef op)
 {
   op->mark_event("elector:handle_ack");
@@ -333,7 +348,9 @@ void Elector::handle_ack(MonOpRequestRef op)
   dout(5) << "handle_ack from " << m->get_source() << dendl;
   int from = m->get_source().num();
 
+  // ACK 必须对应当前选举 epoch。
   ceph_assert(m->epoch == get_epoch());
+  // 门槛检查：缺特性/缺 mon 特性的票不收。
   uint64_t required_features = mon->get_required_features();
   if ((required_features ^ m->get_connection()->get_features()) &
       required_features) {
@@ -353,6 +370,7 @@ void Elector::handle_ack(MonOpRequestRef op)
 
   if (logic.electing_me) {
     // thanks
+    // 登记投票方的特性/版本/元数据（当选后汇总 quorum 能力用）。
     peer_info[from].cluster_features = m->get_connection()->get_features();
     peer_info[from].mon_features = m->mon_features;
     peer_info[from].mon_release = m->mon_release;
@@ -372,9 +390,13 @@ void Elector::handle_ack(MonOpRequestRef op)
     *_dout << " }" << dendl;
   }
 
+  // 重点调用：计票（加入 acked_me，收齐法定人数则 declare_victory）。
   logic.receive_ack(from, m->epoch);
 }
 
+/**
+ * 收到 OP_VICTORY：校验宣胜合法性后认输，就职为 peon 并缓存 leader 命令表。
+ */
 void Elector::handle_victory(MonOpRequestRef op)
 {
   op->mark_event("elector:handle_victory");
@@ -385,19 +407,23 @@ void Elector::handle_victory(MonOpRequestRef op)
           << dendl;
   int from = m->get_source().num();
 
+  // 重点调用：校验对方确实该赢（优先级/epoch 合理），否则拒绝认输。
   bool accept_victory = logic.receive_victory_claim(from, m->epoch);
 
   if (!accept_victory) {
     return;
   }
 
+  // 重点调用：本地就职为 peon（进入 Paxos peon 初始化）。
   mon->lose_election(get_epoch(), m->quorum, from,
                      m->quorum_features, m->mon_features, m->mon_release);
 
   // cancel my timer
+  // 选举结束，取消超时定时器。
   cancel_timer();
 
   // stash leader's commands
+  // 缓存 leader 下发的命令表（管理命令能力集）。
   ceph_assert(m->sharing_bl.length());
   vector<MonCommand> new_cmds;
   auto bi = m->sharing_bl.cbegin();
