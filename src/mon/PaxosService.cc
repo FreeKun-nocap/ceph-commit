@@ -306,8 +306,14 @@ void PaxosService::election_finished()
   _active();
 }
 
+/**
+ * 选举结束后服务激活：leader 建 pending 状态，首次（无已提交值）立即初始化提案。
+ *
+ * 未激活时挂 C_Active 等 Paxos 激活后回调重入。
+ */
 void PaxosService::_active()
 {
+  // 提案进行中：等 C_Committed 回调再走。
   if (is_proposing()) {
     dout(10) << __func__ << " - proposing" << dendl;
     return;
@@ -322,6 +328,7 @@ void PaxosService::_active()
      * our proposed value, to waiting for the Paxos to become active once an
      * election is finished.
      */
+    // Paxos 还没激活：挂回调，激活后自动重入本函数。
     class C_Active : public Context {
       PaxosService *svc;
     public:
@@ -331,6 +338,7 @@ void PaxosService::_active()
 	  svc->_active();
       }
     };
+    // 重点调用：注册激活等待回调。
     wait_for_active_ctx(new C_Active(this));
     return;
   }
@@ -339,6 +347,7 @@ void PaxosService::_active()
   // create pending state?
   if (mon.is_leader()) {
     dout(7) << __func__ << " creating new pending" << dendl;
+    // 重点调用：创建 pending 状态（虚函数，各 service 实现自己的草稿区）。
     if (!have_pending) {
       create_pending();
       have_pending = true;
@@ -346,17 +355,20 @@ void PaxosService::_active()
 
     if (get_last_committed() == 0) {
       // create initial state
+      // bootstrap 首次：生成初始状态并立即提案（首个提案即固化本服务数据）。
       create_initial();
       propose_pending();
       return;
     }
   } else {
+    // 非 leader 不提案。
     dout(7) << __func__ << " we are not the leader, hence we propose nothing!" << dendl;
   }
 
   // wake up anyone who came in while we were proposing.  note that
   // anyone waiting for the previous proposal to commit is no longer
   // on this list; it is on Paxos's.
+  // 唤醒等提案完成的请求。
   finish_contexts(g_ceph_context, waiting_for_finished_proposal, 0);
 
   if (mon.is_leader())
@@ -364,6 +376,7 @@ void PaxosService::_active()
 
   // NOTE: it's possible that this will get called twice if we commit
   // an old paxos value.  Implementations should be mindful of that.
+  // 通知实现类"服务已激活"（各 service 在此处理积压业务）。
   on_active();
 }
 

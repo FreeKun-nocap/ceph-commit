@@ -126,8 +126,13 @@ void MonmapMonitor::update_from_paxos(bool *need_bootstrap)
   mon.notify_new_monmap(true);
 }
 
+/**
+ * 创建 monmap 的 pending 草稿：复制当前 monmap 并把 epoch +1，
+ * 后续修改都在这份草稿上进行，经 Paxos 提交后才生效。
+ */
 void MonmapMonitor::create_pending()
 {
+  // 复制当前 monmap 为草稿，epoch+1 预留下一版编号。
   pending_map = *mon.monmap;
   pending_map.epoch++;
   pending_map.last_changed = ceph_clock_now();
