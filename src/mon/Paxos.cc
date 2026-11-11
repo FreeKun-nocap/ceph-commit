@@ -616,12 +616,17 @@ void Paxos::collect_timeout()
 
 
 // leader
+/**
+ * accept 阶段入口：leader 先自己接受并持久化提案值，
+ * 再向 quorum 各成员广播 OP_BEGIN 请求接受，收齐后进入 commit。
+ */
 void Paxos::begin(bufferlist& v)
 {
   dout(10) << "begin for " << last_committed+1 << " " 
 	   << v.length() << " bytes"
 	   << dendl;
 
+  // 前置：必须是 leader、处于更新态、已握有过半成员在场、无在途提案值。
   ceph_assert(mon.is_leader());
   ceph_assert(is_updating() || is_updating_previous());
 
@@ -633,10 +638,12 @@ void Paxos::begin(bufferlist& v)
   ceph_assert(new_value.length() == 0);
 
   // accept it ourselves
+  // 自己先接受：登记进 accepted 集合（含自己一票）。
   accepted.clear();
   accepted.insert(mon.rank);
   new_value = v;
 
+  // 首次提案（last_committed==0）：补 first_committed=1 基线并入值。
   if (last_committed == 0) {
     auto t(std::make_shared<MonitorDBStore::Transaction>());
     // initial base case; set first_committed too
@@ -651,6 +658,7 @@ void Paxos::begin(bufferlist& v)
 
   // store the proposed value in the store. IF it is accepted, we will then
   // have to decode it into a transaction and apply it.
+  // 先落盘提案值（WAL）：崩溃后凭 pending_v/pending_pn 恢复未决提案。
   auto t(std::make_shared<MonitorDBStore::Transaction>());
   t->put(get_name(), last_committed+1, new_value);
 
@@ -680,8 +688,10 @@ void Paxos::begin(bufferlist& v)
 
   logger->tinc(l_paxos_begin_latency, to_timespan(end - start));
 
+  // 测试钩子：注入故障点 3。
   ceph_assert(g_conf()->paxos_kill_at != 3);
 
+  // 单成员 quorum：自己就是多数，直接进入提交。
   if (mon.get_quorum().size() == 1) {
     // we're alone, take it easy
     commit_start();
@@ -689,6 +699,7 @@ void Paxos::begin(bufferlist& v)
   }
 
   // ask others to accept it too!
+  // 重点调用：向 quorum 其他成员广播 OP_BEGIN 请求接受该值。
   for (auto p = mon.get_quorum().begin();
        p != mon.get_quorum().end();
        ++p) {
@@ -705,6 +716,7 @@ void Paxos::begin(bufferlist& v)
   }
 
   // set timeout event
+  // 设置接受超时定时器：收不齐接受时触发 accept_timeout 处理。
   accept_timeout_event = mon.timer.add_event_after(
     g_conf()->mon_accept_timeout_factor * g_conf()->mon_lease,
     new C_MonContext{&mon, [this](int r) {
@@ -715,6 +727,11 @@ void Paxos::begin(bufferlist& v)
 }
 
 // peon
+/**
+ * peon 侧接受提案：校验 pn 后把提案值落盘（标记 pending），回复 OP_ACCEPT。
+ *
+ * 此时只"接受"不生效，待 leader 发 commit 后才应用。
+ */
 void Paxos::handle_begin(MonOpRequestRef op)
 {
   op->mark_paxos_event("handle_begin");
@@ -722,6 +739,7 @@ void Paxos::handle_begin(MonOpRequestRef op)
   dout(10) << "handle_begin " << *begin << dendl;
 
   // can we accept this?
+  // pn 校验：已接受过更高提案号（更新的 leader）则忽略旧提案。
   if (begin->pn < accepted_pn) {
     dout(10) << " we accepted a higher pn " << accepted_pn << ", ignoring" << dendl;
     op->mark_paxos_event("have higher pn, ignore");
@@ -730,11 +748,13 @@ void Paxos::handle_begin(MonOpRequestRef op)
   ceph_assert(begin->pn == accepted_pn);
   ceph_assert(begin->last_committed == last_committed);
   
+  // 测试钩子：注入故障点 4。
   ceph_assert(g_conf()->paxos_kill_at != 4);
 
   logger->inc(l_paxos_begin);
 
   // set state.
+  // 转入更新态并取消租约（本轮共识期间租约失效）。
   state = STATE_UPDATING;
   lease_expire = {};  // cancel lease
 
@@ -743,6 +763,7 @@ void Paxos::handle_begin(MonOpRequestRef op)
   dout(10) << "accepting value for " << v << " pn " << accepted_pn << dendl;
   // store the accepted value onto our store. We will have to decode it and
   // apply its transaction once we receive permission to commit.
+  // 与 leader 侧相同的 WAL：落盘提案值 + pending_v/pending_pn（崩溃恢复依据）。
   auto t(std::make_shared<MonitorDBStore::Transaction>());
   t->put(get_name(), v, begin->values[v]);
 
@@ -764,9 +785,11 @@ void Paxos::handle_begin(MonOpRequestRef op)
 
   logger->tinc(l_paxos_begin_latency, to_timespan(end - start));
 
+  // 测试钩子：注入故障点 5。
   ceph_assert(g_conf()->paxos_kill_at != 5);
 
   // reply
+  // 重点调用：回复 OP_ACCEPT（接受回执），leader 计数收齐后发 commit。
   MMonPaxos *accept = new MMonPaxos(mon.get_epoch(), MMonPaxos::OP_ACCEPT,
 				    ceph_clock_now());
   accept->pn = accepted_pn;
@@ -775,6 +798,11 @@ void Paxos::handle_begin(MonOpRequestRef op)
 }
 
 // leader
+/**
+ * leader 侧收接受回执：校验后计入 accepted，收齐全部 quorum 成员后进入提交。
+ *
+ * 注意收齐条件是"全体"而非过半——未收到回执的成员可能仍持有旧状态。
+ */
 void Paxos::handle_accept(MonOpRequestRef op)
 {
   op->mark_paxos_event("handle_accept");
@@ -782,12 +810,14 @@ void Paxos::handle_accept(MonOpRequestRef op)
   dout(10) << "handle_accept " << *accept << dendl;
   int from = accept->get_source().num();
 
+  // pn 不符：已有更新的提案号（可能换了 leader），忽略。
   if (accept->pn != accepted_pn) {
     // we accepted a higher pn, from some other leader
     dout(10) << " we accepted a higher pn " << accepted_pn << ", ignoring" << dendl;
     op->mark_paxos_event("have higher pn, ignore");
     return;
   }
+  // 回执落后太多：来自旧轮次，忽略。
   if (last_committed > 0 &&
       accept->last_committed < last_committed-1) {
     dout(10) << " this is from an old round, ignoring" << dendl;
@@ -797,11 +827,13 @@ void Paxos::handle_accept(MonOpRequestRef op)
   ceph_assert(accept->last_committed == last_committed ||   // not committed
 	 accept->last_committed == last_committed-1);  // committed
 
+  // 计票：该成员的接受入集合（防重复计）。
   ceph_assert(is_updating() || is_updating_previous());
   ceph_assert(accepted.count(from) == 0);
   accepted.insert(from);
   dout(10) << " now " << accepted << " have accepted" << dendl;
 
+  // 测试钩子：注入故障点 6。
   ceph_assert(g_conf()->paxos_kill_at != 6);
 
   // only commit (and expose committed state) when we get *all* quorum
@@ -809,8 +841,11 @@ void Paxos::handle_accept(MonOpRequestRef op)
   // stale state.
   // FIXME: we can improve this with an additional lease revocation message
   // that doesn't block for the persist.
+  // 收齐条件是全体 quorum 成员（不是过半）：没回执的可能还在用旧状态，
+  // 直接 commit 会让新旧状态并存。
   if (accepted == mon.get_quorum()) {
     // yay, commit!
+    // 重点调用：进入提交阶段（广播 OP_COMMIT）。
     dout(10) << " got majority, committing, done with update" << dendl;
     op->mark_paxos_event("commit_start");
     commit_start();
@@ -850,19 +885,26 @@ void Paxos::abort_commit()
     shutdown_cond.notify_all();
 }
 
+/**
+ * 提交阶段开始：本地应用提案值（版本 +1）并异步落盘，
+ * 落盘回调 C_Committed 完成后进 commit_finish 广播 OP_COMMIT。
+ */
 void Paxos::commit_start()
 {
   dout(10) << __func__ << " " << (last_committed+1) << dendl;
 
+  // 测试钩子：注入故障点 7。
   ceph_assert(g_conf()->paxos_kill_at != 7);
 
   auto t(std::make_shared<MonitorDBStore::Transaction>());
 
   // commit locally
+  // 本地提交：推进 last_committed 水位。
   t->put(get_name(), "last_committed", last_committed + 1);
 
   // decode the value and apply its transaction to the store.
   // this value can now be read from last_committed.
+  // 重点调用：解码提案值里的业务事务并入本次提交（值从此可读）。
   decode_append_transaction(t, new_value);
 
   dout(30) << __func__ << " transaction dump:\n";
@@ -876,8 +918,10 @@ void Paxos::commit_start()
   logger->inc(l_paxos_commit_bytes, t->get_bytes());
   commit_start_stamp = ceph::coarse_mono_clock::now();
 
+  // 异步落盘；完成回调（Paxos::C_Committed）触发 commit_finish 收尾。
   get_store()->queue_transaction(t, new C_Committed(this));
 
+  // 落盘期间进入 WRITING 态，禁止新的提案/读取。
   if (is_updating_previous())
     state = STATE_WRITING_PREVIOUS;
   else if (is_updating())
@@ -886,6 +930,7 @@ void Paxos::commit_start()
     ceph_abort();
   ++commits_started;
 
+  // 提交已开始，取消接受阶段的超时定时器。
   if (mon.get_quorum().size() > 1) {
     // cancel timeout event
     mon.timer.cancel_event(accept_timeout_event);
@@ -893,28 +938,37 @@ void Paxos::commit_start()
   }
 }
 
+/**
+ * 提交收尾（落盘完成回调触发）：推进版本、广播 OP_COMMIT 通知 peon，
+ * 经 do_refresh 让各 service 应用新值，唤醒提案完成回调并续租约。
+ */
 void Paxos::commit_finish()
 {
   dout(20) << __func__ << " " << (last_committed+1) << dendl;
   auto end = ceph::coarse_mono_clock::now();
   logger->tinc(l_paxos_commit_latency, to_timespan(end - commit_start_stamp));
 
+  // 测试钩子：注入故障点 8。
   ceph_assert(g_conf()->paxos_kill_at != 8);
 
   // cancel lease - it was for the old value.
   //  (this would only happen if message layer lost the 'begin', but
   //   leader still got a majority and committed with out us.)
+  // 旧租约作废（针对旧值）。
   lease_expire = {};  // cancel lease
 
+  // 提交版本推进，记录提交时间。
   last_committed++;
   last_commit_time = ceph_clock_now();
 
   // refresh first_committed; this txn may have trimmed.
+  // 提交事务可能含 trim，刷新 first_committed 水位。
   first_committed = get_store()->get(get_name(), "first_committed");
 
   _sanity_check_store();
 
   // tell everyone
+  // 重点调用：向 quorum 其他成员广播 OP_COMMIT（携带已提交值）。
   for (auto p = mon.get_quorum().begin();
        p != mon.get_quorum().end();
        ++p) {
@@ -930,28 +984,35 @@ void Paxos::commit_finish()
     mon.send_mon_message(commit, *p);
   }
 
+  // 测试钩子：注入故障点 9。
   ceph_assert(g_conf()->paxos_kill_at != 9);
 
   // get ready for a new round.
+  // 清理在途值，准备下一轮。
   new_value.clear();
 
   // WRITING -> REFRESH
   // among other things, this lets do_refresh() -> mon.bootstrap() ->
   // wait_for_paxos_write() know that it doesn't need to flush the store
   // queue. and it should not, as we are in the async completion thread now!
+  // 落盘完成，WRITING -> REFRESH（注意此刻在异步完成线程中）。
   ceph_assert(is_writing() || is_writing_previous());
   state = STATE_REFRESH;
   ceph_assert(commits_started > 0);
   --commits_started;
 
   if (do_refresh()) {
+    // 重点调用：唤醒提案完成回调（PaxosService 的 C_Committed -> _active）。
     commit_proposal();
+    // 多成员时续租约（确认 leader 身份仍有效）。
     if (mon.get_quorum().size() > 1) {
       extend_lease();
     }
 
+    // 测试钩子：注入故障点 10。
     ceph_assert(g_conf()->paxos_kill_at != 10);
 
+    // 重点调用：一轮结束收尾；若还有排队提案会续发下一轮。
     finish_round();
   }
 }
@@ -1533,13 +1594,19 @@ bool Paxos::is_writeable()
     is_lease_valid();
 }
 
+/**
+ * 发起一轮共识：把排队的提案事务编码为 Paxos 值，交 begin() 进入 accept 阶段。
+ */
 void Paxos::propose_pending()
 {
+  // 前置：Paxos 已激活且有排队的提案事务。
   ceph_assert(is_active());
   ceph_assert(pending_proposal);
 
+  // 清掉旧的超时/租约定时器，本轮重新计时。
   cancel_events();
 
+  // 把提案事务序列化为一个 Paxos 值（一次共识提交一整包）。
   bufferlist bl;
   pending_proposal->encode(bl);
 
@@ -1551,10 +1618,14 @@ void Paxos::propose_pending()
   f.flush(*_dout);
   *_dout << dendl;
 
+  // 提案事务已编码，清空排队槽位。
   pending_proposal.reset();
 
+  // 提案完成回调移交给 committing 集合（提交后统一唤醒）。
   committing_finishers.swap(pending_finishers);
+  // 进入"更新中"状态，禁止新的提案插入。
   state = STATE_UPDATING;
+  // 重点调用：进入 Paxos accept 阶段（向 quorum 发送 accept 请求）。
   begin(bl);
 }
 
@@ -1575,16 +1646,22 @@ MonitorDBStore::TransactionRef Paxos::get_pending_transaction()
   return pending_proposal;
 }
 
+/**
+ * 提案触发闸门：未被阻塞且 Paxos 处于 active 时立即发起共识，否则留待稍后。
+ */
 bool Paxos::trigger_propose()
 {
+  // 被阻塞（如租约/恢复期 plug）：不提，调用方稍后重试。
   if (plugged) {
     dout(10) << __func__ << " plugged, not proposing now" << dendl;
     return false;
   } else if (is_active()) {
+    // 重点调用：立即发起一轮共识（accept/commit 流程入口）。
     dout(10) << __func__ << " active, proposing now" << dendl;
     propose_pending();
     return true;
   } else {
+    // 未激活（选举/同步中）：提案留队，激活后由 Paxos 内部补发。
     dout(10) << __func__ << " not active, will propose later" << dendl;
     return false;
   }

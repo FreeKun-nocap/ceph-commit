@@ -195,14 +195,21 @@ bool PaxosService::should_propose(double& delay)
 }
 
 
+/**
+ * 提交 pending 草稿：把本 service 的变更编码进 Paxos 事务并发起共识轮。
+ *
+ * 提案提交后经 C_Committed 回调恢复服务激活状态。
+ */
 void PaxosService::propose_pending()
 {
   dout(10) << __func__ << dendl;
+  // 前置：有草稿、没在提案、是 leader 且服务已激活。
   ceph_assert(have_pending);
   ceph_assert(!proposing);
   ceph_assert(mon.is_leader());
   ceph_assert(is_active());
 
+  // 取消延迟提案定时器（攒批定时器，现在直接提）。
   if (proposal_timer) {
     dout(10) << " canceling proposal_timer " << proposal_timer << dendl;
     mon.timer.cancel_event(proposal_timer);
@@ -218,11 +225,14 @@ void PaxosService::propose_pending()
    *	   bufferlist, so we can then propose that as a value through
    *	   Paxos.
    */
+  // 重点调用：取 Paxos 的待提交事务作为载体。
   MonitorDBStore::TransactionRef t = paxos.get_pending_transaction();
 
+  // 周期性存全量快照（便于 trim 后仍能重建状态）。
   if (should_stash_full())
     encode_full(t);
 
+  // 重点调用：虚函数——各 service 把草稿写进事务（MonmapMonitor 编码 pending_map）。
   encode_pending(t);
   have_pending = false;
 
@@ -231,6 +241,7 @@ void PaxosService::propose_pending()
   }
 
   // apply to paxos
+  // 标记提案中，防止重复提交。
   proposing = true;
   need_immediate_propose = false; /* reset whenever we propose */
   /**
@@ -243,6 +254,7 @@ void PaxosService::propose_pending()
    * wrong people at the wrong time, such as waking up a C_RetryMessage
    * before waking up a C_Active, thus ending up without a pending value.
    */
+  // 提案走完 Paxos 后的回调：清 proposing 并重新激活服务。
   class C_Committed : public Context {
     PaxosService *ps;
   public:
@@ -257,6 +269,7 @@ void PaxosService::propose_pending()
 	ceph_abort_msg("bad return value for C_Committed");
     }
   };
+  // 重点调用：登记 C_Committed 回调，再经 trigger_propose() 转 Paxos 发起共识。
   paxos.queue_pending_finisher(new C_Committed(this));
   paxos.trigger_propose();
 }
