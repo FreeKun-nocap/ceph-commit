@@ -1018,6 +1018,9 @@ void Paxos::commit_finish()
 }
 
 
+/**
+ * peon 侧收 OP_COMMIT：把 leader 已提交的值落盘应用，并刷新服务状态。
+ */
 void Paxos::handle_commit(MonOpRequestRef op)
 {
   op->mark_paxos_event("handle_commit");
@@ -1026,15 +1029,18 @@ void Paxos::handle_commit(MonOpRequestRef op)
 
   logger->inc(l_paxos_commit);
 
+  // 只有 peon 走这里（leader 在 commit_finish 里已本地应用）。
   if (!mon.is_peon()) {
     dout(10) << "not a peon, dropping" << dendl;
     ceph_abort();
     return;
   }
 
+  // 重点调用：把已提交值写入本地 store（推进 last_committed）。
   op->mark_paxos_event("store_state");
   store_state(commit);
 
+  // 重点调用：刷新服务状态（各 service 应用新值），与 leader 侧对称。
   (void)do_refresh();
 }
 
@@ -1108,11 +1114,18 @@ void Paxos::warn_on_future_time(utime_t t, entity_name_t from)
 
 }
 
+/**
+ * 提交后状态刷新：经 Monitor::refresh_from_paxos 加载最新已提交值并分发给各 service。
+ *
+ * 返回 true 表示刷新成功（调用方可继续收尾）；false 表示需回 bootstrap 重建。
+ */
 bool Paxos::do_refresh()
 {
   bool need_bootstrap = false;
 
   // make sure we have the latest state loaded up
+  // 重点调用：加载最新已提交状态，各 PaxosService 在此应用新值
+  //（OSDMonitor::update_from_paxos 即在这条链上）。
   auto start = ceph::coarse_mono_clock::now();
   mon.refresh_from_paxos(&need_bootstrap);
   auto end = ceph::coarse_mono_clock::now();
@@ -1120,6 +1133,7 @@ bool Paxos::do_refresh()
   logger->inc(l_paxos_refresh);
   logger->tinc(l_paxos_refresh_latency, to_timespan(end - start));
 
+  // 发现状态严重不一致：回 bootstrap 重新对齐。
   if (need_bootstrap) {
     dout(10) << " doing requested bootstrap" << dendl;
     mon.bootstrap();

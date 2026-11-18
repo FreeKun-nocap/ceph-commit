@@ -142,11 +142,16 @@ bool PaxosService::dispatch(MonOpRequestRef op)
   return true;
 }
 
+/**
+ * 刷新本服务的已提交状态：更新版本水位、检查格式升级后
+ * 转交虚函数 update_from_paxos（各 service 在此应用新值）。
+ */
 void PaxosService::refresh(bool *need_bootstrap)
 {
   dout(10) << __func__ << dendl;
 
   // update cached versions
+  // 从 store 读最新版本水位；推进了则唤醒等待提交的回调。
   auto first_committed = mon.store->get(get_service_name(), first_committed_name);
   auto last_committed = mon.store->get(get_service_name(), last_committed_name);
   if (last_committed > cached_last_committed) {
@@ -155,6 +160,7 @@ void PaxosService::refresh(bool *need_bootstrap)
   cached_first_committed = first_committed;
   cached_last_committed = last_committed;
 
+  // 磁盘格式版本变化：触发 on_upgrade 迁移处理。
   version_t new_format = get_value("format_version");
   if (new_format != format_version) {
     dout(1) << __func__ << " upgraded, format " << format_version << " -> " << new_format << dendl;
@@ -162,7 +168,8 @@ void PaxosService::refresh(bool *need_bootstrap)
   }
   format_version = new_format;
 
-
+  // 重点调用：虚函数——各 service 应用新提交值
+  //（OSDMonitor::update_from_paxos 在此生成/发布新 OSDMap）。
   update_from_paxos(need_bootstrap);
 }
 

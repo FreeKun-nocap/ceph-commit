@@ -7504,15 +7504,23 @@ void OSD::queue_want_up_thru(epoch_t want)
   }
 }
 
+/**
+ * 向 mon 请求确认 up_thru 水位（MOSDAlive）。
+ *
+ * up_thru 是 mon 授权"该 OSD 可充当 acting 成员的最新 epoch"，peering 安全依据。
+ */
 void OSD::send_alive()
 {
   ceph_assert(ceph_mutex_is_locked(mon_report_lock));
   const auto osdmap = get_osdmap();
+  // 不在地图里的 OSD（被移除）无需报告。
   if (!osdmap->exists(whoami))
     return;
+  // mon 已确认的水位 vs 我想要的水位，只在落后时才发消息（省流量）。
   epoch_t up_thru = osdmap->get_up_thru(whoami);
   dout(10) << "send_alive up_thru currently " << up_thru << " want " << up_thru_wanted << dendl;
   if (up_thru_wanted > up_thru) {
+    // 重点调用：发 MOSDAlive 请求 mon 在下个 OSDMap 里抬升 up_thru。
     dout(10) << "send_alive want " << up_thru_wanted << dendl;
     monc->send_mon_message(new MOSDAlive(osdmap->get_epoch(), up_thru_wanted));
   }
@@ -7590,6 +7598,9 @@ void OSD::requeue_failures()
 	   << failure_queue.size() << dendl;
 }
 
+/**
+ * 把心跳检测发现的故障同伴上报给 mon（MOSDFailure），转 failure_pending 防重复。
+ */
 void OSD::send_failures()
 {
   ceph_assert(ceph_mutex_is_locked(map_lock));
@@ -7599,8 +7610,11 @@ void OSD::send_failures()
   const auto osdmap = get_osdmap();
   while (!failure_queue.empty()) {
     int osd = failure_queue.begin()->first;
+    // 已上报过：不重复发。
     if (!failure_pending.count(osd)) {
+      // 失联时长随消息带给 mon 判定。
       int failed_for = (int)(double)(now - failure_queue.begin()->second);
+      // 重点调用：mon 侧经 prepare_failure 变成标 down 提案。
       monc->send_mon_message(
 	new MOSDFailure(
 	  monc->get_fsid(),
@@ -7608,6 +7622,7 @@ void OSD::send_failures()
 	  osdmap->get_addrs(osd),
 	  failed_for,
 	  osdmap->get_epoch()));
+      // 记入 pending，等 mon 裁决。
       failure_pending[osd] = make_pair(failure_queue.begin()->second,
 				       osdmap->get_addrs(osd));
     }

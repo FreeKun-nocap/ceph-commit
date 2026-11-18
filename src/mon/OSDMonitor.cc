@@ -717,14 +717,26 @@ void OSDMonitor::get_store_prefixes(std::set<string>& s) const
   s.insert(OSD_SNAP_PREFIX);
 }
 
+/**
+ * 应用已提交的 OSDMap 提案（OSDMonitor 的核心生效函数）。
+ *
+ * Paxos 里存的每条已提交值是一个 OSDMap::Incremental（地图增量），不是全图。
+ * 本函数从"最近的全量图"基线出发，把落后的增量逐个重放到内存 osdmap 上，
+ * 追平到最新版本后：为每版生成全量图存盘（供后来者直接加载），
+ * 再把新地图推送给订阅的 OSD/客户端——OSD 侧就是（2.）OSD::handle_osd_map。
+ * 每次 Paxos 提交（本 service 的 refresh）都会调用到这里。
+ */
 void OSDMonitor::update_from_paxos(bool *need_bootstrap)
 {
   // we really don't care if the version has been updated, because we may
   // have trimmed without having increased the last committed; yet, we may
   // need to update the in-memory manifest.
+  // 先重载"哪些版本还有全量图"的清单：Paxos trim 旧值后清单会变，
+  // 而 trim 不推进版本号，所以每次都要重读而不是只在版本变化时读。
   load_osdmap_manifest();
 
   version_t version = get_last_committed();
+  // 内存里的 osdmap 已经追到最新提交版本：没有新东西，直接返回。
   if (version == osdmap.epoch)
     return;
   ceph_assert(version > osdmap.epoch);
@@ -757,6 +769,9 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
    * full maps from the incremental versions.  But don't panic!  We make sure
    * that the following conditions find whichever full map version is newer.
    */
+  // 找全量图基线：重放增量必须有一个起点全图。
+  // latest_full 是"最近一次存过的全量图版本"；它可能已被 trim 掉，
+  // 此时退而用 first_committed（区间内最老的可用全图）作基线。
   version_t latest_full = get_version_latest_full();
   if (latest_full == 0 && get_first_committed() > 1)
     latest_full = get_first_committed();
@@ -813,6 +828,9 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
   }
 
   // walk through incrementals
+  // 主循环：从基线 epoch 起逐版重放增量（epoch+1, +2, ...），
+  // 直到内存 osdmap 追上 last_committed。每重放一版就顺手把
+  // 这一版的全量图算出来存盘，保证区间内每版都有全图可取。
   MonitorDBStore::TransactionRef t;
   size_t tx_size = 0;
   while (version > osdmap.epoch) {
@@ -834,6 +852,8 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
 
     dout(7) << "update_from_paxos  applying incremental " << osdmap.epoch+1
 	    << dendl;
+    // 重点调用：把本版增量应用到内存 osdmap——增量里是成员增删、
+    // up/down 状态、pool/CRUSH 变更等，应用后 osdmap.epoch 前进一版。
     OSDMap::Incremental inc(inc_bl);
     err = osdmap.apply_incremental(inc);
     ceph_assert(err == 0);
@@ -845,6 +865,8 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
     // map with the same features as the incremental.  If we don't
     // know, use the quorum features.  If we don't know those either,
     // encode with all features.
+    // 生成本版全量图并存盘：新加入的 OSD/客户端落后太多时
+    // 不必从头重放全部增量，直接取一份全量图起步。
     uint64_t f = inc.encode_features;
     if (!f)
       f = mon.get_quorum_con_features();
@@ -859,6 +881,10 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
     dout(20) << __func__ << " mon is running version: " << ceph_version_to_str() << dendl;
     if (orig_full_bl.length()) {
       // the primary provided the full map
+      // CRC 对账：leader 当年发增量时附带了它的全图 CRC，
+      // 这里重放出的全图 CRC 必须一致；不一致（历史上混版本导致
+      // 各 mon 全图编码有差异）就丢弃本地重建结果、换用权威全图，
+      // 保证所有 mon 的全图字节一致（OSD 发现 CRC 不符会来要全图）。
       ceph_assert(inc.have_crc);
       if (inc.full_crc != osdmap.crc) {
 	// This will happen if the mons were running mixed versions in
@@ -924,6 +950,8 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
     mon.store->apply_transaction(t);
   }
 
+  // 维护 down→out 计时表：OSD 被标 down 时记下时间，
+  // 后面 process_failures() 按 mon_osd_down_out_interval 超时后把它转成 out。
   bool marked_osd_down = false;
   for (int o = 0; o < osdmap.get_max_osd(); o++) {
     if (osdmap.is_out(o))
@@ -945,9 +973,13 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
   }
   // XXX: need to trim MonSession connected with a osd whose id > max_osd?
 
+  // 重点调用：给所有订阅了 osdmap 的 OSD/客户端发 MOSDMap（增量或全量）。
+  // 这就是"发布"动作——OSD 收到后走（2.）OSD::handle_osd_map 应用新地图。
   check_osdmap_subs();
   check_pg_creates_subs();
 
+  // 再随机挑一个 OSD 主动分享一次地图（加速收敛）；
+  // 顺带更新统计、处理 down 超时的故障转 out、刷新 messenger 特性位。
   share_map_with_random_osd();
   update_logger();
   process_failures();
@@ -959,6 +991,8 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
     // will be called by on_active() on the leader, avoid doing so twice
     start_mapping();
   }
+  // stretch 模式状态机：根据新地图里 up OSD 数量变化，
+  // 在 健康/降级/恢复 三种 stretch 状态间切换（跨机房容灾场景）。
   if (osdmap.stretch_mode_enabled) {
     dout(20) << "Stretch mode enabled in this map" << dendl;
     mon.try_engage_stretch_mode();
@@ -3247,15 +3281,23 @@ utime_t OSDMonitor::get_grace_time(utime_t now,
   return grace;
 }
 
+/**
+ * 判定故障票数是否够标 down：报告者按 CRUSH 子树去重计票
+ * （同一故障域多份报告只算一票，防集体误判），票数够且失联时长超过
+ * 宽限期才把"标 down"写入 pending_inc 增量。
+ */
 bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 {
   // already pending failure?
+  // 本提案里已标过 down：不重复处理。
   if (pending_inc.new_state.count(target_osd) &&
       pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
     dout(10) << " already pending failure" << dendl;
     return true;
   }
 
+  // 按子树（mon_osd_reporter_subtree_level，如 host/rack）归并报告者：
+  // 同一子树内多个 OSD 的报告只算一票；已不存在的报告者顺手剔除。
   set<string> reporters_by_subtree;
   auto reporter_subtree_level = g_conf().get_val<string>("mon_osd_reporter_subtree_level");
   ceph_assert(fi.reporters.size());
@@ -3276,12 +3318,16 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
       p = fi.reporters.erase(p);
     }
   }
+  // 票数门槛：去重后不足 mon_osd_min_down_reporters 个来源，继续等。
   if (reporters_by_subtree.size() < g_conf().get_val<uint64_t>("mon_osd_min_down_reporters")) {
     return false;
   }
+  // 时长门槛：失联时长须超过宽限期（报告者越多宽限越短，见 get_grace_time）。
   const utime_t failed_for = now - fi.get_failed_since();
   const utime_t grace = get_grace_time(now, target_osd, fi);
   if (failed_for >= grace) {
+    // 两道门槛都过：在增量里记 CEPH_OSD_UP 状态位变化——
+    // apply_incremental 时把该 OSD 的 UP 清掉，即标 down。
     dout(1) << " we have enough reporters to mark osd." << target_osd
 	    << " down" << dendl;
     pending_inc.new_state[target_osd] = CEPH_OSD_UP;
@@ -3332,6 +3378,12 @@ void OSDMonitor::force_failure(int target_osd, int by)
   return;
 }
 
+/**
+ * 处理故障报告：登记/取消报告者的投票，交 check_failure 判定是否标 down。
+ *
+ * 单个 OSD 报告不足为凭（可能是网络分区误判），报告先记入 failure_info 累计，
+ * 票数够（超过半数存活 OSD 也报故障等条件）才在提案里标 down。
+ */
 bool OSDMonitor::prepare_failure(MonOpRequestRef op)
 {
   op->mark_osdmon_event(__func__);
@@ -3343,6 +3395,7 @@ bool OSDMonitor::prepare_failure(MonOpRequestRef op)
 
   int target_osd = m->get_target_osd();
   int reporter = m->get_orig_source().num();
+  // 目标必须仍 up 且地址一致（防过期报告误伤）。
   ceph_assert(osdmap.is_up(target_osd));
   ceph_assert(osdmap.get_addrs(target_osd) == m->get_target_addrs());
 
@@ -3350,11 +3403,13 @@ bool OSDMonitor::prepare_failure(MonOpRequestRef op)
 
   if (m->if_osd_failed()) {
     // calculate failure time
+    // 由"已失联时长"倒推出失联起始时间。
     utime_t now = ceph_clock_now();
     utime_t failed_since =
       m->get_recv_stamp() - utime_t(m->failed_for, 0);
 
     // add a report
+    // immediate：管理员强制（如 osd out 命令），跳过投票直接标 down。
     if (m->is_immediate()) {
       mon.clog->debug() << "osd." << m->get_target_osd()
 			 << " reported immediately failed by "
@@ -3365,11 +3420,14 @@ bool OSDMonitor::prepare_failure(MonOpRequestRef op)
     mon.clog->debug() << "osd." << m->get_target_osd() << " reported failed by "
 		      << m->get_orig_source();
 
+    // 重点调用：报告入册（failure_info 记录谁在何时开始报告）。
     failure_info_t& fi = failure_info[target_osd];
     fi.add_report(reporter, failed_since, op);
+    // 重点调用：判定票数是否够标 down，够则写入 pending_inc。
     return check_failure(now, target_osd, fi);
   } else {
     // remove the report
+    // 撤回报告（被报告者其实活着）：减票；没人再报告则清记录。
     mon.clog->debug() << "osd." << m->get_target_osd()
 		       << " failure report canceled by "
 		       << m->get_orig_source();

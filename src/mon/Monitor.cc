@@ -1015,10 +1015,15 @@ void Monitor::init_paxos()
   refresh_from_paxos(NULL);
 }
 
+/**
+ * 从 Paxos 加载最新已提交状态并分发给各 service：
+ * 先逐个 refresh 应用新值，再统一 post_refresh 后处理。
+ */
 void Monitor::refresh_from_paxos(bool *need_bootstrap)
 {
   dout(10) << __func__ << dendl;
 
+  // 读取集群指纹（首次选举时生成的唯一标识）。
   bufferlist bl;
   int r = store->get(MONITOR_NAME, "cluster_fingerprint", bl);
   if (r >= 0) {
@@ -1033,12 +1038,16 @@ void Monitor::refresh_from_paxos(bool *need_bootstrap)
     dout(10) << __func__ << " no cluster_fingerprint" << dendl;
   }
 
+  // 重点调用：各 PaxosService 应用已提交的新值
+  //（OSDMonitor::update_from_paxos 在此链上生成/发布新 OSDMap）。
   for (auto& svc : paxos_service) {
     svc->refresh(need_bootstrap);
   }
+  // 全部 refresh 完后统一后处理（互相依赖的收尾动作）。
   for (auto& svc : paxos_service) {
     svc->post_refresh();
   }
+  // 重新加载 mon 成员元数据。
   load_metadata();
 }
 
