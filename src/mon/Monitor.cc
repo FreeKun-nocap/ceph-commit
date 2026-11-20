@@ -5570,6 +5570,12 @@ void Monitor::handle_subscribe(MonOpRequestRef op)
 
 }
 
+/**
+ * 处理版本查询（MMonGetVersion）：按 map 类型找到对应 PaxosService，
+ * 回复其已提交版本区间 [first_committed, last_committed]。
+ *
+ * quorum 未就绪或服务未可读时挂 C_RetryMessage 稍后重试。
+ */
 void Monitor::handle_get_version(MonOpRequestRef op)
 {
   auto m = op->get_req<MMonGetVersion>();
@@ -5579,12 +5585,14 @@ void Monitor::handle_get_version(MonOpRequestRef op)
   MonSession *s = op->get_session();
   ceph_assert(s);
 
+  // 还在选举/同步中：进 quorum 后重试本消息。
   if (!is_leader() && !is_peon()) {
     dout(10) << " waiting for quorum" << dendl;
     waitfor_quorum.push_back(new C_RetryMessage(this, op));
     goto out;
   }
 
+  // 按查询对象选对应的 PaxosService。
   if (m->what == "mdsmap") {
     svc = mdsmon();
   } else if (m->what == "fsmap") {
@@ -5598,11 +5606,13 @@ void Monitor::handle_get_version(MonOpRequestRef op)
   }
 
   if (svc) {
+    // 服务状态还读不了（刚切换未加载完）：等可读后重试。
     if (!svc->is_readable()) {
       svc->wait_for_readable(op, new C_RetryMessage(this, op));
       goto out;
     }
 
+    // 回复版本区间：handle 用于调用方找回自己的回调。
     MMonGetVersionReply *reply = new MMonGetVersionReply();
     reply->handle = m->handle;
     reply->version = svc->get_last_committed();

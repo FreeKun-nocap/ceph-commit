@@ -7119,20 +7119,30 @@ bool OSD::ms_handle_refused(Connection *con)
   return true;
 }
 
+/**
+ * 版本查询的 asio 完成处理器（operator() 仿函数，非 Context::finish）：
+ * 查询成功后把 mon 的版本区间转交 _got_mon_epochs 决定追地图或 boot。
+ */
 struct CB_OSD_GetVersion {
   OSD *osd;
   explicit CB_OSD_GetVersion(OSD *o) : osd(o) {}
   void operator ()(boost::system::error_code ec, version_t newest,
 		   version_t oldest) {
+    // 查询失败（连接断等）忽略；成功则交 OSD 决定去向。
     if (!ec)
       osd->_got_mon_epochs(oldest, newest);
   }
 };
 
+/**
+ * boot 流程入口：自身健康后进入 PREBOOT，先向 mon 查 osdmap 最新版本，
+ * 由回调决定是先追地图还是直接 _send_boot() 申请进地图。
+ */
 void OSD::start_boot()
 {
   if (!_is_healthy()) {
     // if we are not healthy, do not mark ourselves up (yet)
+    // 数据盘/网络未就绪：不急着上报 up，转等待态并提前发心跳探活。
     dout(1) << "not healthy; waiting to boot" << dendl;
     if (!is_waiting_for_healthy())
       start_waiting_for_healthy();
@@ -7141,19 +7151,31 @@ void OSD::start_boot()
     return;
   }
   dout(1) << __func__ << dendl;
+  // 进入 PREBOOT：尚未被 mon 认作 up。
   set_state(STATE_PREBOOT);
   dout(10) << "start_boot - have maps " << superblock.get_maps() << dendl;
+  // 重点调用：查 mon 上 osdmap 的最新版本，
+  // 回调（CB_OSD_GetVersion）比较后决定追地图或发 MOSDBoot。
   monc->get_version("osdmap", CB_OSD_GetVersion(this));
 }
 
+/**
+ * 收到 mon 的版本区间：仍在 PREBOOT 才继续，转 _preboot 决定追地图或发 boot。
+ */
 void OSD::_got_mon_epochs(epoch_t oldest, epoch_t newest)
 {
   std::lock_guard l(osd_lock);
+  // 期间状态已变（如已放弃 boot）则忽略。
   if (is_preboot()) {
+    // 重点调用：比较本地/mon 版本，补齐地图后走 _send_boot。
     _preboot(oldest, newest);
   }
 }
 
+/**
+ * boot 前决策：一串前置检查（初始地图/已销毁/NOUP/full 状态/purged_snaps），
+ * 全部通过且本地地图够新则等 PG 追平后 _send_boot()；否则先订阅追地图。
+ */
 void OSD::_preboot(epoch_t oldest, epoch_t newest)
 {
   ceph_assert(is_preboot());
@@ -7161,6 +7183,7 @@ void OSD::_preboot(epoch_t oldest, epoch_t newest)
 	   << oldest << ".." << newest << dendl;
 
   // ensure our local fullness awareness is accurate
+  // 刷新一次心跳，保证 full 状态判断准确。
   {
     std::lock_guard l(heartbeat_lock);
     heartbeat();
@@ -7169,9 +7192,12 @@ void OSD::_preboot(epoch_t oldest, epoch_t newest)
   const auto& monmap = monc->monmap;
   const auto osdmap = get_osdmap();
   // if our map within recent history, try to add ourselves to the osdmap.
+  // 前置检查链：任一不满足就停在等待态（等条件变化后再走 boot）。
   if (osdmap->get_epoch() == 0) {
+    // 连初始地图都还没有，等。
     derr << "waiting for initial osdmap" << dendl;
   } else if (osdmap->is_destroyed(whoami)) {
+    // 已被销毁的 OSD 不许 boot；留 1 版余量防 livelock 后退出。
     derr << "osdmap says I am destroyed" << dendl;
     // provide a small margin so we don't livelock seeing if we
     // un-destroyed ourselves.
@@ -7179,15 +7205,19 @@ void OSD::_preboot(epoch_t oldest, epoch_t newest)
       exit(0);
     }
   } else if (osdmap->is_noup(whoami)) {
+    // NOUP 标志：mon 不允许本 OSD 上线，等清除。
     derr << "osdmap NOUP flag is set, waiting for it to clear" << dendl;
   } else if (!osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE)) {
+    // 排序标志未设（老集群升级遗留），要求先设置。
     derr << "osdmap SORTBITWISE OSDMap flag is NOT set; please set it"
 	 << dendl;
   } else if (service.need_fullness_update()) {
+    // 我的 full 状态和地图记录不符：先上报更正。
     derr << "osdmap fullness state needs update" << dendl;
     send_full_update();
   } else if (monmap.min_mon_release >= ceph_release_t::octopus &&
 	     superblock.purged_snaps_last < superblock.current_epoch) {
+    // purged_snaps 记录落后：先向 mon 补齐（追齐后重新 start_boot）。
     dout(10) << __func__ << " purged_snaps_last " << superblock.purged_snaps_last
 	     << " < newest_map " << superblock.current_epoch << dendl;
     _get_purged_snaps();
@@ -7197,6 +7227,8 @@ void OSD::_preboot(epoch_t oldest, epoch_t newest)
     // wait for pgs to fully catch up in a different thread, since
     // this thread might be required for splitting and merging PGs to
     // make progress.
+    // 地图已够新：异步等各 shard 的 PG 追平（排空 peering 工作），
+    // 完成后调 _send_boot() 申请进地图。
     boot_finisher.queue(
       new LambdaContext(
 	[this](int r) {
@@ -7211,6 +7243,7 @@ void OSD::_preboot(epoch_t oldest, epoch_t newest)
 	    l.lock();
 	  }
 	  if (is_preboot()) {
+	    // 重点调用：组装 MOSDBoot 申请上线。
 	    _send_boot();
 	  }
 	}));
@@ -7218,6 +7251,7 @@ void OSD::_preboot(epoch_t oldest, epoch_t newest)
   }
 
   // get all the latest maps
+  // 地图不够新：订阅补齐（补齐后回调会再次进入 _preboot）。
   if (osdmap->get_epoch() + 1 >= oldest)
     osdmap_subscribe(osdmap->get_epoch() + 1, false);
   else

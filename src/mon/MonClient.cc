@@ -1415,9 +1415,14 @@ void MonClient::_finish_command(MonCommand *r, bs::error_code ret,
 
 // ---------
 
+/**
+ * 版本查询回程：按 handle 找回登记的 handler，经 asio 执行器异步执行
+ *（即 CB_OSD_GetVersion::finish 那类回调，参数为新旧版本号）。
+ */
 void MonClient::handle_get_version_reply(MMonGetVersionReply* m)
 {
   ceph_assert(ceph_mutex_is_locked(monc_lock));
+  // 按请求号找回 handler；找不到（已取消/重复回复）则忽略。
   auto iter = version_requests.find(m->handle);
   if (iter == version_requests.end()) {
     ldout(cct, 0) << __func__ << " version request with handle " << m->handle
@@ -1427,6 +1432,7 @@ void MonClient::handle_get_version_reply(MMonGetVersionReply* m)
     ldout(cct, 10) << __func__ << " finishing " << iter->first << " version "
 		   << m->version << dendl;
     version_requests.erase(iter);
+    // 重点调用：投递到 asio 执行器异步调用 handler(version, oldest_version)。
     asio::post(service.get_executor(),
 	       asio::append(std::move(req), bs::error_code(),
 			    m->version, m->oldest_version));

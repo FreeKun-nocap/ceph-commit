@@ -779,6 +779,13 @@ public:
    *         boost::system::errc::resource_unavailable_try_again if we need to
    *         resubmit our request
    */
+  /**
+   * 异步查询某类 map（如 "osdmap"）的最新版本：发 MMonGetVersion 并登记完成回调。
+   *
+   * 用 asio async_initiate 把调用方的完成令牌包成 handler，按 handle 记入 version_requests；
+   * mon 回 MMonGetVersionReply 时 handle_get_version_reply
+   * 用 handle 找回 handler 执行（即 CB_OSD_GetVersion::finish 那类回调）。
+   */
   template<typename CompletionToken>
   auto get_version(std::string&& map, CompletionToken&& token) {
     namespace asio = boost::asio;
@@ -790,8 +797,10 @@ public:
 	std::scoped_lock l(monc_lock);
 	auto m = ceph::make_message<MMonGetVersion>();
 	m->what = std::move(map);
+	// 分配请求号并把 handler 入表，等回复时按号找回。
 	m->handle = ++version_req_id;
 	version_requests.emplace(m->handle, std::move(handler));
+	// 重点调用：发查询消息给 mon。
 	_send_mon_message(m);
       }, consigned);
   }
